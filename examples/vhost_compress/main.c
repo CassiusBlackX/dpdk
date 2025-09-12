@@ -13,8 +13,8 @@
 #include <rte_malloc.h>
 #include <rte_cycles.h>
 #include <rte_vhost.h>
-#include <rte_cryptodev.h>
-#include <rte_vhost_crypto.h>
+#include <rte_compressdev.h>
+#include <rte_vhost_compress.h>
 #include <rte_string_fns.h>
 
 #include <cmdline_rdline.h>
@@ -26,7 +26,7 @@
 #define MAX_PKT_BURST			(64)
 #define MAX_IV_LEN			(32)
 #define NB_MEMPOOL_OBJS			(8192)
-#define NB_CRYPTO_DESCRIPTORS		(4096)
+#define NB_COMPRESS_DESCRIPTORS		(4096)
 #define NB_CACHE_OBJS			(128)
 #define SESSION_MAP_ENTRIES		(1024)
 #define REFRESH_TIME_SEC		(3)
@@ -42,7 +42,7 @@ struct lcore_option {
 	uint16_t qid;
 };
 
-struct __rte_cache_aligned vhost_crypto_info {
+struct __rte_cache_aligned vhost_compress_info {
 	int vids[MAX_NB_SOCKETS];
 	uint32_t nb_vids;
 	struct rte_mempool *sess_pool;
@@ -53,13 +53,12 @@ struct __rte_cache_aligned vhost_crypto_info {
 	volatile uint32_t initialized[MAX_NB_SOCKETS];
 };
 
-struct vhost_crypto_options {
+struct vhost_compress_options {
 	struct lcore_option los[MAX_NB_WORKER_CORES];
-	struct vhost_crypto_info *infos[MAX_NB_WORKER_CORES];
+	struct vhost_compress_info *infos[MAX_NB_WORKER_CORES];
 	uint32_t nb_los;
 	uint32_t zero_copy;
 	uint32_t guest_polling;
-	bool asymmetric_crypto;
 } options;
 
 enum {
@@ -71,8 +70,6 @@ enum {
 	OPT_ZERO_COPY_NUM,
 #define OPT_POLLING         "guest-polling"
 	OPT_POLLING_NUM,
-#define OPT_ASYM            "asymmetric-crypto"
-	OPT_ASYM_NUM,
 };
 
 #define NB_SOCKET_FIELDS	(2)
@@ -89,7 +86,7 @@ find_lo(uint32_t lcore_id)
 	return UINT32_MAX;
 }
 
-/** support *SOCKET_FILE_PATH:CRYPTODEV_ID* format */
+/** support *SOCKET_FILE_PATH:COMPRESSDEV_ID* format */
 static int
 parse_socket_arg(char *arg)
 {
@@ -199,20 +196,19 @@ parse_config(char *q_arg)
 }
 
 static void
-vhost_crypto_usage(const char *prgname)
+vhost_compress_usage(const char *prgname)
 {
 	printf("%s [EAL options] --\n"
 		"  --%s <lcore>,SOCKET-FILE-PATH\n"
 		"  --%s (lcore,cdev_id,queue_id)[,(lcore,cdev_id,queue_id)]\n"
 		"  --%s: zero copy\n"
-		"  --%s: guest polling\n"
-		"  --%s: asymmetric crypto\n",
+		"  --%s: guest polling\n",
 		prgname, OPT_SOCKET_FILE, OPT_CONFIG,
-		OPT_ZERO_COPY, OPT_POLLING, OPT_ASYM);
+		OPT_ZERO_COPY, OPT_POLLING);
 }
 
 static int
-vhost_crypto_parse_args(int argc, char **argv)
+vhost_compress_parse_args(int argc, char **argv)
 {
 	int opt, ret;
 	char *prgname = argv[0];
@@ -227,8 +223,6 @@ vhost_crypto_parse_args(int argc, char **argv)
 				NULL, OPT_ZERO_COPY_NUM},
 		{OPT_POLLING, no_argument,
 				NULL, OPT_POLLING_NUM},
-		{OPT_ASYM, no_argument,
-				NULL, OPT_ASYM_NUM},
 		{NULL, 0, 0, 0}
 	};
 
@@ -238,7 +232,7 @@ vhost_crypto_parse_args(int argc, char **argv)
 				  lgopts, &option_index)) != EOF) {
 
 		if (opt == '?') {
-			vhost_crypto_usage(prgname);
+			vhost_compress_usage(prgname);
 			return -1;
 		}
 
@@ -246,7 +240,7 @@ vhost_crypto_parse_args(int argc, char **argv)
 		case OPT_SOCKET_FILE_NUM:
 			ret = parse_socket_arg(optarg);
 			if (ret < 0) {
-				vhost_crypto_usage(prgname);
+				vhost_compress_usage(prgname);
 				return ret;
 			}
 			break;
@@ -254,26 +248,22 @@ vhost_crypto_parse_args(int argc, char **argv)
 		case OPT_CONFIG_NUM:
 			ret = parse_config(optarg);
 			if (ret < 0) {
-				vhost_crypto_usage(prgname);
+				vhost_compress_usage(prgname);
 				return ret;
 			}
 			break;
 
 		case OPT_ZERO_COPY_NUM:
 			options.zero_copy =
-				RTE_VHOST_CRYPTO_ZERO_COPY_ENABLE;
+				RTE_VHOST_COMPRESS_ZERO_COPY_ENABLE;
 			break;
 
 		case OPT_POLLING_NUM:
 			options.guest_polling = 1;
 			break;
 
-		case OPT_ASYM_NUM:
-			options.asymmetric_crypto = true;
-			break;
-
 		default:
-			vhost_crypto_usage(prgname);
+			vhost_compress_usage(prgname);
 			return -EINVAL;
 		}
 	}
@@ -284,7 +274,7 @@ vhost_crypto_parse_args(int argc, char **argv)
 static int
 new_device(int vid)
 {
-	struct vhost_crypto_info *info = NULL;
+	struct vhost_compress_info *info = NULL;
 	char path[PATH_MAX];
 	uint32_t i, j;
 	int ret;
@@ -312,14 +302,14 @@ new_device(int vid)
 		return -ENOENT;
 	}
 
-	ret = rte_vhost_crypto_create(vid, info->cid, info->sess_pool,
+	ret = rte_vhost_compress_create(vid, info->cid, info->sess_pool,
 			rte_lcore_to_socket_id(options.los[i].lcore_id));
 	if (ret) {
-		RTE_LOG(ERR, USER1, "Cannot create vhost crypto\n");
+		RTE_LOG(ERR, USER1, "Cannot create vhost compress\n");
 		return ret;
 	}
 
-	ret = rte_vhost_crypto_set_zero_copy(vid, options.zero_copy);
+	ret = rte_vhost_compress_set_zero_copy(vid, options.zero_copy);
 	if (ret) {
 		RTE_LOG(ERR, USER1, "Cannot %s zero copy feature\n",
 				options.zero_copy == 1 ? "enable" : "disable");
@@ -331,7 +321,7 @@ new_device(int vid)
 
 	rte_wmb();
 
-	RTE_LOG(INFO, USER1, "New Vhost-crypto Device %s, Device ID %d\n", path,
+	RTE_LOG(INFO, USER1, "New Vhost-compress Device %s, Device ID %d\n", path,
 			vid);
 	return 0;
 }
@@ -339,7 +329,7 @@ new_device(int vid)
 static void
 destroy_device(int vid)
 {
-	struct vhost_crypto_info *info = NULL;
+	struct vhost_compress_info *info = NULL;
 	uint32_t i, j;
 
 	for (i = 0; i < options.nb_los; i++) {
@@ -366,27 +356,27 @@ destroy_device(int vid)
 
 	rte_wmb();
 
-	rte_vhost_crypto_free(vid);
+	rte_vhost_compress_free(vid);
 
-	RTE_LOG(INFO, USER1, "Vhost Crypto Device %i Removed\n", vid);
+	RTE_LOG(INFO, USER1, "Vhost Compress Device %i Removed\n", vid);
 }
 
-static const struct rte_vhost_device_ops virtio_crypto_device_ops = {
+static const struct rte_vhost_device_ops virtio_compress_device_ops = {
 	.new_connection =  new_device,
 	.destroy_connection = destroy_device,
 };
 
 static int
-vhost_crypto_worker(void *arg)
+vhost_compress_worker(void *arg)
 {
-	struct rte_crypto_op *ops[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
-	struct rte_crypto_op *ops_deq[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
-	struct vhost_crypto_info *info = arg;
+	struct rte_comp_op *ops[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
+	struct rte_comp_op *ops_deq[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
+	struct vhost_compress_info *info = arg;
 	uint16_t nb_callfds;
-	int callfds[VIRTIO_CRYPTO_MAX_NUM_BURST_VQS];
+	int callfds[VIRTIO_COMPRESS_MAX_NUM_BURST_VQS];
 	uint32_t lcore_id = rte_lcore_id();
 	uint32_t burst_size = MAX_PKT_BURST;
-	enum rte_crypto_op_type cop_type;
+
 	uint32_t i, j, k;
 	uint32_t to_fetch, fetched;
 
@@ -394,13 +384,9 @@ vhost_crypto_worker(void *arg)
 
 	RTE_LOG(INFO, USER1, "Processing on Core %u started\n", lcore_id);
 
-	cop_type = RTE_CRYPTO_OP_TYPE_SYMMETRIC;
-	if (options.asymmetric_crypto)
-		cop_type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
-
 	for (i = 0; i < NB_VIRTIO_QUEUES; i++) {
-		if (rte_crypto_op_bulk_alloc(info->cop_pool,
-				cop_type, ops[i],
+		if (rte_comp_op_bulk_alloc(info->cop_pool,
+				ops[i],
 				burst_size) < burst_size) {
 			RTE_LOG(ERR, USER1, "Failed to alloc cops\n");
 			ret = -1;
@@ -415,27 +401,26 @@ vhost_crypto_worker(void *arg)
 
 			for (j = 0; j < NB_VIRTIO_QUEUES; j++) {
 				to_fetch = RTE_MIN(burst_size,
-						(NB_CRYPTO_DESCRIPTORS -
+						(NB_COMPRESS_DESCRIPTORS -
 						info->nb_inflight_ops));
-				fetched = rte_vhost_crypto_fetch_requests(
+				fetched = rte_vhost_compress_fetch_requests(
 						info->vids[i], j, ops[j],
 						to_fetch);
 				info->nb_inflight_ops +=
-						rte_cryptodev_enqueue_burst(
+						rte_compressdev_enqueue_burst(
 						info->cid, info->qid, ops[j],
 						fetched);
-				if (unlikely(rte_crypto_op_bulk_alloc(
+				if (unlikely(rte_comp_op_bulk_alloc(
 						info->cop_pool,
-						cop_type,
 						ops[j], fetched) < fetched)) {
 					RTE_LOG(ERR, USER1, "Failed realloc\n");
 					return -1;
 				}
-				fetched = rte_cryptodev_dequeue_burst(
+				fetched = rte_compressdev_dequeue_burst(
 						info->cid, info->qid,
 						ops_deq[j], RTE_MIN(burst_size,
 						info->nb_inflight_ops));
-				fetched = rte_vhost_crypto_finalize_requests(
+				fetched = rte_vhost_compress_finalize_requests(
 						ops_deq[j], fetched, callfds,
 						&nb_callfds);
 
@@ -463,7 +448,7 @@ free_resource(void)
 
 	for (i = 0; i < options.nb_los; i++) {
 		struct lcore_option *lo = &options.los[i];
-		struct vhost_crypto_info *info = options.infos[i];
+		struct vhost_compress_info *info = options.infos[i];
 
 		if (!info)
 			continue;
@@ -488,10 +473,9 @@ free_resource(void)
 int
 main(int argc, char *argv[])
 {
-	struct rte_cryptodev_qp_conf qp_conf;
-	struct rte_cryptodev_config config;
-	struct rte_cryptodev_info dev_info;
-	enum rte_crypto_op_type cop_type;
+	struct rte_compressdev_config config;
+	struct rte_compressdev_info dev_info;
+
 	char name[128];
 	uint32_t i, j, lcore;
 	int ret;
@@ -502,13 +486,13 @@ main(int argc, char *argv[])
 	argc -= ret;
 	argv += ret;
 
-	ret = vhost_crypto_parse_args(argc, argv);
+	ret = vhost_compress_parse_args(argc, argv);
 	if (ret < 0)
 		rte_exit(EXIT_FAILURE, "Failed to parse arguments!\n");
 
 	for (i = 0; i < options.nb_los; i++) {
 		struct lcore_option *lo = &options.los[i];
-		struct vhost_crypto_info *info;
+		struct vhost_compress_info *info;
 
 		info = rte_zmalloc_socket(NULL, sizeof(*info),
 				RTE_CACHE_LINE_SIZE, rte_lcore_to_socket_id(
@@ -522,20 +506,21 @@ main(int argc, char *argv[])
 		info->qid = lo->qid;
 		info->nb_vids = lo->nb_sockets;
 
-		rte_cryptodev_info_get(info->cid, &dev_info);
-		if (options.zero_copy == RTE_VHOST_CRYPTO_ZERO_COPY_ENABLE) {
-#define VHOST_CRYPTO_CDEV_NAME_AESNI_MB_PMD	crypto_aesni_mb
-#define VHOST_CRYPTO_CDEV_NAME_AESNI_GCM_PMD	crypto_aesni_gcm
-			if (strstr(dev_info.driver_name,
-				RTE_STR(VHOST_CRYPTO_CDEV_NAME_AESNI_MB_PMD)) ||
-				strstr(dev_info.driver_name,
-				RTE_STR(VHOST_CRYPTO_CDEV_NAME_AESNI_GCM_PMD))) {
-				RTE_LOG(ERR, USER1, "Cannot enable zero-copy in %s\n",
-					dev_info.driver_name);
-				ret = -EPERM;
-				goto error_exit;
-			}
-		}
+		rte_compressdev_info_get(info->cid, &dev_info);
+		//TODO: zero-copy in options
+// 		if (options.zero_copy == RTE_VHOST_COMPRESS_ZERO_COPY_ENABLE) {
+// #define VHOST_COMPRESS_CDEV_NAME_AESNI_MB_PMD	crypto_aesni_mb
+// #define VHOST_CRYPTO_CDEV_NAME_AESNI_GCM_PMD	crypto_aesni_gcm
+// 			if (strstr(dev_info.driver_name,
+// 				RTE_STR(VHOST_CRYPTO_CDEV_NAME_AESNI_MB_PMD)) ||
+// 				strstr(dev_info.driver_name,
+// 				RTE_STR(VHOST_CRYPTO_CDEV_NAME_AESNI_GCM_PMD))) {
+// 				RTE_LOG(ERR, USER1, "Cannot enable zero-copy in %s\n",
+// 					dev_info.driver_name);
+// 				ret = -EPERM;
+// 				goto error_exit;
+// 			}
+// 		}
 
 		if (dev_info.max_nb_queue_pairs < info->qid + 1) {
 			RTE_LOG(ERR, USER1, "Number of queues cannot over %u",
@@ -545,58 +530,48 @@ main(int argc, char *argv[])
 
 		config.nb_queue_pairs = dev_info.max_nb_queue_pairs;
 		config.socket_id = rte_lcore_to_socket_id(lo->lcore_id);
-		config.ff_disable = RTE_CRYPTODEV_FF_SECURITY;
 
-		ret = rte_cryptodev_configure(info->cid, &config);
+		ret = rte_compressdev_configure(info->cid, &config);
 		if (ret < 0) {
-			RTE_LOG(ERR, USER1, "Failed to configure cryptodev %u",
+			RTE_LOG(ERR, USER1, "Failed to configure compressdev %u",
 					info->cid);
 			goto error_exit;
 		}
 
-		if (!options.asymmetric_crypto) {
-			snprintf(name, 127, "SYM_SESS_POOL_%u", lo->lcore_id);
-			info->sess_pool = rte_cryptodev_sym_session_pool_create(name,
-					SESSION_MAP_ENTRIES,
-					rte_cryptodev_sym_get_private_session_size(
-					info->cid), 0, 0,
-					rte_lcore_to_socket_id(lo->lcore_id));
-			cop_type = RTE_CRYPTO_OP_TYPE_SYMMETRIC;
-		} else {
-			snprintf(name, 127, "ASYM_SESS_POOL_%u", lo->lcore_id);
-			info->sess_pool = rte_cryptodev_asym_session_pool_create(name,
-					SESSION_MAP_ENTRIES, 0, 64,
-					rte_lcore_to_socket_id(lo->lcore_id));
-			cop_type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
-		}
+		// session pool
+		snprintf(name, 127, "COMP_SESS_POOL_%u", lo->lcore_id);
+		// info->sess_pool = rte_compressdev_session_pool_create(name,
+		// 	SESSION_MAP_ENTRIES,
+		// 	rte_compressdev_sym_get_private_session_size(
+		// 	info->cid), 0, 0,
+		// 	rte_lcore_to_socket_id(lo->lcore_id));
 
-		if (!info->sess_pool) {
-			RTE_LOG(ERR, USER1, "Failed to create mempool");
-			goto error_exit;
-		}
+		// if (!info->sess_pool) {
+		// 	RTE_LOG(ERR, USER1, "Failed to create mempool");
+		// 	goto error_exit;
+		// }
 
 		snprintf(name, 127, "COPPOOL_%u", lo->lcore_id);
-		info->cop_pool = rte_crypto_op_pool_create(name,
-				cop_type, NB_MEMPOOL_OBJS,
-				NB_CACHE_OBJS, VHOST_CRYPTO_MAX_IV_LEN,
+		info->cop_pool = rte_comp_op_pool_create(name,
+				NB_MEMPOOL_OBJS,
+				NB_CACHE_OBJS, VHOST_COMPRESS_MAX_IV_LEN,
 				rte_lcore_to_socket_id(lo->lcore_id));
 
 		if (!info->cop_pool) {
-			RTE_LOG(ERR, USER1, "Failed to create crypto pool");
+			RTE_LOG(ERR, USER1, "Failed to create compress pool");
 			ret = -ENOMEM;
 			goto error_exit;
 		}
 
 		options.infos[i] = info;
 
-		qp_conf.nb_descriptors = NB_CRYPTO_DESCRIPTORS;
-		qp_conf.mp_session = info->sess_pool;
-		if (options.asymmetric_crypto)
-			qp_conf.mp_session = NULL;
+		// qp_conf.nb_descriptors = NB_COMPRESS_DESCRIPTORS;
+		// qp_conf.mp_session = info->sess_pool;
 
+		// TODO: NUM_MAX_INFLIGHT_OPS
 		for (j = 0; j < dev_info.max_nb_queue_pairs; j++) {
-			ret = rte_cryptodev_queue_pair_setup(info->cid, j,
-					&qp_conf, rte_lcore_to_socket_id(
+			ret = rte_compressdev_queue_pair_setup(info->cid, j,
+					512, rte_lcore_to_socket_id(
 							lo->lcore_id));
 			if (ret < 0) {
 				RTE_LOG(ERR, USER1, "Failed to configure qp\n");
@@ -607,15 +582,15 @@ main(int argc, char *argv[])
 
 	for (i = 0; i < options.nb_los; i++) {
 		struct lcore_option *lo = &options.los[i];
-		struct vhost_crypto_info *info = options.infos[i];
+		struct vhost_compress_info *info = options.infos[i];
 
-		ret = rte_cryptodev_start(lo->cid);
+		ret = rte_compressdev_start(lo->cid);
 		if (ret < 0) {
-			RTE_LOG(ERR, USER1, "Failed to start cryptodev\n");
+			RTE_LOG(ERR, USER1, "Failed to start compressdev\n");
 			goto error_exit;
 		}
 
-		if (rte_eal_remote_launch(vhost_crypto_worker, info,
+		if (rte_eal_remote_launch(vhost_compress_worker, info,
 				lo->lcore_id) < 0) {
 			RTE_LOG(ERR, USER1, "Failed to start worker lcore");
 			goto error_exit;
@@ -631,9 +606,9 @@ main(int argc, char *argv[])
 			}
 
 			rte_vhost_driver_callback_register(lo->socket_files[j],
-				&virtio_crypto_device_ops);
+				&virtio_compress_device_ops);
 
-			ret = rte_vhost_crypto_driver_start(
+			ret = rte_vhost_compress_driver_start(
 					lo->socket_files[j]);
 			if (ret < 0)  {
 				RTE_LOG(ERR, USER1, "failed to start vhost.\n");
