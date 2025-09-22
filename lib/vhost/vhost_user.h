@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #include "rte_vhost.h"
+#include "rte_comp.h"
 
 /* refer to hw/virtio/vhost-user.c */
 
@@ -69,6 +70,8 @@ typedef enum VhostUserRequest {
 	VHOST_USER_SET_INFLIGHT_FD = 32,
 	VHOST_USER_SET_STATUS = 39,
 	VHOST_USER_GET_STATUS = 40,
+	VHOST_USER_COMP_CREATE_SESS = 41,
+	VHOST_USER_COMP_CLOSE_SESS = 42,
 } VhostUserRequest;
 
 typedef enum VhostUserBackendRequest {
@@ -145,6 +148,39 @@ typedef struct VhostUserCryptoSessionParam {
 	int64_t session_id;
 } VhostUserCryptoSessionParam;
 
+typedef struct VhostUserCompDeflateParam {
+	enum rte_comp_huffman huffman;
+} VhostUserCompDeflateParam;
+
+typedef struct VhostUserCompStatelessSessionParam {
+	uint32_t algo;
+	uint8_t op_type;
+
+	int level;
+	uint8_t window_size;
+	enum rte_comp_checksum_type chksum;
+	enum rte_comp_hash_algorithm hash_algo;
+
+	union {
+		VhostUserCompDeflateParam deflate;
+	} u;
+} VhostUserCompStatelessSessionParam;
+
+typedef struct VhostUserCompStatefulSessionParam {
+	uint32_t algo;
+	uint8_t op_type;
+} VhostUserCompStatefulSessionParam;
+
+typedef struct VhostUserCompSessionParam {
+	uint32_t op_code;
+	uint32_t dir; // VIRTIO_COMP_OP_COMPRESS or VIRTIO_COMP_OP_DECOMPRESS
+	union {
+		VhostUserCompStatelessSessionParam stateless;
+		VhostUserCompStatefulSessionParam stateful;
+	} u;
+	int64_t session_id;
+} VhostUserCompSessionParam;
+
 typedef struct VhostUserVringArea {
 	uint64_t u64;
 	uint64_t size;
@@ -189,6 +225,7 @@ typedef struct __rte_packed_begin VhostUserMsg {
 		VhostUserLog    log;
 		struct vhost_iotlb_msg iotlb;
 		VhostUserCryptoSessionParam crypto_session;
+		VhostUserCompSessionParam comp_session;
 		VhostUserVringArea area;
 		VhostUserInflight inflight;
 		struct vhost_user_config cfg;

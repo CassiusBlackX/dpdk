@@ -31,6 +31,7 @@ sources = files(
         'vduse.c',
         'vhost.c',
         'vhost_crypto.c',
+        'vhost_comp.c',
         'vhost_user.c',
         'virtio_net.c',
         'virtio_net_ctrl.c',
@@ -40,8 +41,9 @@ headers = files(
         'rte_vhost.h',
         'rte_vhost_async.h',
         'rte_vhost_crypto.h',
+        'rte_vhost_comp.h',
 )
 driver_sdk_headers = files(
         'vdpa_driver.h',
 )
-deps += ['ethdev', 'cryptodev', 'hash', 'pci', 'dmadev']
+deps += ['ethdev', 'compressdev', 'cryptodev', 'hash', 'pci', 'dmadev']

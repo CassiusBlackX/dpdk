@@ -55,6 +55,7 @@ all_examples = [
         'vhost',
         'vhost_blk',
         'vhost_crypto',
+        'vhost_compress',
         'vm_power_manager',
         'vm_power_manager/guest_cli',
         'vmdq',
