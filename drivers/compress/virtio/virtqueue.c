@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 #include <rte_mbuf.h>
-#include <rte_crypto.h>
+#include <rte_comp.h>
 #include <rte_malloc.h>
 #include <rte_errno.h>
 
@@ -50,21 +50,21 @@ virtqueue_disable_intr(struct virtqueue *vq)
 void
 virtqueue_detatch_unused(struct virtqueue *vq)
 {
-	struct rte_crypto_op *cop = NULL;
+	struct rte_comp_op *cop = NULL;
 
 	int idx;
 
 	if (vq != NULL)
 		for (idx = 0; idx < vq->vq_nentries; idx++) {
-			cop = vq->vq_descx[idx].crypto_op;
+			cop = vq->vq_descx[idx].comp_op;
 			if (cop) {
-				if (cop->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+				if (cop->type == RTE_COMP_OP_STATELESS) {
 					rte_pktmbuf_free(cop->sym->m_src);
 					rte_pktmbuf_free(cop->sym->m_dst);
 				}
 
-				rte_crypto_op_free(cop);
-				vq->vq_descx[idx].crypto_op = NULL;
+				rte_comp_op_free(cop);
+				vq->vq_descx[idx].comp_op = NULL;
 			}
 		}
 }
@@ -112,18 +112,18 @@ virtio_alloc_queue_headers(struct virtqueue *vq, int numa_node, const char *name
 
 	queue_type = virtio_get_queue_type(vq->hw, vq->vq_queue_index);
 	switch (queue_type) {
-	case VTCRYPTO_DATAQ:
+	case VTCOMP_DATAQ:  /* TODO: change the enum of the `queue_type` */
 		/*
 		 * Op cookie for every ring element. This memory can be optimized
 		 * based on descriptor requirements. For example, if a descriptor
 		 * is indirect, then the cookie can be shared among all the
 		 * descriptors in the chain.
 		 */
-		size = vq->vq_nentries * sizeof(struct virtio_crypto_op_cookie);
+		size = vq->vq_nentries * sizeof(struct virtio_comp_op_cookie);
 		hdr_mz = &vq->dq.hdr_mz;
 		hdr_mem = &vq->dq.hdr_mem;
 		break;
-	case VTCRYPTO_CTRLQ:
+	case VTCOMP_CTRLQ:
 		/* One control operation at a time in control queue */
 		size = sizeof(struct virtio_pmd_ctrl);
 		hdr_mz = &vq->cq.hdr_mz;
@@ -162,11 +162,11 @@ virtio_free_queue_headers(struct virtqueue *vq)
 
 	queue_type = virtio_get_queue_type(vq->hw, vq->vq_queue_index);
 	switch (queue_type) {
-	case VTCRYPTO_DATAQ:
+	case VTCOMP_DATAQ:
 		hdr_mz = &vq->dq.hdr_mz;
 		hdr_mem = &vq->dq.hdr_mem;
 		break;
-	case VTCRYPTO_CTRLQ:
+	case VTCOMP_CTRLQ:
 		hdr_mz = &vq->cq.hdr_mz;
 		hdr_mem = &vq->cq.hdr_mem;
 		break;

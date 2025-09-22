@@ -103,7 +103,7 @@ virtqueue_store_flags_packed(struct vring_packed_desc *dp,
 
 #define VIRTQUEUE_MAX_NAME_SZ 32
 
-enum { VTCRYPTO_DATAQ = 0, VTCRYPTO_CTRLQ = 1 };
+enum { VTCOMP_DATAQ = 0, VTCOMP_CTRLQ = 1 };
 
 /**
  * The maximum virtqueue size is 2^15. Use that value as the end of
@@ -114,7 +114,7 @@ enum { VTCRYPTO_DATAQ = 0, VTCRYPTO_CTRLQ = 1 };
 #define VQ_RING_DESC_CHAIN_END 32768
 
 struct vq_desc_extra {
-	void     *crypto_op;
+	void     *comp_op;
 	void     *cookie;
 	uint16_t ndescs;
 	uint16_t next;
@@ -142,8 +142,8 @@ struct virtqueue {
 	};
 
 	union {
-		struct virtcrypto_data dq;
-		struct virtcrypto_ctl cq;
+		struct virtcomp_data dq;
+		struct virtcomp_ctl cq;
 	};
 
 	/**< mem zone to populate RX ring. */
@@ -289,9 +289,9 @@ static inline int
 virtio_get_queue_type(struct virtio_crypto_hw *hw, uint16_t vq_idx)
 {
 	if (vq_idx == hw->max_dataqueues)
-		return VTCRYPTO_CTRLQ;
+		return VTCOMP_CTRLQ;
 	else
-		return VTCRYPTO_DATAQ;
+		return VTCOMP_DATAQ;
 }
 
 /* virtqueue_nused has load-acquire or rte_io_rmb insed */
