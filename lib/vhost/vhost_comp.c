@@ -7,7 +7,6 @@
 #include <rte_mbuf.h>
 #include <rte_compressdev.h>
 
-#include "compressdev/rte_compressdev.h"
 #include "iotlb.h"
 #include "rte_vhost_comp.h"
 #include "vhost.h"
@@ -1054,7 +1053,6 @@ rte_vhost_comp_driver_start(const char *path)
 RTE_EXPORT_SYMBOL(rte_vhost_comp_create)
 int
 rte_vhost_comp_create(int vid, uint8_t compressdev_id,
-		struct rte_mempool *sess_pool,
 		int socket_id)
 {
 	struct virtio_net *dev = get_device(vid);
@@ -1075,7 +1073,7 @@ rte_vhost_comp_create(int vid, uint8_t compressdev_id,
 		return -ENOMEM;
 	}
 
-	vcompress->sess_pool = sess_pool;
+	// vcompress->sess_pool = sess_pool;
 	vcompress->cid = compressdev_id;
 	vcompress->cache_stateful_session_id = UINT64_MAX;
 	vcompress->cache_stateless_session_id = UINT64_MAX;

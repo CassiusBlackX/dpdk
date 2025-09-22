@@ -14,7 +14,7 @@
 #include <rte_cycles.h>
 #include <rte_vhost.h>
 #include <rte_compressdev.h>
-#include <rte_vhost_compress.h>
+#include <rte_vhost_comp.h>
 #include <rte_string_fns.h>
 
 #include <cmdline_rdline.h>
@@ -45,7 +45,7 @@ struct lcore_option {
 struct __rte_cache_aligned vhost_compress_info {
 	int vids[MAX_NB_SOCKETS];
 	uint32_t nb_vids;
-	struct rte_mempool *sess_pool;
+	// struct rte_mempool *sess_pool;
 	struct rte_mempool *cop_pool;
 	uint8_t cid;
 	uint32_t qid;
@@ -255,7 +255,7 @@ vhost_compress_parse_args(int argc, char **argv)
 
 		case OPT_ZERO_COPY_NUM:
 			options.zero_copy =
-				RTE_VHOST_COMPRESS_ZERO_COPY_ENABLE;
+				RTE_VHOST_COMP_ZERO_COPY_ENABLE;
 			break;
 
 		case OPT_POLLING_NUM:
@@ -302,14 +302,14 @@ new_device(int vid)
 		return -ENOENT;
 	}
 
-	ret = rte_vhost_compress_create(vid, info->cid, info->sess_pool,
+	ret = rte_vhost_comp_create(vid, info->cid,
 			rte_lcore_to_socket_id(options.los[i].lcore_id));
 	if (ret) {
 		RTE_LOG(ERR, USER1, "Cannot create vhost compress\n");
 		return ret;
 	}
 
-	ret = rte_vhost_compress_set_zero_copy(vid, options.zero_copy);
+	ret = rte_vhost_comp_set_zero_copy(vid, options.zero_copy);
 	if (ret) {
 		RTE_LOG(ERR, USER1, "Cannot %s zero copy feature\n",
 				options.zero_copy == 1 ? "enable" : "disable");
@@ -356,7 +356,7 @@ destroy_device(int vid)
 
 	rte_wmb();
 
-	rte_vhost_compress_free(vid);
+	rte_vhost_comp_free(vid);
 
 	RTE_LOG(INFO, USER1, "Vhost Compress Device %i Removed\n", vid);
 }
@@ -373,7 +373,7 @@ vhost_compress_worker(void *arg)
 	struct rte_comp_op *ops_deq[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
 	struct vhost_compress_info *info = arg;
 	uint16_t nb_callfds;
-	int callfds[VIRTIO_COMPRESS_MAX_NUM_BURST_VQS];
+	int callfds[VIRTIO_COMP_MAX_NUM_BURST_VQS];
 	uint32_t lcore_id = rte_lcore_id();
 	uint32_t burst_size = MAX_PKT_BURST;
 
@@ -383,6 +383,7 @@ vhost_compress_worker(void *arg)
 	int ret = 0;
 
 	RTE_LOG(INFO, USER1, "Processing on Core %u started\n", lcore_id);
+	RTE_LOG(INFO, USER1, "11111\n");
 
 	for (i = 0; i < NB_VIRTIO_QUEUES; i++) {
 		if (rte_comp_op_bulk_alloc(info->cop_pool,
@@ -393,6 +394,7 @@ vhost_compress_worker(void *arg)
 			goto exit;
 		}
 	}
+	RTE_LOG(INFO, USER1, "11111\n");
 
 	while (1) {
 		for (i = 0; i < info->nb_vids; i++) {
@@ -403,7 +405,7 @@ vhost_compress_worker(void *arg)
 				to_fetch = RTE_MIN(burst_size,
 						(NB_COMPRESS_DESCRIPTORS -
 						info->nb_inflight_ops));
-				fetched = rte_vhost_compress_fetch_requests(
+				fetched = rte_vhost_comp_fetch_requests(
 						info->vids[i], j, ops[j],
 						to_fetch);
 				info->nb_inflight_ops +=
@@ -420,7 +422,7 @@ vhost_compress_worker(void *arg)
 						info->cid, info->qid,
 						ops_deq[j], RTE_MIN(burst_size,
 						info->nb_inflight_ops));
-				fetched = rte_vhost_compress_finalize_requests(
+				fetched = rte_vhost_comp_finalize_requests(
 						ops_deq[j], fetched, callfds,
 						&nb_callfds);
 
@@ -454,7 +456,7 @@ free_resource(void)
 			continue;
 
 		rte_mempool_free(info->cop_pool);
-		rte_mempool_free(info->sess_pool);
+		// rte_mempool_free(info->sess_pool);
 
 		for (j = 0; j < lo->nb_sockets; j++) {
 			rte_vhost_driver_unregister(lo->socket_files[i]);
@@ -521,6 +523,7 @@ main(int argc, char *argv[])
 // 				goto error_exit;
 // 			}
 // 		}
+		dev_info.max_nb_queue_pairs = 4;
 
 		if (dev_info.max_nb_queue_pairs < info->qid + 1) {
 			RTE_LOG(ERR, USER1, "Number of queues cannot over %u",
@@ -530,6 +533,8 @@ main(int argc, char *argv[])
 
 		config.nb_queue_pairs = dev_info.max_nb_queue_pairs;
 		config.socket_id = rte_lcore_to_socket_id(lo->lcore_id);
+		config.max_nb_priv_xforms = 1024;
+		config.max_nb_streams = 1024;
 
 		ret = rte_compressdev_configure(info->cid, &config);
 		if (ret < 0) {
@@ -539,7 +544,7 @@ main(int argc, char *argv[])
 		}
 
 		// session pool
-		snprintf(name, 127, "COMP_SESS_POOL_%u", lo->lcore_id);
+		// snprintf(name, 127, "COMP_SESS_POOL_%u", lo->lcore_id);
 		// info->sess_pool = rte_compressdev_session_pool_create(name,
 		// 	SESSION_MAP_ENTRIES,
 		// 	rte_compressdev_sym_get_private_session_size(
@@ -554,7 +559,7 @@ main(int argc, char *argv[])
 		snprintf(name, 127, "COPPOOL_%u", lo->lcore_id);
 		info->cop_pool = rte_comp_op_pool_create(name,
 				NB_MEMPOOL_OBJS,
-				NB_CACHE_OBJS, VHOST_COMPRESS_MAX_IV_LEN,
+				NB_CACHE_OBJS, VHOST_COMP_MAX_IV_LEN,
 				rte_lcore_to_socket_id(lo->lcore_id));
 
 		if (!info->cop_pool) {
@@ -608,7 +613,7 @@ main(int argc, char *argv[])
 			rte_vhost_driver_callback_register(lo->socket_files[j],
 				&virtio_compress_device_ops);
 
-			ret = rte_vhost_compress_driver_start(
+			ret = rte_vhost_comp_driver_start(
 					lo->socket_files[j]);
 			if (ret < 0)  {
 				RTE_LOG(ERR, USER1, "failed to start vhost.\n");

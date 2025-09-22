@@ -49,8 +49,6 @@ rte_vhost_comp_driver_start(const char *path);
  * @param compressdev_id
  *  The identifier of DPDK Compressdev, the same compressdev_id can be assigned to
  *  multiple Vhost-compress devices.
- * @param sess_pool
- *  The pointer to the created compressdev session pool.
  * @param socket_id
  *  NUMA Socket ID to allocate resources on. *
  * @return
@@ -59,7 +57,6 @@ rte_vhost_comp_driver_start(const char *path);
  */
 int
 rte_vhost_comp_create(int vid, uint8_t compressdev_id,
-		struct rte_mempool *sess_pool,
 		int socket_id);
 
 /**
