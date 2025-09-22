@@ -12,7 +12,7 @@
 #include "virtqueue.h"
 
 static struct virtio_pmd_ctrl *
-virtio_send_command_packed(struct virtcrypto_ctl *cvq,
+virtio_send_command_packed(struct virtcomp_ctl *cvq,
 			   struct virtio_pmd_ctrl *ctrl,
 			   int *dlen, int dnum)
 {
@@ -107,7 +107,7 @@ virtio_send_command_packed(struct virtcrypto_ctl *cvq,
 }
 
 static struct virtio_pmd_ctrl *
-virtio_send_command_split(struct virtcrypto_ctl *cvq,
+virtio_send_command_split(struct virtcomp_ctl *cvq,
 			  struct virtio_pmd_ctrl *ctrl,
 			  int *dlen, int dnum)
 {
@@ -190,7 +190,7 @@ virtio_send_command_split(struct virtcrypto_ctl *cvq,
 }
 
 int
-virtio_crypto_send_command(struct virtcrypto_ctl *cvq, struct virtio_pmd_ctrl *ctrl,
+virtio_crypto_send_command(struct virtcomp_ctl *cvq, struct virtio_pmd_ctrl *ctrl,
 	int *dlen, int dnum)
 {
 	struct virtio_pmd_ctrl *result;

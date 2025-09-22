@@ -83,7 +83,7 @@ virtqueue_fetch_flags_packed(struct vring_packed_desc *dp,
 static inline void
 virtqueue_store_flags_packed(struct vring_packed_desc *dp,
 			      uint16_t flags, uint8_t weak_barriers)
-{
+
 	if (weak_barriers) {
 /* x86 prefers to using rte_io_wmb over rte_atomic_store_explicit as it reports
  * a better perf(~1.5%), which comes from the saved branch by the compiler.

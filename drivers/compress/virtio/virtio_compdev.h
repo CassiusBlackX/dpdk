@@ -32,6 +32,7 @@
 
 extern uint8_t cryptodev_virtio_driver_id;
 
+/* TODO: determine what the cmd will be needed in compress*/
 enum virtio_crypto_cmd_id {
 	VIRTIO_CRYPTO_CMD_CIPHER = 0,
 	VIRTIO_CRYPTO_CMD_AUTH = 1,
@@ -39,9 +40,9 @@ enum virtio_crypto_cmd_id {
 	VIRTIO_CRYPTO_CMD_HASH_CIPHER = 3
 };
 
-struct virtio_crypto_op_cookie {
-	struct virtio_crypto_op_data_req data_req;
-	struct virtio_crypto_inhdr inhdr;
+struct virtio_comp_op_cookie {
+	struct virtio_comp_op_data_req data_req;
+	struct virtio_comp_inhdr inhdr;
 	struct vring_desc desc[NUM_ENTRY_VIRTIO_CRYPTO_OP];
 	uint8_t iv[VIRTIO_CRYPTO_MAX_IV_SIZE];
 	uint8_t message[VIRTIO_CRYPTO_MAX_MSG_SIZE];

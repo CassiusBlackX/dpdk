@@ -50,8 +50,8 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 	struct rte_crypto_op *cop;
 	uint16_t used_idx, desc_idx;
 	uint16_t i;
-	struct virtio_crypto_inhdr *inhdr;
-	struct virtio_crypto_op_cookie *op_cookie;
+	struct virtio_comp_inhdr *inhdr;
+	struct virtio_comp_op_cookie *op_cookie;
 
 	/* Caller does the check */
 	for (i = 0; i < num ; i++) {
@@ -60,7 +60,7 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 		uep = &vq->vq_split.ring.used->ring[used_idx];
 		desc_idx = (uint16_t)uep->id;
 		cop = (struct rte_crypto_op *)
-				vq->vq_descx[desc_idx].crypto_op;
+				vq->vq_descx[desc_idx].comp_op;
 		if (unlikely(cop == NULL)) {
 			VIRTIO_CRYPTO_RX_LOG_DBG("vring descriptor with no "
 					"mbuf cookie at %u",
@@ -68,7 +68,7 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 			break;
 		}
 
-		op_cookie = (struct virtio_crypto_op_cookie *)
+		op_cookie = (struct virtio_comp_op_cookie *)
 						vq->vq_descx[desc_idx].cookie;
 		inhdr = &(op_cookie->inhdr);
 		switch (inhdr->status) {
@@ -102,7 +102,7 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 
 		vq->vq_used_cons_idx++;
 		vq_ring_free_chain(vq, desc_idx);
-		vq->vq_descx[desc_idx].crypto_op = NULL;
+		vq->vq_descx[desc_idx].comp_op = NULL;
 	}
 
 	return i;
@@ -115,8 +115,8 @@ virtqueue_dequeue_burst_rx_packed(struct virtqueue *vq,
 	struct rte_crypto_op *cop;
 	uint16_t used_idx;
 	uint16_t i;
-	struct virtio_crypto_inhdr *inhdr;
-	struct virtio_crypto_op_cookie *op_cookie;
+	struct virtio_comp_inhdr *inhdr;
+	struct virtio_comp_op_cookie *op_cookie;
 	struct vring_packed_desc *desc;
 
 	desc = vq->vq_packed.ring.desc;
@@ -128,7 +128,7 @@ virtqueue_dequeue_burst_rx_packed(struct virtqueue *vq,
 			break;
 
 		cop = (struct rte_crypto_op *)
-				vq->vq_descx[used_idx].crypto_op;
+				vq->vq_descx[used_idx].comp_op;
 		if (unlikely(cop == NULL)) {
 			VIRTIO_CRYPTO_RX_LOG_DBG("vring descriptor with no "
 					"mbuf cookie at %u",
@@ -136,7 +136,7 @@ virtqueue_dequeue_burst_rx_packed(struct virtqueue *vq,
 			break;
 		}
 
-		op_cookie = (struct virtio_crypto_op_cookie *)
+		op_cookie = (struct virtio_comp_op_cookie *)
 						vq->vq_descx[used_idx].cookie;
 		inhdr = &(op_cookie->inhdr);
 		switch (inhdr->status) {
@@ -183,7 +183,7 @@ virtqueue_dequeue_burst_rx_packed(struct virtqueue *vq,
 
 		vq->vq_free_cnt += 4;
 		vq->vq_used_cons_idx += 4;
-		vq->vq_descx[used_idx].crypto_op = NULL;
+		vq->vq_descx[used_idx].comp_op = NULL;
 		if (vq->vq_used_cons_idx >= vq->vq_nentries) {
 			vq->vq_used_cons_idx -= vq->vq_nentries;
 			vq->vq_packed.used_wrap_counter ^= 1;
@@ -230,11 +230,11 @@ virtqueue_crypto_check_chain_request(struct virtio_crypto_alg_chain_data_req *re
 static inline int
 virtqueue_crypto_sym_pkt_header_arrange(
 		struct rte_crypto_op *cop,
-		struct virtio_crypto_op_data_req *data,
+		struct virtio_comp_op_data_req *data,
 		struct virtio_crypto_session *session)
 {
 	struct rte_crypto_sym_op *sym_op = cop->sym;
-	struct virtio_crypto_op_data_req *req_data = data;
+	struct virtio_comp_op_data_req *req_data = data;
 	struct virtio_crypto_op_ctrl_req *ctrl = &session->ctrl.hdr;
 	struct virtio_crypto_sym_create_session_req *sym_sess_req =
 		&ctrl->u.sym_create_session;
@@ -328,17 +328,17 @@ virtqueue_crypto_sym_enqueue_xmit_split(
 	struct vring_desc *start_dp;
 	struct vring_desc *desc;
 	uint64_t indirect_op_data_req_phys_addr;
-	uint16_t req_data_len = sizeof(struct virtio_crypto_op_data_req);
+	uint16_t req_data_len = sizeof(struct virtio_comp_op_data_req);
 	uint32_t indirect_vring_addr_offset = req_data_len +
-		sizeof(struct virtio_crypto_inhdr);
+		sizeof(struct virtio_comp_inhdr);
 	uint32_t indirect_iv_addr_offset =
-			offsetof(struct virtio_crypto_op_cookie, iv);
+			offsetof(struct virtio_comp_op_cookie, iv);
 	struct rte_crypto_sym_op *sym_op = cop->sym;
 	struct virtio_crypto_session *session =
 		CRYPTODEV_GET_SYM_SESS_PRIV(cop->sym->session);
-	struct virtio_crypto_op_data_req *op_data_req;
+	struct virtio_comp_op_data_req *op_data_req;
 	uint32_t hash_result_len = 0;
-	struct virtio_crypto_op_cookie *crypto_op_cookie;
+	struct virtio_comp_op_cookie *crypto_op_cookie;
 	struct virtio_crypto_alg_chain_session_para *para;
 	uint32_t src_len;
 
@@ -363,13 +363,13 @@ virtqueue_crypto_sym_enqueue_xmit_split(
 	crypto_op_cookie = dxp->cookie;
 	indirect_op_data_req_phys_addr =
 		rte_mempool_virt2iova(crypto_op_cookie);
-	op_data_req = (struct virtio_crypto_op_data_req *)crypto_op_cookie;
+	op_data_req = (struct virtio_comp_op_data_req *)crypto_op_cookie;
 
 	if (virtqueue_crypto_sym_pkt_header_arrange(cop, op_data_req, session))
 		return -EFAULT;
 
 	/* status is initialized to VIRTIO_CRYPTO_ERR */
-	((struct virtio_crypto_inhdr *)
+	((struct virtio_comp_inhdr *)
 		((uint8_t *)op_data_req + req_data_len))->status =
 		VIRTIO_CRYPTO_ERR;
 
@@ -447,13 +447,13 @@ virtqueue_crypto_sym_enqueue_xmit_split(
 
 	/* indirect vring: last part, status returned */
 	desc[idx].addr = indirect_op_data_req_phys_addr + req_data_len;
-	desc[idx].len = sizeof(struct virtio_crypto_inhdr);
+	desc[idx].len = sizeof(struct virtio_comp_inhdr);
 	desc[idx++].flags = VRING_DESC_F_WRITE;
 
 	num_entry = idx;
 
 	/* save the infos to use when receiving packets */
-	dxp->crypto_op = (void *)cop;
+	dxp->comp_op = (void *)cop;
 	dxp->ndescs = needed;
 
 	/* use a single buffer */
@@ -486,15 +486,15 @@ virtqueue_crypto_sym_enqueue_xmit_packed(
 	struct vring_packed_desc *start_dp;
 	struct vring_packed_desc *desc;
 	uint64_t op_data_req_phys_addr;
-	uint16_t req_data_len = sizeof(struct virtio_crypto_op_data_req);
+	uint16_t req_data_len = sizeof(struct virtio_comp_op_data_req);
 	uint32_t iv_addr_offset =
-			offsetof(struct virtio_crypto_op_cookie, iv);
+			offsetof(struct virtio_comp_op_cookie, iv);
 	struct rte_crypto_sym_op *sym_op = cop->sym;
 	struct virtio_crypto_session *session =
 		CRYPTODEV_GET_SYM_SESS_PRIV(cop->sym->session);
-	struct virtio_crypto_op_data_req *op_data_req;
+	struct virtio_comp_op_data_req *op_data_req;
 	uint32_t hash_result_len = 0;
-	struct virtio_crypto_op_cookie *crypto_op_cookie;
+	struct virtio_comp_op_cookie *crypto_op_cookie;
 	struct virtio_crypto_alg_chain_session_para *para;
 	uint16_t flags = VRING_DESC_F_NEXT;
 
@@ -518,13 +518,13 @@ virtqueue_crypto_sym_enqueue_xmit_packed(
 	}
 	crypto_op_cookie = dxp->cookie;
 	op_data_req_phys_addr = rte_mempool_virt2iova(crypto_op_cookie);
-	op_data_req = (struct virtio_crypto_op_data_req *)crypto_op_cookie;
+	op_data_req = (struct virtio_comp_op_data_req *)crypto_op_cookie;
 
 	if (virtqueue_crypto_sym_pkt_header_arrange(cop, op_data_req, session))
 		return -EFAULT;
 
 	/* status is initialized to VIRTIO_CRYPTO_ERR */
-	((struct virtio_crypto_inhdr *)
+	((struct virtio_comp_inhdr *)
 		((uint8_t *)op_data_req + req_data_len))->status =
 		VIRTIO_CRYPTO_ERR;
 
@@ -598,7 +598,7 @@ virtqueue_crypto_sym_enqueue_xmit_packed(
 
 	/* packed vring: last part, status returned */
 	desc[idx].addr = op_data_req_phys_addr + req_data_len;
-	desc[idx].len = sizeof(struct virtio_crypto_inhdr);
+	desc[idx].len = sizeof(struct virtio_comp_inhdr);
 	desc[idx++].flags = txvq->vq_packed.cached_flags | VRING_DESC_F_WRITE;
 
 	num_entry = idx;
@@ -609,7 +609,7 @@ virtqueue_crypto_sym_enqueue_xmit_packed(
 	}
 
 	/* save the infos to use when receiving packets */
-	dxp->crypto_op = (void *)cop;
+	dxp->comp_op = (void *)cop;
 	dxp->ndescs = needed;
 
 	txvq->vq_desc_head_idx = (txvq->vq_desc_head_idx + idx) & (txvq->vq_nentries - 1);
@@ -638,11 +638,11 @@ virtqueue_crypto_sym_enqueue_xmit(
 static inline int
 virtqueue_crypto_asym_pkt_header_arrange(
 		struct rte_crypto_op *cop,
-		struct virtio_crypto_op_data_req *data,
+		struct virtio_comp_op_data_req *data,
 		struct virtio_crypto_session *session)
 {
 	struct virtio_crypto_op_ctrl_req *ctrl = &session->ctrl.hdr;
-	struct virtio_crypto_op_data_req *req_data = data;
+	struct virtio_comp_op_data_req *req_data = data;
 	struct rte_crypto_asym_op *asym_op = cop->asym;
 
 	req_data->header.session_id = session->session_id;
@@ -691,14 +691,14 @@ virtqueue_crypto_asym_enqueue_xmit_split(
 		struct virtqueue *txvq,
 		struct rte_crypto_op *cop)
 {
-	uint16_t req_data_len = sizeof(struct virtio_crypto_op_data_req);
+	uint16_t req_data_len = sizeof(struct virtio_comp_op_data_req);
 	uint32_t indirect_vring_addr_offset = req_data_len +
-		sizeof(struct virtio_crypto_inhdr);
+		sizeof(struct virtio_comp_inhdr);
 	struct virtio_crypto_session *session =
 		CRYPTODEV_GET_ASYM_SESS_PRIV(cop->asym->session);
-	struct virtio_crypto_op_cookie *crypto_op_cookie;
+	struct virtio_comp_op_cookie *crypto_op_cookie;
 	struct rte_crypto_asym_op *asym_op = cop->asym;
-	struct virtio_crypto_op_data_req *op_data_req;
+	struct virtio_comp_op_data_req *op_data_req;
 	uint64_t indirect_op_data_req_phys_addr;
 	struct vring_used_elem *uep;
 	struct vring_desc *start_dp;
@@ -726,12 +726,12 @@ virtqueue_crypto_asym_enqueue_xmit_split(
 	crypto_op_cookie = dxp->cookie;
 	indirect_op_data_req_phys_addr =
 		rte_mempool_virt2iova(crypto_op_cookie);
-	op_data_req = (struct virtio_crypto_op_data_req *)crypto_op_cookie;
+	op_data_req = (struct virtio_comp_op_data_req *)crypto_op_cookie;
 	if (virtqueue_crypto_asym_pkt_header_arrange(cop, op_data_req, session))
 		return -EFAULT;
 
 	/* status is initialized to VIRTIO_CRYPTO_ERR */
-	((struct virtio_crypto_inhdr *)
+	((struct virtio_comp_inhdr *)
 		((uint8_t *)op_data_req + req_data_len))->status =
 		VIRTIO_CRYPTO_ERR;
 
@@ -796,13 +796,13 @@ virtqueue_crypto_asym_enqueue_xmit_split(
 
 	/* indirect vring: last part, status returned */
 	desc[idx].addr = indirect_op_data_req_phys_addr + req_data_len;
-	desc[idx].len = sizeof(struct virtio_crypto_inhdr);
+	desc[idx].len = sizeof(struct virtio_comp_inhdr);
 	desc[idx++].flags = VRING_DESC_F_WRITE;
 
 	num_entry = idx;
 
 	/* save the infos to use when receiving packets */
-	dxp->crypto_op = (void *)cop;
+	dxp->comp_op = (void *)cop;
 	dxp->ndescs = needed;
 
 	/* use a single buffer */
@@ -838,12 +838,12 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 	struct vring_packed_desc *start_dp;
 	struct vring_packed_desc *desc;
 	uint64_t op_data_req_phys_addr;
-	uint16_t req_data_len = sizeof(struct virtio_crypto_op_data_req);
+	uint16_t req_data_len = sizeof(struct virtio_comp_op_data_req); 
 	struct rte_crypto_asym_op *asym_op = cop->asym;
 	struct virtio_crypto_session *session =
 		CRYPTODEV_GET_ASYM_SESS_PRIV(cop->asym->session);
-	struct virtio_crypto_op_data_req *op_data_req;
-	struct virtio_crypto_op_cookie *crypto_op_cookie;
+	struct virtio_comp_op_data_req *op_data_req;
+	struct virtio_comp_op_cookie *crypto_op_cookie;
 	uint16_t flags = VRING_DESC_F_NEXT;
 
 	if (unlikely(txvq->vq_free_cnt == 0))
@@ -862,12 +862,12 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 	}
 	crypto_op_cookie = dxp->cookie;
 	op_data_req_phys_addr =	rte_mempool_virt2iova(crypto_op_cookie);
-	op_data_req = (struct virtio_crypto_op_data_req *)crypto_op_cookie;
+	op_data_req = (struct virtio_comp_op_data_req *)crypto_op_cookie;
 	if (virtqueue_crypto_asym_pkt_header_arrange(cop, op_data_req, session))
 		return -EFAULT;
 
 	/* status is initialized to VIRTIO_CRYPTO_ERR */
-	((struct virtio_crypto_inhdr *)
+	((struct virtio_comp_inhdr *)
 		((uint8_t *)op_data_req + req_data_len))->status =
 		VIRTIO_CRYPTO_ERR;
 
@@ -880,7 +880,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 
 	/* packed vring: first part, virtio_crypto_op_data_req */
 	desc[idx].addr = op_data_req_phys_addr;
-	desc[idx].len = sizeof(struct virtio_crypto_op_data_req);
+	desc[idx].len = sizeof(struct virtio_comp_op_data_req);
 	desc[idx++].flags = flags;
 
 	if (asym_op->rsa.op_type == RTE_CRYPTO_ASYM_OP_SIGN) {
@@ -890,7 +890,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 		memcpy(crypto_op_cookie->message, asym_op->rsa.message.data,
 				asym_op->rsa.message.length);
 		desc[idx].addr = op_data_req_phys_addr +
-			offsetof(struct virtio_crypto_op_cookie, message);
+			offsetof(struct virtio_comp_op_cookie, message);
 		desc[idx].len = asym_op->rsa.message.length;
 		desc[idx++].flags = flags;
 
@@ -898,7 +898,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 		if (asym_op->rsa.sign.length > VIRTIO_CRYPTO_MAX_SIGN_SIZE)
 			return -ENOMEM;
 		desc[idx].addr = op_data_req_phys_addr +
-			offsetof(struct virtio_crypto_op_cookie, sign);
+			offsetof(struct virtio_comp_op_cookie, sign);
 		desc[idx].len = asym_op->rsa.sign.length;
 		desc[idx++].flags = flags | VRING_DESC_F_WRITE;
 	} else if (asym_op->rsa.op_type == RTE_CRYPTO_ASYM_OP_VERIFY) {
@@ -908,7 +908,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 		memcpy(crypto_op_cookie->sign, asym_op->rsa.sign.data,
 				asym_op->rsa.sign.length);
 		desc[idx].addr = op_data_req_phys_addr +
-			offsetof(struct virtio_crypto_op_cookie, sign);
+			offsetof(struct virtio_comp_op_cookie, sign);
 		desc[idx].len = asym_op->rsa.sign.length;
 		desc[idx++].flags = flags;
 
@@ -916,7 +916,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 		if (asym_op->rsa.message.length > VIRTIO_CRYPTO_MAX_MSG_SIZE)
 			return -ENOMEM;
 		desc[idx].addr = op_data_req_phys_addr +
-			offsetof(struct virtio_crypto_op_cookie, message);
+			offsetof(struct virtio_comp_op_cookie, message);
 		desc[idx].len = asym_op->rsa.message.length;
 		desc[idx++].flags = flags;
 	} else if (asym_op->rsa.op_type == RTE_CRYPTO_ASYM_OP_ENCRYPT) {
@@ -926,7 +926,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 		memcpy(crypto_op_cookie->message, asym_op->rsa.message.data,
 				asym_op->rsa.message.length);
 		desc[idx].addr = op_data_req_phys_addr +
-			offsetof(struct virtio_crypto_op_cookie, message);
+			offsetof(struct virtio_comp_op_cookie, message);
 		desc[idx].len = asym_op->rsa.message.length;
 		desc[idx++].flags = flags;
 
@@ -934,7 +934,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 		if (asym_op->rsa.cipher.length > VIRTIO_CRYPTO_MAX_CIPHER_SIZE)
 			return -ENOMEM;
 		desc[idx].addr = op_data_req_phys_addr +
-			offsetof(struct virtio_crypto_op_cookie, cipher);
+			offsetof(struct virtio_comp_op_cookie, cipher);
 		desc[idx].len = asym_op->rsa.cipher.length;
 		desc[idx++].flags = flags | VRING_DESC_F_WRITE;
 	} else if (asym_op->rsa.op_type == RTE_CRYPTO_ASYM_OP_DECRYPT) {
@@ -944,7 +944,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 		memcpy(crypto_op_cookie->cipher, asym_op->rsa.cipher.data,
 				asym_op->rsa.cipher.length);
 		desc[idx].addr = op_data_req_phys_addr +
-			offsetof(struct virtio_crypto_op_cookie, cipher);
+			offsetof(struct virtio_comp_op_cookie, cipher);
 		desc[idx].len = asym_op->rsa.cipher.length;
 		desc[idx++].flags = flags;
 
@@ -952,7 +952,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 		if (asym_op->rsa.message.length > VIRTIO_CRYPTO_MAX_MSG_SIZE)
 			return -ENOMEM;
 		desc[idx].addr = op_data_req_phys_addr +
-			offsetof(struct virtio_crypto_op_cookie, message);
+			offsetof(struct virtio_comp_op_cookie, message);
 		desc[idx].len = asym_op->rsa.message.length;
 		desc[idx++].flags = flags | VRING_DESC_F_WRITE;
 	} else {
@@ -962,7 +962,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 
 	/* packed vring: last part, status returned */
 	desc[idx].addr = op_data_req_phys_addr + req_data_len;
-	desc[idx].len = sizeof(struct virtio_crypto_inhdr);
+	desc[idx].len = sizeof(struct virtio_comp_inhdr);
 	desc[idx++].flags = txvq->vq_packed.cached_flags | VRING_DESC_F_WRITE;
 
 	num_entry = idx;
@@ -973,7 +973,7 @@ virtqueue_crypto_asym_enqueue_xmit_packed(
 	}
 
 	/* save the infos to use when receiving packets */
-	dxp->crypto_op = (void *)cop;
+	dxp->comp_op = (void *)cop;
 	dxp->ndescs = needed;
 
 	txvq->vq_desc_head_idx = (txvq->vq_desc_head_idx + idx) & (txvq->vq_nentries - 1);

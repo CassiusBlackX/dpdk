@@ -12,7 +12,7 @@
 
 struct virtqueue;
 
-struct virtcrypto_ctl {
+struct virtcomp_ctl {
 	const struct rte_memzone *hdr_mz; /**< memzone to populate hdr. */
 	rte_iova_t hdr_mem;               /**< hdr for each xmit packet */
 	rte_spinlock_t lock;              /**< spinlock for control queue. */
@@ -27,7 +27,7 @@ struct virtio_pmd_ctrl {
 };
 
 int
-virtio_crypto_send_command(struct virtcrypto_ctl *cvq, struct virtio_pmd_ctrl *ctrl,
+virtio_crypto_send_command(struct virtcomp_ctl *cvq, struct virtio_pmd_ctrl *ctrl,
 	int *dlen, int pkt_num);
 
 #endif /* _VIRTIO_CVQ_H_ */

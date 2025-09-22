@@ -119,13 +119,13 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 		return -EINVAL;
 	}
 
-	if (queue_type == VTCRYPTO_DATAQ) {
+	if (queue_type == VTCOMP_DATAQ) {
 		snprintf(vq_name, sizeof(vq_name), "dev%d_dataqueue%d",
 				dev->data->dev_id, vtpci_queue_idx);
 		snprintf(mpool_name, sizeof(mpool_name),
 				"dev%d_dataqueue%d_mpool",
 				dev->data->dev_id, vtpci_queue_idx);
-	} else if (queue_type == VTCRYPTO_CTRLQ) {
+	} else if (queue_type == VTCOMP_CTRLQ) {
 		snprintf(vq_name, sizeof(vq_name), "dev%d_controlqueue",
 				dev->data->dev_id);
 		snprintf(mpool_name, sizeof(mpool_name),
@@ -152,7 +152,7 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 
 	hw->vqs[vtpci_queue_idx] = vq;
 
-	if (queue_type == VTCRYPTO_DATAQ) {
+	if (queue_type == VTCOMP_DATAQ) {
 		/* pre-allocate a mempool and use it in the data plane to
 		 * improve performance
 		 */
@@ -160,7 +160,7 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 		if (vq->mpool == NULL)
 			vq->mpool = rte_mempool_create(mpool_name,
 					nb_desc,
-					sizeof(struct virtio_crypto_op_cookie),
+					sizeof(struct virtio_comp_op_cookie),
 					RTE_CACHE_LINE_SIZE, 0,
 					NULL, NULL, NULL, NULL, socket_id,
 					0);
@@ -172,7 +172,7 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 		for (i = 0; i < nb_desc; i++) {
 			vq->vq_descx[i].cookie =
 				rte_zmalloc("crypto PMD op cookie pointer",
-					sizeof(struct virtio_crypto_op_cookie),
+					sizeof(struct virtio_comp_op_cookie),
 					RTE_CACHE_LINE_SIZE);
 			if (vq->vq_descx[i].cookie == NULL) {
 				VIRTIO_CRYPTO_DRV_LOG_ERR("Failed to "
@@ -324,7 +324,7 @@ virtio_comp_qp_setup(struct rte_compressdev *dev, uint16_t queue_pair_id,
 	if (dev->data->dev_started)
 		return 0;
 
-	ret = virtio_comp_queue_setup(dev, VTCRYPTO_DATAQ, queue_pair_id,
+	ret = virtio_comp_queue_setup(dev, VTCOMP_DATAQ, queue_pair_id,
 			qp_conf->nb_descriptors, socket_id, &vq);
 	if (ret < 0) {
 		VIRTIO_CRYPTO_INIT_LOG_ERR(
@@ -448,7 +448,7 @@ virtio_comp_init_queue(struct rte_compressdev *dev, uint16_t queue_idx)
 
 	hw->vqs[queue_idx] = vq;
 
-	if (queue_type == VTCRYPTO_CTRLQ) {
+	if (queue_type == VTCOMP_CTRLQ) {
 		hw->cvq = &vq->cq;
 		vq->cq.notify_queue = &virtio_control_queue_notify;
 	}
@@ -462,7 +462,7 @@ virtio_comp_init_queue(struct rte_compressdev *dev, uint16_t queue_idx)
 	return 0;
 
 clean_vq:
-	if (queue_type == VTCRYPTO_CTRLQ)
+	if (queue_type == VTCOMP_CTRLQ)
 		hw->cvq = NULL;
 	virtcrypto_queue_free(vq);
 	hw->vqs[queue_idx] = NULL;

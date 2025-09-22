@@ -5,7 +5,7 @@
 #ifndef _VIRTIO_RXTX_H_
 #define _VIRTIO_RXTX_H_
 
-struct virtcrypto_data {
+struct virtcomp_data {
 	const struct rte_memzone *hdr_mz; /**< memzone to populate hdr. */
 	rte_iova_t hdr_mem;               /**< hdr for each xmit packet */
 };

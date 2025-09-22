@@ -216,7 +216,7 @@ struct virtio_comp_hw {
 	struct virtio_crypto_config *dev_cfg;
 	const struct rte_cryptodev_capabilities *virtio_dev_capabilities;
 	uint8_t weak_barriers;
-	struct virtcrypto_ctl *cvq;
+	struct virtcomp_ctl *cvq;
 	bool use_va;
 };
 
