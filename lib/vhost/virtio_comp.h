@@ -110,7 +110,7 @@ struct virtio_comp_data_para {
 	/* length of source data */
 	uint32_t src_data_len;
 	/* length of dst data */
-	uint32_t dst_data_len;
+	// uint32_t dst_data_len;  // BUG: this var is potentially not needed
 	uint32_t padding;
 };
 

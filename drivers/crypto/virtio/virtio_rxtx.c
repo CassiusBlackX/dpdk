@@ -999,7 +999,7 @@ virtqueue_crypto_asym_enqueue_xmit(
 }
 
 static int
-virtio_crypto_vring_start(struct virtqueue *vq)
+virtio_comp_vring_start(struct virtqueue *vq)
 {
 	struct virtio_crypto_hw *hw = vq->hw;
 	uint8_t *ring_mem = vq->vq_ring_virt_mem;
@@ -1031,7 +1031,7 @@ virtio_crypto_ctrlq_start(struct rte_cryptodev *dev)
 
 	if (hw->cvq) {
 		rte_spinlock_init(&hw->cvq->lock);
-		virtio_crypto_vring_start(virtcrypto_cq_to_vq(hw->cvq));
+		virtio_comp_vring_start(virtcrypto_cq_to_vq(hw->cvq));
 		VIRTQUEUE_DUMP(virtcrypto_cq_to_vq(hw->cvq));
 	}
 }
@@ -1049,7 +1049,7 @@ virtio_crypto_dataq_start(struct rte_cryptodev *dev)
 
 	/* Start data vring. */
 	for (i = 0; i < dev->data->nb_queue_pairs; i++) {
-		virtio_crypto_vring_start(dev->data->queue_pairs[i]);
+		virtio_comp_vring_start(dev->data->queue_pairs[i]);
 		VIRTQUEUE_DUMP((struct virtqueue *)dev->data->queue_pairs[i]);
 	}
 }

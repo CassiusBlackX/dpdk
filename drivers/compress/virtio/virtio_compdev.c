@@ -548,8 +548,8 @@ comp_virtio_dev_init(struct rte_compressdev *cryptodev, uint64_t features,
 
 	cryptodev->dev_ops = &virtio_comp_dev_ops;
 
-	cryptodev->enqueue_burst = virtio_crypto_pkt_tx_burst;
-	cryptodev->dequeue_burst = virtio_crypto_pkt_rx_burst;
+	cryptodev->enqueue_burst = virtio_comp_pkt_tx_burst;
+	cryptodev->dequeue_burst = virtio_comp_pkt_rx_burst;
 
 	/* BUG: cassius guessed about the supported feature flags here */
 	cryptodev->feature_flags = RTE_COMPDEV_FF_HW_ACCELERATED | 
@@ -653,7 +653,7 @@ virtio_comp_dev_configure(struct rte_compressdev *cryptodev,
 		return -1;
 	}
 
-	virtio_crypto_ctrlq_start(cryptodev);
+	virtio_comp_ctrlq_start(cryptodev);
 
 	return 0;
 }
@@ -683,7 +683,7 @@ virtio_comp_dev_start(struct rte_compressdev *dev)
 		return 0;
 
 	/* Do final configuration before queue engine starts */
-	virtio_crypto_dataq_start(dev);
+	virtio_comp_dataq_start(dev);
 	vtpci_cryptodev_reinit_complete(hw);
 
 	dev->data->dev_started = 1;

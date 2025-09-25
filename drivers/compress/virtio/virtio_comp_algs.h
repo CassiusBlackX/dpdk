@@ -7,21 +7,28 @@
 
 #include <rte_memory.h>
 
-#include "virtio_crypto.h"
+#include "virtio_comp.h"
 
-struct virtio_crypto_session {
+/* FIXME: cassius designed virtio_comp_session, 
+not copied, possibly not right 
+*/
+struct virtio_comp_session {
 	uint64_t session_id;
-
+	enum rte_comp_algorithm algo;
+	uint8_t level;
+	uint8_t window_size;
+	uint32_t checksum_type;
+	/*
+	TODO:
+	stateful compress may require ```
 	struct {
-		uint16_t offset;
-		uint16_t length;
-	} iv;
-
-	struct {
-		uint32_t length;
-		phys_addr_t phys_addr;
-	} aad;
-
+		phys_addr_t dict_phys_addr;
+		uint32_t dict_size;
+		uint32_t total_in;
+	} state; 
+	```
+	or other similar fields to store state
+	*/
 	struct virtio_pmd_ctrl ctrl;
 };
 

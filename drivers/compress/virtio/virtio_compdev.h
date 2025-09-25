@@ -32,7 +32,7 @@
 
 extern uint8_t cryptodev_virtio_driver_id;
 
-/* TODO: determine what the cmd will be needed in compress*/
+/* TODO: determine what the cmd will be needed in compress */
 enum virtio_crypto_cmd_id {
 	VIRTIO_CRYPTO_CMD_CIPHER = 0,
 	VIRTIO_CRYPTO_CMD_AUTH = 1,
@@ -40,25 +40,22 @@ enum virtio_crypto_cmd_id {
 	VIRTIO_CRYPTO_CMD_HASH_CIPHER = 3
 };
 
+/* TODO: determine what is needed in op_cookie */
 struct virtio_comp_op_cookie {
 	struct virtio_comp_op_data_req data_req;
 	struct virtio_comp_inhdr inhdr;
 	struct vring_desc desc[NUM_ENTRY_VIRTIO_CRYPTO_OP];
-	uint8_t iv[VIRTIO_CRYPTO_MAX_IV_SIZE];
-	uint8_t message[VIRTIO_CRYPTO_MAX_MSG_SIZE];
-	uint8_t sign[VIRTIO_CRYPTO_MAX_SIGN_SIZE];
-	uint8_t cipher[VIRTIO_CRYPTO_MAX_CIPHER_SIZE];
 };
 
 /*
  * Control queue function prototype
  */
-void virtio_crypto_ctrlq_start(struct rte_cryptodev *dev);
+void virtio_comp_ctrlq_start(struct rte_cryptodev *dev);
 
 /*
  * Data queue function prototype
  */
-void virtio_crypto_dataq_start(struct rte_cryptodev *dev);
+void virtio_comp_dataq_start(struct rte_cryptodev *dev);
 
 int virtio_comp_queue_setup(struct rte_compressdev *dev,
 		int queue_type,
@@ -69,11 +66,11 @@ int virtio_comp_queue_setup(struct rte_compressdev *dev,
 
 void virtio_comp_queue_release(struct virtqueue *vq);
 
-uint16_t virtio_crypto_pkt_tx_burst(void *tx_queue,
+uint16_t virtio_comp_pkt_tx_burst(void *tx_queue,
 		struct rte_crypto_op **tx_pkts,
 		uint16_t nb_pkts);
 
-uint16_t virtio_crypto_pkt_rx_burst(void *tx_queue,
+uint16_t virtio_comp_pkt_rx_burst(void *tx_queue,
 		struct rte_crypto_op **tx_pkts,
 		uint16_t nb_pkts);
 

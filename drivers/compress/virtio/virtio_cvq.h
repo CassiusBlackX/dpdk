@@ -6,7 +6,7 @@
 #define _VIRTIO_CVQ_H_
 
 #include <rte_spinlock.h>
-#include <virtio_crypto.h>
+#include <virtio_comp.h>
 
 #include "virtio_compdev.h"
 
@@ -21,8 +21,8 @@ struct virtcomp_ctl {
 };
 
 struct virtio_pmd_ctrl {
-	struct virtio_crypto_op_ctrl_req hdr;
-	struct virtio_crypto_session_input input;
+	struct virtio_comp_op_ctrl_req hdr;
+	struct virtio_comp_session_input input;
 	uint8_t data[VIRTIO_CRYPTO_MAX_CTRL_DATA];
 };
 

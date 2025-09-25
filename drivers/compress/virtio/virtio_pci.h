@@ -12,7 +12,7 @@
 #include <bus_pci_driver.h>
 #include <rte_cryptodev.h>
 
-#include "virtio_crypto.h"
+#include "virtio_comp.h"
 
 struct virtqueue;
 
@@ -213,8 +213,8 @@ struct virtio_comp_hw {
 	uint8_t     *isr;
 	uint16_t    *notify_base;
 	struct virtio_pci_common_cfg *common_cfg;
-	struct virtio_crypto_config *dev_cfg;
-	const struct rte_cryptodev_capabilities *virtio_dev_capabilities;
+	// struct virtio_crypto_config *dev_cfg;
+	const struct rte_compressdev_capabilities *virtio_dev_capabilities;
 	uint8_t weak_barriers;
 	struct virtcomp_ctl *cvq;
 	bool use_va;

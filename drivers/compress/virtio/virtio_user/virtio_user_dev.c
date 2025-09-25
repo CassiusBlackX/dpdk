@@ -24,7 +24,7 @@
 #include "vhost.h"
 #include "virtio_logs.h"
 #include "cryptodev_pmd.h"
-#include "virtio_crypto.h"
+#include "virtio_comp.h"
 #include "virtio_cvq.h"
 #include "virtio_user_dev.h"
 #include "virtqueue.h"

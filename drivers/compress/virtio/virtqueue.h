@@ -16,7 +16,7 @@
 #include "virtio_pci.h"
 #include "virtio_ring.h"
 #include "virtio_logs.h"
-#include "virtio_crypto.h"
+#include "virtio_comp.h"
 #include "virtio_rxtx.h"
 
 struct rte_mbuf;
