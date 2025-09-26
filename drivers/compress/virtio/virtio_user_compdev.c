@@ -35,7 +35,7 @@ virtio_user_read_dev_config(struct virtio_crypto_hw *hw, size_t offset,
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 
 	if (offset == offsetof(struct virtio_crypto_config, status)) {
-		crypto_virtio_user_dev_update_link_state(dev);
+		comp_virtio_user_dev_update_link_state(dev);
 		*(uint32_t *)dst = dev->crypto_status;
 	} else if (offset == offsetof(struct virtio_crypto_config, max_dataqueues))
 		*(uint16_t *)dst = dev->max_queue_pairs;
@@ -74,7 +74,7 @@ virtio_user_reset(struct virtio_crypto_hw *hw)
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 
 	if (dev->status & VIRTIO_CONFIG_STATUS_DRIVER_OK)
-		crypto_virtio_user_stop_device(dev);
+		comp_virtio_user_stop_device(dev);
 }
 
 static void
@@ -85,7 +85,7 @@ virtio_user_set_status(struct virtio_crypto_hw *hw, uint8_t status)
 
 	if (status & VIRTIO_CONFIG_STATUS_FEATURES_OK &&
 			~old_status & VIRTIO_CONFIG_STATUS_FEATURES_OK) {
-		crypto_virtio_user_dev_set_features(dev);
+		comp_virtio_user_dev_set_features(dev);
 		/* Feature negotiation should be only done in probe time.
 		 * So we skip any more request here.
 		 */
@@ -93,19 +93,19 @@ virtio_user_set_status(struct virtio_crypto_hw *hw, uint8_t status)
 	}
 
 	if (status & VIRTIO_CONFIG_STATUS_DRIVER_OK) {
-		if (crypto_virtio_user_start_device(dev)) {
-			crypto_virtio_user_dev_update_status(dev);
+		if (comp_virtio_user_start_device(dev)) {
+			comp_virtio_user_dev_update_status(dev);
 			return;
 		}
 	} else if (status == VIRTIO_CONFIG_STATUS_RESET) {
 		virtio_user_reset(hw);
 	}
 
-	crypto_virtio_user_dev_set_status(dev, status);
+	comp_virtio_user_dev_set_status(dev, status);
 	if (status & VIRTIO_CONFIG_STATUS_DRIVER_OK && dev->scvq) {
 		if (dev->ops->cvq_enable(dev, 1) < 0) {
 			PMD_INIT_LOG(ERR, "(%s) Failed to start ctrlq", dev->path);
-			crypto_virtio_user_dev_update_status(dev);
+			comp_virtio_user_dev_update_status(dev);
 			return;
 		}
 	}
@@ -116,7 +116,7 @@ virtio_user_get_status(struct virtio_crypto_hw *hw)
 {
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 
-	crypto_virtio_user_dev_update_status(dev);
+	comp_virtio_user_dev_update_status(dev);
 
 	return dev->status;
 }
@@ -455,7 +455,7 @@ virtio_user_pmd_probe(struct rte_vdev_device *vdev)
 	}
 
 	dev = cryptodev->data->dev_private;
-	if (crypto_virtio_user_dev_init(dev, path, queues, queue_size,
+	if (comp_virtio_user_dev_init(dev, path, queues, queue_size,
 			server_mode) < 0) {
 		PMD_INIT_LOG(ERR, "virtio_user_dev_init fails");
 		virtio_user_cryptodev_free(cryptodev);
@@ -466,7 +466,7 @@ virtio_user_pmd_probe(struct rte_vdev_device *vdev)
 	if (crypto_virtio_dev_init(cryptodev, VIRTIO_USER_CRYPTO_PMD_GUEST_FEATURES,
 			NULL) < 0) {
 		PMD_INIT_LOG(ERR, "crypto_virtio_dev_init fails");
-		crypto_virtio_user_dev_uninit(dev);
+		comp_virtio_user_dev_uninit(dev);
 		virtio_user_cryptodev_free(cryptodev);
 		goto end;
 	}

@@ -10,7 +10,7 @@ endif
 includes += include_directories('../../../lib/vhost')
 deps += 'bus_pci'
 sources = files(
-        'virtio_cryptodev.c',
+        'virtio_compdev.c',
         'virtio_cvq.c',
         'virtio_pci.c',
         'virtio_rxtx.c',
@@ -18,7 +18,7 @@ sources = files(
 )
 
 if is_linux
-    sources += files('virtio_user_cryptodev.c',
+    sources += files('virtio_user_compdev.c',
         'virtio_user/vhost_vdpa.c',
         'virtio_user/virtio_user_dev.c')
     deps += ['bus_vdev']

@@ -21,7 +21,7 @@
 #define VIRTIO_PCI_CONFIG(hw) \
 		(((hw)->use_msix == VIRTIO_MSIX_ENABLED) ? 24 : 20)
 
-struct virtio_hw_internal crypto_virtio_hw_internal[RTE_MAX_VIRTIO_CRYPTO];
+struct virtio_hw_internal comp_virtio_hw_internal[RTE_MAX_VIRTIO_CRYPTO];
 
 static inline int
 check_vq_phys_addr_ok(struct virtqueue *vq)
@@ -47,7 +47,7 @@ io_write64_twopart(uint64_t val, uint32_t *lo, uint32_t *hi)
 }
 
 static void
-modern_read_dev_config(struct virtio_crypto_hw *hw, size_t offset,
+modern_read_dev_config(struct virtio_comp_hw *hw, size_t offset,
 		       void *dst, int length)
 {
 	int i;
@@ -66,7 +66,7 @@ modern_read_dev_config(struct virtio_crypto_hw *hw, size_t offset,
 }
 
 static void
-modern_write_dev_config(struct virtio_crypto_hw *hw, size_t offset,
+modern_write_dev_config(struct virtio_comp_hw *hw, size_t offset,
 			const void *src, int length)
 {
 	int i;
@@ -77,7 +77,7 @@ modern_write_dev_config(struct virtio_crypto_hw *hw, size_t offset,
 }
 
 static uint64_t
-modern_get_features(struct virtio_crypto_hw *hw)
+modern_get_features(struct virtio_comp_hw *hw)
 {
 	uint32_t features_lo, features_hi;
 
@@ -91,7 +91,7 @@ modern_get_features(struct virtio_crypto_hw *hw)
 }
 
 static void
-modern_set_features(struct virtio_crypto_hw *hw, uint64_t features)
+modern_set_features(struct virtio_comp_hw *hw, uint64_t features)
 {
 	rte_write32(0, &hw->common_cfg->guest_feature_select);
 	rte_write32(features & ((1ULL << 32) - 1),
@@ -103,39 +103,39 @@ modern_set_features(struct virtio_crypto_hw *hw, uint64_t features)
 }
 
 static uint8_t
-modern_get_status(struct virtio_crypto_hw *hw)
+modern_get_status(struct virtio_comp_hw *hw)
 {
 	return rte_read8(&hw->common_cfg->device_status);
 }
 
 static void
-modern_set_status(struct virtio_crypto_hw *hw, uint8_t status)
+modern_set_status(struct virtio_comp_hw *hw, uint8_t status)
 {
 	rte_write8(status, &hw->common_cfg->device_status);
 }
 
 static void
-modern_reset(struct virtio_crypto_hw *hw)
+modern_reset(struct virtio_comp_hw *hw)
 {
 	modern_set_status(hw, VIRTIO_CONFIG_STATUS_RESET);
 	modern_get_status(hw);
 }
 
 static uint8_t
-modern_get_isr(struct virtio_crypto_hw *hw)
+modern_get_isr(struct virtio_comp_hw *hw)
 {
 	return rte_read8(hw->isr);
 }
 
 static uint16_t
-modern_set_config_irq(struct virtio_crypto_hw *hw, uint16_t vec)
+modern_set_config_irq(struct virtio_comp_hw *hw, uint16_t vec)
 {
 	rte_write16(vec, &hw->common_cfg->msix_config);
 	return rte_read16(&hw->common_cfg->msix_config);
 }
 
 static uint16_t
-modern_set_queue_irq(struct virtio_crypto_hw *hw, struct virtqueue *vq,
+modern_set_queue_irq(struct virtio_comp_hw *hw, struct virtqueue *vq,
 		uint16_t vec)
 {
 	rte_write16(vq->vq_queue_index, &hw->common_cfg->queue_select);
@@ -144,14 +144,14 @@ modern_set_queue_irq(struct virtio_crypto_hw *hw, struct virtqueue *vq,
 }
 
 static uint16_t
-modern_get_queue_num(struct virtio_crypto_hw *hw, uint16_t queue_id)
+modern_get_queue_num(struct virtio_comp_hw *hw, uint16_t queue_id)
 {
 	rte_write16(queue_id, &hw->common_cfg->queue_select);
 	return rte_read16(&hw->common_cfg->queue_size);
 }
 
 static int
-modern_setup_queue(struct virtio_crypto_hw *hw, struct virtqueue *vq)
+modern_setup_queue(struct virtio_comp_hw *hw, struct virtqueue *vq)
 {
 	uint64_t desc_addr, avail_addr, used_addr;
 	uint16_t notify_off;
@@ -191,7 +191,7 @@ modern_setup_queue(struct virtio_crypto_hw *hw, struct virtqueue *vq)
 }
 
 static void
-modern_del_queue(struct virtio_crypto_hw *hw, struct virtqueue *vq)
+modern_del_queue(struct virtio_comp_hw *hw, struct virtqueue *vq)
 {
 	rte_write16(vq->vq_queue_index, &hw->common_cfg->queue_select);
 
@@ -206,7 +206,7 @@ modern_del_queue(struct virtio_crypto_hw *hw, struct virtqueue *vq)
 }
 
 static void
-modern_notify_queue(struct virtio_crypto_hw *hw __rte_unused,
+modern_notify_queue(struct virtio_comp_hw *hw __rte_unused,
 		struct virtqueue *vq)
 {
 	rte_write16(vq->vq_queue_index, vq->notify_addr);
@@ -230,21 +230,21 @@ const struct virtio_pci_ops virtio_crypto_modern_ops = {
 };
 
 void
-vtpci_read_cryptodev_config(struct virtio_crypto_hw *hw, size_t offset,
+vtpci_read_cryptodev_config(struct virtio_comp_hw *hw, size_t offset,
 		void *dst, int length)
 {
 	VTPCI_OPS(hw)->read_dev_cfg(hw, offset, dst, length);
 }
 
 void
-vtpci_write_cryptodev_config(struct virtio_crypto_hw *hw, size_t offset,
+vtpci_write_cryptodev_config(struct virtio_comp_hw *hw, size_t offset,
 		const void *src, int length)
 {
 	VTPCI_OPS(hw)->write_dev_cfg(hw, offset, src, length);
 }
 
 uint64_t
-vtpci_cryptodev_negotiate_features(struct virtio_crypto_hw *hw,
+vtpci_cryptodev_negotiate_features(struct virtio_comp_hw *hw,
 		uint64_t host_features)
 {
 	uint64_t features;
@@ -260,7 +260,7 @@ vtpci_cryptodev_negotiate_features(struct virtio_crypto_hw *hw,
 }
 
 void
-vtpci_cryptodev_reset(struct virtio_crypto_hw *hw)
+vtpci_cryptodev_reset(struct virtio_comp_hw *hw)
 {
 	VTPCI_OPS(hw)->set_status(hw, VIRTIO_CONFIG_STATUS_RESET);
 	/* flush status write */
@@ -268,13 +268,13 @@ vtpci_cryptodev_reset(struct virtio_crypto_hw *hw)
 }
 
 void
-vtpci_cryptodev_reinit_complete(struct virtio_crypto_hw *hw)
+vtpci_cryptodev_reinit_complete(struct virtio_comp_hw *hw)
 {
 	vtpci_cryptodev_set_status(hw, VIRTIO_CONFIG_STATUS_DRIVER_OK);
 }
 
 void
-vtpci_cryptodev_set_status(struct virtio_crypto_hw *hw, uint8_t status)
+vtpci_cryptodev_set_status(struct virtio_comp_hw *hw, uint8_t status)
 {
 	if (status != VIRTIO_CONFIG_STATUS_RESET)
 		status |= VTPCI_OPS(hw)->get_status(hw);
@@ -283,13 +283,13 @@ vtpci_cryptodev_set_status(struct virtio_crypto_hw *hw, uint8_t status)
 }
 
 uint8_t
-vtpci_cryptodev_get_status(struct virtio_crypto_hw *hw)
+vtpci_cryptodev_get_status(struct virtio_comp_hw *hw)
 {
 	return VTPCI_OPS(hw)->get_status(hw);
 }
 
 uint8_t
-vtpci_cryptodev_isr(struct virtio_crypto_hw *hw)
+vtpci_cryptodev_isr(struct virtio_comp_hw *hw)
 {
 	return VTPCI_OPS(hw)->get_isr(hw);
 }
@@ -330,7 +330,7 @@ get_cfg_addr(struct rte_pci_device *dev, struct virtio_pci_cap *cap)
 }
 
 static int
-virtio_read_caps(struct rte_pci_device *dev, struct virtio_crypto_hw *hw)
+virtio_read_caps(struct rte_pci_device *dev, struct virtio_comp_hw *hw)
 {
 	struct virtio_pci_cap cap;
 	uint16_t flags;
@@ -415,7 +415,7 @@ virtio_read_caps(struct rte_pci_device *dev, struct virtio_crypto_hw *hw)
  * Return 0 on success.
  */
 int
-vtpci_cryptodev_init(struct rte_pci_device *dev, struct virtio_crypto_hw *hw)
+vtpci_cryptodev_init(struct rte_pci_device *dev, struct virtio_comp_hw *hw)
 {
 	/*
 	 * Try if we can succeed reading virtio pci caps, which exists
@@ -424,7 +424,7 @@ vtpci_cryptodev_init(struct rte_pci_device *dev, struct virtio_crypto_hw *hw)
 	 */
 	if (virtio_read_caps(dev, hw) == 0) {
 		VIRTIO_CRYPTO_INIT_LOG_INFO("modern virtio pci detected.");
-		crypto_virtio_hw_internal[hw->dev_id].vtpci_ops =
+		comp_virtio_hw_internal[hw->dev_id].vtpci_ops =
 					&virtio_crypto_modern_ops;
 		hw->modern = 1;
 		return 0;

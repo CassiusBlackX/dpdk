@@ -23,7 +23,8 @@
 
 #include "vhost.h"
 #include "virtio_logs.h"
-#include "cryptodev_pmd.h"
+// #include "cryptodev_pmd.h"
+#include "rte_compressdev_pmd.h"
 #include "virtio_comp.h"
 #include "virtio_cvq.h"
 #include "virtio_user_dev.h"
@@ -210,7 +211,7 @@ virtio_user_foreach_queue(struct virtio_user_dev *dev,
 }
 
 int
-crypto_virtio_user_dev_set_features(struct virtio_user_dev *dev)
+comp_virtio_user_dev_set_features(struct virtio_user_dev *dev)
 {
 	uint64_t features;
 	int ret = -1;
@@ -234,7 +235,7 @@ error:
 }
 
 int
-crypto_virtio_user_start_device(struct virtio_user_dev *dev)
+comp_virtio_user_start_device(struct virtio_user_dev *dev)
 {
 	int ret;
 
@@ -291,7 +292,7 @@ error:
 	return -1;
 }
 
-int crypto_virtio_user_stop_device(struct virtio_user_dev *dev)
+int comp_virtio_user_stop_device(struct virtio_user_dev *dev)
 {
 	uint32_t i;
 	int ret;
@@ -360,7 +361,7 @@ virtio_user_dev_init_max_queue_pairs(struct virtio_user_dev *dev, uint32_t user_
 static int
 virtio_user_dev_init_cipher_services(struct virtio_user_dev *dev)
 {
-	struct virtio_crypto_config config;
+	struct virtio_comp_config config;
 	int ret;
 
 	dev->crypto_services = RTE_BIT32(VIRTIO_CRYPTO_SERVICE_CIPHER);
@@ -377,7 +378,8 @@ virtio_user_dev_init_cipher_services(struct virtio_user_dev *dev)
 		return ret;
 	}
 
-	dev->crypto_services = config.crypto_services;
+	/* TODO: the following variables are not needed in compression*/
+	dev->crypto_services = config.compress_services;
 	dev->cipher_algo = ((uint64_t)config.cipher_algo_h << 32) |
 						config.cipher_algo_l;
 	dev->hash_algo = config.hash_algo;
@@ -575,18 +577,15 @@ virtio_user_free_vrings(struct virtio_user_dev *dev)
 	dev->callfds = NULL;
 }
 
+/* TODO: assume that virtio frontend support all features*/
 #define VIRTIO_USER_SUPPORTED_FEATURES   \
-	(1ULL << VIRTIO_CRYPTO_SERVICE_CIPHER     | \
-	 1ULL << VIRTIO_CRYPTO_SERVICE_HASH       | \
-	 1ULL << VIRTIO_CRYPTO_SERVICE_AKCIPHER   | \
-	 1ULL << VIRTIO_F_VERSION_1               | \
-	 1ULL << VIRTIO_F_IN_ORDER                | \
-	 1ULL << VIRTIO_F_RING_PACKED             | \
-	 1ULL << VIRTIO_F_NOTIFICATION_DATA       | \
-	 1ULL << VIRTIO_F_ORDER_PLATFORM)
+	(1ULL << VIRTIO_COMP_STATEFUL_CREATE_SESSION  | \
+	 1ULL << VIRTIO_COMP_STATEFUL_DESTROY_SESSION | \
+	 1ULL << VIRTIO_COMP_STATELESS_CREATE_SESSION | \
+	 1ULL << VIRTIO_COMP_STATELESS_DESTROY_SESSION)
 
 int
-crypto_virtio_user_dev_init(struct virtio_user_dev *dev, char *path, uint16_t queues,
+comp_virtio_user_dev_init(struct virtio_user_dev *dev, char *path, uint16_t queues,
 			int queue_size, int server)
 {
 	uint64_t backend_features;
@@ -671,9 +670,9 @@ destroy:
 }
 
 void
-crypto_virtio_user_dev_uninit(struct virtio_user_dev *dev)
+comp_virtio_user_dev_uninit(struct virtio_user_dev *dev)
 {
-	crypto_virtio_user_stop_device(dev);
+	comp_virtio_user_stop_device(dev);
 
 	rte_mem_event_callback_unregister(VIRTIO_USER_MEM_EVENT_CLB_NAME, dev);
 
@@ -690,7 +689,7 @@ crypto_virtio_user_dev_uninit(struct virtio_user_dev *dev)
 #define CVQ_MAX_DATA_DESCS 32
 
 int
-crypto_virtio_user_dev_set_status(struct virtio_user_dev *dev, uint8_t status)
+comp_virtio_user_dev_set_status(struct virtio_user_dev *dev, uint8_t status)
 {
 	int ret;
 
@@ -705,7 +704,7 @@ crypto_virtio_user_dev_set_status(struct virtio_user_dev *dev, uint8_t status)
 }
 
 int
-crypto_virtio_user_dev_update_status(struct virtio_user_dev *dev)
+comp_virtio_user_dev_update_status(struct virtio_user_dev *dev)
 {
 	int ret;
 	uint8_t status;
@@ -740,7 +739,7 @@ crypto_virtio_user_dev_update_status(struct virtio_user_dev *dev)
 }
 
 int
-crypto_virtio_user_dev_update_link_state(struct virtio_user_dev *dev)
+comp_virtio_user_dev_update_link_state(struct virtio_user_dev *dev)
 {
 	if (dev->ops->update_link_state)
 		return dev->ops->update_link_state(dev);

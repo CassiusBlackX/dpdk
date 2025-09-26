@@ -213,7 +213,7 @@ struct virtio_comp_hw {
 	uint8_t     *isr;
 	uint16_t    *notify_base;
 	struct virtio_pci_common_cfg *common_cfg;
-	// struct virtio_crypto_config *dev_cfg;
+	struct virtio_comp_config *dev_cfg;
 	const struct rte_compressdev_capabilities *virtio_dev_capabilities;
 	uint8_t weak_barriers;
 	struct virtcomp_ctl *cvq;
@@ -230,10 +230,10 @@ struct virtio_hw_internal {
 	struct rte_pci_ioport io;
 };
 
-#define VTPCI_OPS(hw)	(crypto_virtio_hw_internal[(hw)->dev_id].vtpci_ops)
-#define VTPCI_IO(hw)	(&crypto_virtio_hw_internal[(hw)->dev_id].io)
+#define VTPCI_OPS(hw)	(comp_virtio_hw_internal[(hw)->dev_id].vtpci_ops)
+#define VTPCI_IO(hw)	(&comp_virtio_hw_internal[(hw)->dev_id].io)
 
-extern struct virtio_hw_internal crypto_virtio_hw_internal[RTE_MAX_VIRTIO_CRYPTO];
+extern struct virtio_hw_internal comp_virtio_hw_internal[RTE_MAX_VIRTIO_CRYPTO];
 
 /*
  * How many bits to shift physical queue address written to QUEUE_PFN.

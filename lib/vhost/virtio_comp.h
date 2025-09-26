@@ -157,6 +157,9 @@ struct virtio_comp_config {
 	 */
 	uint32_t  max_dataqueues;
 
+
+	/* TODO: the following variables are not needed in compression*/
+
 	/*
 	 * Specifies the services mask which the device support,
 	 * see VIRTIO_COMP_SERVICE_* above

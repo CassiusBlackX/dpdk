@@ -26,7 +26,7 @@ struct virtio_user_queue {
 };
 
 struct virtio_user_dev {
-	struct virtio_crypto_hw hw;
+	struct virtio_comp_hw hw;
 	enum virtio_user_backend_type backend_type;
 	bool		is_server;  /* server or client mode */
 
@@ -72,14 +72,14 @@ struct virtio_user_dev {
 	uint16_t **notify_area;
 };
 
-int crypto_virtio_user_dev_set_features(struct virtio_user_dev *dev);
-int crypto_virtio_user_start_device(struct virtio_user_dev *dev);
-int crypto_virtio_user_stop_device(struct virtio_user_dev *dev);
-int crypto_virtio_user_dev_init(struct virtio_user_dev *dev, char *path, uint16_t queues,
+int comp_virtio_user_dev_set_features(struct virtio_user_dev *dev);
+int comp_virtio_user_start_device(struct virtio_user_dev *dev);
+int comp_virtio_user_stop_device(struct virtio_user_dev *dev);
+int comp_virtio_user_dev_init(struct virtio_user_dev *dev, char *path, uint16_t queues,
 			int queue_size, int server);
-void crypto_virtio_user_dev_uninit(struct virtio_user_dev *dev);
-int crypto_virtio_user_dev_set_status(struct virtio_user_dev *dev, uint8_t status);
-int crypto_virtio_user_dev_update_status(struct virtio_user_dev *dev);
-int crypto_virtio_user_dev_update_link_state(struct virtio_user_dev *dev);
+void comp_virtio_user_dev_uninit(struct virtio_user_dev *dev);
+int comp_virtio_user_dev_set_status(struct virtio_user_dev *dev, uint8_t status);
+int comp_virtio_user_dev_update_status(struct virtio_user_dev *dev);
+int comp_virtio_user_dev_update_link_state(struct virtio_user_dev *dev);
 extern const char * const crypto_virtio_user_backend_strings[];
 #endif
