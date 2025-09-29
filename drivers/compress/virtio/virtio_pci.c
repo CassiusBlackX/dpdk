@@ -431,7 +431,7 @@ vtpci_compdev_init(struct rte_pci_device *dev, struct virtio_comp_hw *hw)
 	}
 
 	/*
-	 * virtio crypto conforms to virtio 1.0 and doesn't support
+	 * virtio comp conforms to virtio 1.0 and doesn't support
 	 * legacy mode
 	 */
 	return -1;

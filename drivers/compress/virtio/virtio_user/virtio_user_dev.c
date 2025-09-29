@@ -23,7 +23,6 @@
 
 #include "vhost.h"
 #include "virtio_logs.h"
-// #include "cryptodev_pmd.h"
 #include "rte_compressdev_pmd.h"
 #include "virtio_comp.h"
 #include "virtio_cvq.h"
@@ -32,7 +31,7 @@
 
 #define VIRTIO_USER_MEM_EVENT_CLB_NAME "virtio_user_mem_event_clb"
 
-const char * const crypto_virtio_user_backend_strings[] = {
+const char * const comp_virtio_user_backend_strings[] = {
 	[VIRTIO_USER_BACKEND_UNKNOWN] = "VIRTIO_USER_BACKEND_UNKNOWN",
 	[VIRTIO_USER_BACKEND_VHOST_VDPA] = "VHOST_VDPA",
 };
@@ -374,7 +373,7 @@ virtio_user_dev_init_cipher_services(struct virtio_user_dev *dev)
 
 	ret = dev->ops->get_config(dev, (uint8_t *)&config,	0, sizeof(config));
 	if (ret) {
-		PMD_DRV_LOG(ERR, "(%s) Failed to get crypto config from device", dev->path);
+		PMD_DRV_LOG(ERR, "(%s) Failed to get comp config from device", dev->path);
 		return ret;
 	}
 
@@ -477,7 +476,7 @@ virtio_user_dev_setup(struct virtio_user_dev *dev)
 
 	switch (dev->backend_type) {
 	case VIRTIO_USER_BACKEND_VHOST_VDPA:
-		dev->ops = &virtio_crypto_ops_vdpa;
+		dev->ops = &virtio_comp_ops_vdpa;
 		break;
 	default:
 		PMD_DRV_LOG(ERR, "(%s) Unknown backend type", dev->path);

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright(c) 2018 HUAWEI TECHNOLOGIES CO., LTD.
  */
-#include <cryptodev_pmd.h>
+#include <rte_compressdev.h>
 
 #include "virtqueue.h"
 #include "virtio_ring.h"
@@ -202,7 +202,6 @@ virtqueue_comp_sym_pkt_header_arrange(
 		struct virtio_comp_op_data_req *data,
 		struct virtio_comp_session *session)
 {
-	// struct rte_crypto_sym_op *sym_op = cop->sym;
 	struct virtio_comp_op_data_req *req_data = data;
 	struct virtio_comp_op_ctrl_req *ctrl = &session->ctrl.hdr;
 	struct virtio_comp_stateless_create_session_req *stateless_sess_req =
@@ -225,7 +224,7 @@ virtqueue_comp_sym_pkt_header_arrange(
 }
 
 static inline int
-virtqueue_comp_sym_enqueue_xmit_split(
+virtqueue_comp_stateless_enqueue_xmit_split(
 		struct virtqueue *txvq,
 		struct rte_comp_op *cop)
 {
@@ -244,7 +243,7 @@ virtqueue_comp_sym_enqueue_xmit_split(
 	struct virtio_comp_op_data_req *op_data_req;
 	uint32_t hash_result_len = 0;
 	struct virtio_comp_op_cookie *comp_op_cookie;
-	struct virtio_crypto_alg_chain_session_para *para;
+	// struct virtio_crypto_alg_chain_session_para *para;
 	uint32_t src_len;
 
 	if (unlikely(cop->m_src->nb_segs != 1))
@@ -287,7 +286,7 @@ virtqueue_comp_sym_enqueue_xmit_split(
 
 	idx = 0;
 
-	/* indirect vring: first part, virtio_crypto_op_data_req */
+	/* indirect vring: first part, virtio_comp_op_data_req */
 	desc[idx].addr = indirect_op_data_req_phys_addr;
 	desc[idx].len = req_data_len;
 	desc[idx++].flags = VRING_DESC_F_NEXT;
@@ -352,7 +351,7 @@ virtqueue_comp_sym_enqueue_xmit_split(
 }
 
 static inline int
-virtqueue_comp_sym_enqueue_xmit_packed(
+virtqueue_comp_stateless_enqueue_xmit_packed(
 		struct virtqueue *txvq,
 		struct rte_comp_op *cop)
 {
@@ -371,7 +370,7 @@ virtqueue_comp_sym_enqueue_xmit_packed(
 		CRYPTODEV_GET_SYM_SESS_PRIV(cop->sym->session);
 	struct virtio_comp_op_data_req *op_data_req;
 	uint32_t hash_result_len = 0;
-	struct virtio_comp_op_cookie *crypto_op_cookie;
+	struct virtio_comp_op_cookie *comp_op_cookie;
 	struct virtio_crypto_alg_chain_session_para *para;
 	uint16_t flags = VRING_DESC_F_NEXT;
 
@@ -393,9 +392,9 @@ virtqueue_comp_sym_enqueue_xmit_packed(
 		VIRTIO_CRYPTO_TX_LOG_ERR("can not get cookie");
 		return -EFAULT;
 	}
-	crypto_op_cookie = dxp->cookie;
-	op_data_req_phys_addr = rte_mempool_virt2iova(crypto_op_cookie);
-	op_data_req = (struct virtio_comp_op_data_req *)crypto_op_cookie;
+	comp_op_cookie = dxp->cookie;
+	op_data_req_phys_addr = rte_mempool_virt2iova(comp_op_cookie);
+	op_data_req = (struct virtio_comp_op_data_req *)comp_op_cookie;
 
 	if (virtqueue_comp_sym_pkt_header_arrange(cop, op_data_req, session))
 		return -EFAULT;
@@ -473,14 +472,14 @@ virtqueue_comp_sym_enqueue_xmit_packed(
 }
 
 static inline int
-virtqueue_comp_sym_enqueue_xmit(
+virtqueue_comp_stateless_enqueue_xmit(
 		struct virtqueue *txvq,
 		struct rte_comp_op *cop)
 {
 	if (vtpci_with_packed_queue(txvq->hw))
-		return virtqueue_comp_sym_enqueue_xmit_packed(txvq, cop);
+		return virtqueue_comp_stateless_enqueue_xmit_packed(txvq, cop);
 	else
-		return virtqueue_comp_sym_enqueue_xmit_split(txvq, cop);
+		return virtqueue_comp_stateless_enqueue_xmit_split(txvq, cop);
 }
 
 static int
@@ -611,12 +610,12 @@ virtio_comp_pkt_tx_burst(void *tx_queue, struct rte_comp_op **tx_pkts,
 			}
 
 			/* Enqueue Packet buffers */
-			error = virtqueue_comp_sym_enqueue_xmit(txvq, tx_pkts[nb_tx]);
-		} else if (tx_pkts[nb_tx]->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
-			/* Enqueue Packet buffers */
-			error = virtqueue_crypto_asym_enqueue_xmit(txvq, tx_pkts[nb_tx]);
+			error = virtqueue_comp_stateless_enqueue_xmit(txvq, tx_pkts[nb_tx]);
+		// } else if (tx_pkts[nb_tx]->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+		// 	/* Enqueue Packet buffers */
+		// 	error = virtqueue_crypto_asym_enqueue_xmit(txvq, tx_pkts[nb_tx]);
 		} else {
-			VIRTIO_CRYPTO_TX_LOG_ERR("invalid crypto op type %u",
+			VIRTIO_CRYPTO_TX_LOG_ERR("invalid comp op type %u",
 				tx_pkts[nb_tx]->type);
 			txvq->packets_sent_failed++;
 			continue;

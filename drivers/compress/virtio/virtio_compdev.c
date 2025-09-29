@@ -171,7 +171,7 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 		}
 		for (i = 0; i < nb_desc; i++) {
 			vq->vq_descx[i].cookie =
-				rte_zmalloc("crypto PMD op cookie pointer",
+				rte_zmalloc("comp PMD op cookie pointer",
 					sizeof(struct virtio_comp_op_cookie),
 					RTE_CACHE_LINE_SIZE);
 			if (vq->vq_descx[i].cookie == NULL) {
@@ -328,7 +328,7 @@ virtio_comp_qp_setup(struct rte_compressdev *dev, uint16_t queue_pair_id,
 			qp_conf->nb_descriptors, socket_id, &vq);
 	if (ret < 0) {
 		VIRTIO_CRYPTO_INIT_LOG_ERR(
-			"virtio crypto data queue initialization failed");
+			"virtio comp data queue initialization failed");
 		return ret;
 	}
 

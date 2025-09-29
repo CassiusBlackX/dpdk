@@ -11,7 +11,7 @@
 #include "../virtio_pci.h"
 #include "../virtio_ring.h"
 
-extern struct virtio_user_backend_ops virtio_crypto_ops_vdpa;
+extern struct virtio_user_backend_ops virtio_comp_ops_vdpa;
 
 enum virtio_user_backend_type {
 	VIRTIO_USER_BACKEND_UNKNOWN,
@@ -82,5 +82,5 @@ void comp_virtio_user_dev_uninit(struct virtio_user_dev *dev);
 int comp_virtio_user_dev_set_status(struct virtio_user_dev *dev, uint8_t status);
 int comp_virtio_user_dev_update_status(struct virtio_user_dev *dev);
 int comp_virtio_user_dev_update_link_state(struct virtio_user_dev *dev);
-extern const char * const crypto_virtio_user_backend_strings[];
+extern const char * const comp_virtio_user_backend_strings[];
 #endif

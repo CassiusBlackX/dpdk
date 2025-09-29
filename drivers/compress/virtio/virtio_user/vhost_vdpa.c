@@ -681,7 +681,7 @@ map_err:
 	return -1;
 }
 
-struct virtio_user_backend_ops virtio_crypto_ops_vdpa = {
+struct virtio_user_backend_ops virtio_comp_ops_vdpa = {
 	.setup = vhost_vdpa_setup,
 	.destroy = vhost_vdpa_destroy,
 	.get_backend_features = vhost_vdpa_get_backend_features,
