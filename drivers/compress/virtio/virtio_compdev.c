@@ -18,18 +18,18 @@
 #include "virtio_comp_capabilities.h"
 
 static int virtio_comp_dev_configure(struct rte_compressdev *dev,
-		struct rte_cryptodev_config *config);
+		struct rte_compressdev_config *config);
 static int virtio_comp_dev_start(struct rte_compressdev *dev);
 static void virtio_comp_dev_stop(struct rte_compressdev *dev);
 static int virtio_comp_dev_close(struct rte_compressdev *dev);
 static void virtio_comp_dev_info_get(struct rte_compressdev *dev,
-		struct rte_cryptodev_info *dev_info);
+		struct rte_compressdev_info *dev_info);
 static void virtio_comp_dev_stats_get(struct rte_compressdev *dev,
-		struct rte_cryptodev_stats *stats);
+		struct rte_compressdev_stats *stats);
 static void virtio_comp_dev_stats_reset(struct rte_compressdev *dev);
 static int virtio_comp_qp_setup(struct rte_compressdev *dev,
 		uint16_t queue_pair_id,
-		const struct rte_cryptodev_qp_conf *qp_conf,
+		const struct rte_cryptodev_qp_conf *qp_conf,  /* TODO: no similar struct in rte_compressdev.h*/
 		int socket_id);
 static int virtio_comp_qp_release(struct rte_compressdev *dev,
 		uint16_t queue_pair_id);
@@ -60,7 +60,7 @@ static const struct rte_compressdev_capabilities virtio_capabilities[] = {
 	RTE_COMP_END_OF_CAPABILITIES_LIST()
 };
 
-uint8_t cryptodev_virtio_driver_id;
+uint8_t compdev_virtio_driver_id;
 
 void
 virtio_comp_queue_release(struct virtqueue *vq)
@@ -221,7 +221,7 @@ virtio_comp_dev_close(struct rte_compressdev *dev __rte_unused)
 
 	/* control queue release */
 	if (hw->cvq)
-		virtio_comp_queue_release(virtcrypto_cq_to_vq(hw->cvq));
+		virtio_comp_queue_release(virtcomp_cq_to_vq(hw->cvq));
 
 	hw->cvq = NULL;
 	return 0;
@@ -239,7 +239,7 @@ static struct rte_compressdev_ops virtio_comp_dev_ops = {
 	.dev_infos_get			 = virtio_comp_dev_info_get,
 
 	.stats_get			 = virtio_comp_dev_stats_get,
-	.stats_reset			 = virtio_crypto_dev_stats_reset,
+	.stats_reset			 = virtio_comp_dev_stats_reset,
 
 	.queue_pair_setup                = virtio_comp_qp_setup,
 	.queue_pair_release              = virtio_comp_qp_release,
@@ -290,7 +290,7 @@ virtio_comp_dev_stats_get(struct rte_compressdev *dev,
 }
 
 static void
-virtio_crypto_dev_stats_reset(struct rte_compressdev *dev)
+virtio_comp_dev_stats_reset(struct rte_compressdev *dev)
 {
 	unsigned int i;
 	struct virtio_comp_hw *hw = dev->data->dev_private;
@@ -376,7 +376,7 @@ virtio_negotiate_features(struct virtio_comp_hw *hw, uint64_t req_features)
 	 * guest feature bits.
 	 */
 	hw->guest_features = req_features;
-	hw->guest_features = vtpci_cryptodev_negotiate_features(hw,
+	hw->guest_features = vtpci_compdev_negotiate_features(hw,
 							host_features);
 	VIRTIO_CRYPTO_INIT_LOG_DBG("features after negotiate = %" PRIx64,
 		hw->guest_features);
@@ -387,9 +387,9 @@ virtio_negotiate_features(struct virtio_comp_hw *hw, uint64_t req_features)
 				"VIRTIO_F_VERSION_1 features is not enabled.");
 			return -1;
 		}
-		vtpci_cryptodev_set_status(hw,
+		vtpci_compdev_set_status(hw,
 			VIRTIO_CONFIG_STATUS_FEATURES_OK);
-		if (!(vtpci_cryptodev_get_status(hw) &
+		if (!(vtpci_compdev_get_status(hw) &
 			VIRTIO_CONFIG_STATUS_FEATURES_OK)) {
 			VIRTIO_CRYPTO_INIT_LOG_ERR("failed to set FEATURES_OK "
 						"status!");
@@ -464,7 +464,7 @@ virtio_comp_init_queue(struct rte_compressdev *dev, uint16_t queue_idx)
 clean_vq:
 	if (queue_type == VTCOMP_CTRLQ)
 		hw->cvq = NULL;
-	virtcrypto_queue_free(vq);
+	virtcomp_queue_free(vq);
 	hw->vqs[queue_idx] = NULL;
 
 	return ret;
@@ -497,29 +497,29 @@ virtio_comp_alloc_queues(struct rte_compressdev *dev)
 
 /* reset device and renegotiate features if needed */
 static int
-virtio_comp_init_device(struct rte_compressdev *cryptodev,
+virtio_comp_init_device(struct rte_compressdev *compdev,
 	uint64_t req_features)
 {
-	struct virtio_comp_hw *hw = cryptodev->data->dev_private;
-	struct virtio_crypto_config local_config;
-	struct virtio_crypto_config *config = &local_config;
+	struct virtio_comp_hw *hw = compdev->data->dev_private;
+	struct virtio_comp_config local_config;
+	struct virtio_comp_config *config = &local_config;
 
 	PMD_INIT_FUNC_TRACE();
 
 	/* Reset the device although not necessary at startup */
-	vtpci_cryptodev_reset(hw);
+	vtpci_compdev_reset(hw);
 
 	/* Tell the host we've noticed this device. */
-	vtpci_cryptodev_set_status(hw, VIRTIO_CONFIG_STATUS_ACK);
+	vtpci_compdev_set_status(hw, VIRTIO_CONFIG_STATUS_ACK);
 
 	/* Tell the host we've known how to drive the device. */
-	vtpci_cryptodev_set_status(hw, VIRTIO_CONFIG_STATUS_DRIVER);
+	vtpci_compdev_set_status(hw, VIRTIO_CONFIG_STATUS_DRIVER);
 	if (virtio_negotiate_features(hw, req_features) < 0)
 		return -1;
 
 	/* Get status of the device */
-	vtpci_read_cryptodev_config(hw,
-		offsetof(struct virtio_crypto_config, status),
+	vtpci_read_compdev_config(hw,
+		offsetof(struct virtio_comp_config, status),
 		&config->status, sizeof(config->status));
 	if (config->status != VIRTIO_CRYPTO_S_HW_READY) {
 		VIRTIO_CRYPTO_DRV_LOG_ERR("accelerator hardware is "
@@ -528,8 +528,8 @@ virtio_comp_init_device(struct rte_compressdev *cryptodev,
 	}
 
 	/* Get number of data queues */
-	vtpci_read_cryptodev_config(hw,
-		offsetof(struct virtio_crypto_config, max_dataqueues),
+	vtpci_read_compdev_config(hw,
+		offsetof(struct virtio_comp_config, max_dataqueues),
 		&config->max_dataqueues,
 		sizeof(config->max_dataqueues));
 	hw->max_dataqueues = config->max_dataqueues;
@@ -541,18 +541,18 @@ virtio_comp_init_device(struct rte_compressdev *cryptodev,
 }
 
 int
-comp_virtio_dev_init(struct rte_compressdev *cryptodev, uint64_t features,
+comp_virtio_dev_init(struct rte_compressdev *compdev, uint64_t features,
 		struct rte_pci_device *pci_dev)
 {
 	struct virtio_comp_hw *hw;
 
-	cryptodev->dev_ops = &virtio_comp_dev_ops;
+	compdev->dev_ops = &virtio_comp_dev_ops;
 
-	cryptodev->enqueue_burst = virtio_comp_pkt_tx_burst;
-	cryptodev->dequeue_burst = virtio_comp_pkt_rx_burst;
+	compdev->enqueue_burst = virtio_comp_pkt_tx_burst;
+	compdev->dequeue_burst = virtio_comp_pkt_rx_burst;
 
 	/* BUG: cassius guessed about the supported feature flags here */
-	cryptodev->feature_flags = RTE_COMPDEV_FF_HW_ACCELERATED | 
+	compdev->feature_flags = RTE_COMPDEV_FF_HW_ACCELERATED | 
 		RTE_COMPDEV_FF_CPU_SSE |
 		RTE_COMPDEV_FF_CPU_AVX |
 		RTE_COMPDEV_FF_CPU_AVX2 |
@@ -560,21 +560,21 @@ comp_virtio_dev_init(struct rte_compressdev *cryptodev, uint64_t features,
 		RTE_COMPDEV_FF_CPU_NEON |
 		RTE_COMPDEV_FF_OP_DONE_IN_DEQUEUE;
 
-	hw = cryptodev->data->dev_private;
-	hw->dev_id = cryptodev->data->dev_id;
+	hw = compdev->data->dev_private;
+	hw->dev_id = compdev->data->dev_id;
 	hw->virtio_dev_capabilities = virtio_capabilities;
 
 	if (pci_dev) {
 		/* pci device init */
 		VIRTIO_CRYPTO_INIT_LOG_DBG("dev %d vendorID=0x%x deviceID=0x%x",
-			cryptodev->data->dev_id, pci_dev->id.vendor_id,
+			compdev->data->dev_id, pci_dev->id.vendor_id,
 			pci_dev->id.device_id);
 
-		if (vtpci_cryptodev_init(pci_dev, hw))
+		if (vtpci_compdev_init(pci_dev, hw))
 			return -1;
 	}
 
-	if (virtio_comp_init_device(cryptodev, features) < 0)
+	if (virtio_comp_init_device(compdev, features) < 0)
 		return -1;
 
 	return 0;
@@ -588,18 +588,18 @@ static int
 comp_virtio_create(const char *name, struct rte_pci_device *pci_dev,
 		struct rte_compressdev_pmd_init_params *init_params)
 {
-	struct rte_compressdev *cryptodev;
+	struct rte_compressdev *compdev;
 
 	PMD_INIT_FUNC_TRACE();
 
-	cryptodev = rte_compressdev_pmd_create(name, &pci_dev->device,
+	compdev = rte_compressdev_pmd_create(name, &pci_dev->device,
 		sizeof(struct virtio_comp_dev_private),	 /* BUG: cassius add this struct here to be passed in */
 		init_params);
-	if (cryptodev == NULL)
+	if (compdev == NULL)
 		return -ENODEV;
 
-	cryptodev->driver_id = cryptodev_virtio_driver_id;
-	if (comp_virtio_dev_init(cryptodev, VIRTIO_CRYPTO_PMD_GUEST_FEATURES,
+	compdev->driver_id = compdev_virtio_driver_id;
+	if (comp_virtio_dev_init(compdev, VIRTIO_CRYPTO_PMD_GUEST_FEATURES,
 			pci_dev) < 0)
 		return -1;
 
@@ -611,23 +611,23 @@ comp_virtio_create(const char *name, struct rte_pci_device *pci_dev,
 }
 
 static int
-virtio_comp_dev_uninit(struct rte_compressdev *cryptodev)
+virtio_comp_dev_uninit(struct rte_compressdev *compdev)
 {
 	PMD_INIT_FUNC_TRACE();
 
 	if (rte_eal_process_type() == RTE_PROC_SECONDARY)
 		return -EPERM;
 
-	if (cryptodev->data->dev_started) {
-		virtio_comp_dev_stop(cryptodev);
-		virtio_comp_dev_close(cryptodev);
+	if (compdev->data->dev_started) {
+		virtio_comp_dev_stop(compdev);
+		virtio_comp_dev_close(compdev);
 	}
 
-	cryptodev->dev_ops = NULL;
-	cryptodev->enqueue_burst = NULL;
-	cryptodev->dequeue_burst = NULL;
+	compdev->dev_ops = NULL;
+	compdev->enqueue_burst = NULL;
+	compdev->dequeue_burst = NULL;
 
-	rte_compressdev_pmd_release_device(cryptodev);
+	rte_compressdev_pmd_release_device(compdev);
 
 	VIRTIO_CRYPTO_DRV_LOG_INFO("dev_uninit completed");
 
@@ -635,12 +635,12 @@ virtio_comp_dev_uninit(struct rte_compressdev *cryptodev)
 }
 
 static int
-virtio_comp_dev_configure(struct rte_compressdev *cryptodev,
-	struct rte_cryptodev_config *config __rte_unused)
+virtio_comp_dev_configure(struct rte_compressdev *compdev,
+	struct rte_compressdev_config *config __rte_unused)
 {
 	PMD_INIT_FUNC_TRACE();
 
-	if (virtio_comp_init_device(cryptodev,
+	if (virtio_comp_init_device(compdev,
 			VIRTIO_CRYPTO_PMD_GUEST_FEATURES) < 0)
 		return -1;
 
@@ -648,12 +648,12 @@ virtio_comp_dev_configure(struct rte_compressdev *cryptodev,
 	 * [0, 1, ... ,(config->max_dataqueues - 1)] are data queues
 	 * config->max_dataqueues is the control queue
 	 */
-	if (virtio_comp_alloc_queues(cryptodev) < 0) {
+	if (virtio_comp_alloc_queues(compdev) < 0) {
 		VIRTIO_CRYPTO_DRV_LOG_ERR("failed to create virtqueues");
 		return -1;
 	}
 
-	virtio_comp_ctrlq_start(cryptodev);
+	virtio_comp_ctrlq_start(compdev);
 
 	return 0;
 }
@@ -666,7 +666,7 @@ virtio_comp_dev_stop(struct rte_compressdev *dev)
 	PMD_INIT_FUNC_TRACE();
 	VIRTIO_CRYPTO_DRV_LOG_DBG("virtio_dev_stop");
 
-	vtpci_cryptodev_reset(hw);
+	vtpci_compdev_reset(hw);
 
 	virtio_comp_dev_free_mbufs(dev);
 	virtio_comp_free_queues(dev);
@@ -684,7 +684,7 @@ virtio_comp_dev_start(struct rte_compressdev *dev)
 
 	/* Do final configuration before queue engine starts */
 	virtio_comp_dataq_start(dev);
-	vtpci_cryptodev_reinit_complete(hw);
+	vtpci_compdev_reinit_complete(hw);
 
 	dev->data->dev_started = 1;
 
@@ -716,7 +716,7 @@ virtio_comp_dev_free_mbufs(struct rte_compressdev *dev)
 
 static void
 virtio_comp_dev_info_get(struct rte_compressdev *dev,
-		struct rte_cryptodev_info *info)
+		struct rte_compressdev_info *info)
 {
 	struct virtio_comp_hw *hw = dev->data->dev_private;
 
@@ -758,20 +758,20 @@ static int
 comp_virtio_pci_remove(
 	struct rte_pci_device *pci_dev __rte_unused)
 {
-	struct rte_compressdev *cryptodev;
-	char cryptodev_name[RTE_CRYPTODEV_NAME_MAX_LEN];
+	struct rte_compressdev *compdev;
+	char compdev_name[RTE_CRYPTODEV_NAME_MAX_LEN];
 
 	if (pci_dev == NULL)
 		return -EINVAL;
 
-	rte_pci_device_name(&pci_dev->addr, cryptodev_name,
-			sizeof(cryptodev_name));
+	rte_pci_device_name(&pci_dev->addr, compdev_name,
+			sizeof(compdev_name));
 
-	cryptodev = rte_cryptodev_pmd_get_named_dev(cryptodev_name);
-	if (cryptodev == NULL)
+	compdev = rte_compressdev_pmd_get_named_dev(compdev_name);
+	if (compdev == NULL)
 		return -ENODEV;
 
-	return virtio_comp_dev_uninit(cryptodev);
+	return virtio_comp_dev_uninit(compdev);
 }
 
 static struct rte_pci_driver rte_virtio_comp_driver = {
@@ -787,9 +787,9 @@ static struct cryptodev_driver virtio_crypto_drv;
 RTE_PMD_REGISTER_PCI(COMPDEV_NAME_VIRTIO_PMD, rte_virtio_comp_driver);
 RTE_PMD_REGISTER_CRYPTO_DRIVER(virtio_crypto_drv,
 	rte_virtio_comp_driver.driver,
-	cryptodev_virtio_driver_id);
-RTE_LOG_REGISTER_SUFFIX(virtio_crypto_logtype_init, init, NOTICE);
-RTE_LOG_REGISTER_SUFFIX(virtio_crypto_logtype_session, session, NOTICE);
-RTE_LOG_REGISTER_SUFFIX(virtio_crypto_logtype_rx, rx, NOTICE);
-RTE_LOG_REGISTER_SUFFIX(virtio_crypto_logtype_tx, tx, NOTICE);
-RTE_LOG_REGISTER_SUFFIX(virtio_crypto_logtype_driver, driver, NOTICE);
+	compdev_virtio_driver_id);
+RTE_LOG_REGISTER_SUFFIX(virtio_comp_logtype_init, init, NOTICE);
+RTE_LOG_REGISTER_SUFFIX(virtio_comp_logtype_session, session, NOTICE);
+RTE_LOG_REGISTER_SUFFIX(virtio_comp_logtype_rx, rx, NOTICE);
+RTE_LOG_REGISTER_SUFFIX(virtio_comp_logtype_tx, tx, NOTICE);
+RTE_LOG_REGISTER_SUFFIX(virtio_comp_logtype_driver, driver, NOTICE);

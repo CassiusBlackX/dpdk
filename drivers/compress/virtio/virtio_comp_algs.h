@@ -19,7 +19,7 @@ struct virtio_comp_session {
 	uint8_t window_size;
 	uint32_t checksum_type;
 	/*
-	TODO:
+	TODO: similar fields to store state
 	stateful compress may require ```
 	struct {
 		phys_addr_t dict_phys_addr;

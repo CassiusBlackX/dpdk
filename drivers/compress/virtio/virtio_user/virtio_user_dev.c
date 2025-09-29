@@ -342,7 +342,7 @@ virtio_user_dev_init_max_queue_pairs(struct virtio_user_dev *dev, uint32_t user_
 	}
 
 	ret = dev->ops->get_config(dev, (uint8_t *)&dev->max_queue_pairs,
-			offsetof(struct virtio_crypto_config, max_dataqueues),
+			offsetof(struct virtio_comp_config, max_dataqueues),
 			sizeof(uint16_t));
 	if (ret) {
 		/*
@@ -364,8 +364,8 @@ virtio_user_dev_init_cipher_services(struct virtio_user_dev *dev)
 	struct virtio_comp_config config;
 	int ret;
 
-	dev->crypto_services = RTE_BIT32(VIRTIO_CRYPTO_SERVICE_CIPHER);
-	dev->cipher_algo = 0;
+	dev->comp_services = RTE_BIT32(VIRTIO_CRYPTO_SERVICE_CIPHER);
+	dev->comp_algo = 0;
 	dev->auth_algo = 0;
 	dev->akcipher_algo = 0;
 
@@ -379,8 +379,8 @@ virtio_user_dev_init_cipher_services(struct virtio_user_dev *dev)
 	}
 
 	/* TODO: the following variables are not needed in compression*/
-	dev->crypto_services = config.compress_services;
-	dev->cipher_algo = ((uint64_t)config.cipher_algo_h << 32) |
+	dev->comp_services = config.compress_services;
+	dev->comp_algo = ((uint64_t)config.cipher_algo_h << 32) |
 						config.cipher_algo_l;
 	dev->hash_algo = config.hash_algo;
 	dev->auth_algo = ((uint64_t)config.mac_algo_h << 32) |

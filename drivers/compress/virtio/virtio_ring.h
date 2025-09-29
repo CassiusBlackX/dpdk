@@ -134,7 +134,7 @@ struct vring {
 #define vring_avail_event(vr) (*(uint16_t *)&(vr)->used->ring[(vr)->num])
 
 static inline size_t
-vring_size(struct virtio_crypto_hw *hw, unsigned int num, unsigned long align)
+vring_size(struct virtio_comp_hw *hw, unsigned int num, unsigned long align)
 {
 	size_t size;
 

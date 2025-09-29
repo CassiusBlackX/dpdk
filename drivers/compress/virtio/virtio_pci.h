@@ -10,7 +10,7 @@
 #include <rte_eal_paging.h>
 #include <rte_pci.h>
 #include <bus_pci_driver.h>
-#include <rte_cryptodev.h>
+#include <rte_compressdev.h>
 
 #include "virtio_comp.h"
 
@@ -265,24 +265,24 @@ vtpci_with_packed_queue(struct virtio_comp_hw *hw)
 /*
  * Function declaration from virtio_pci.c
  */
-int vtpci_cryptodev_init(struct rte_pci_device *dev,
+int vtpci_compdev_init(struct rte_pci_device *dev,
 	struct virtio_comp_hw *hw);
-void vtpci_cryptodev_reset(struct virtio_comp_hw *hw);
+void vtpci_compdev_reset(struct virtio_comp_hw *hw);
 
-void vtpci_cryptodev_reinit_complete(struct virtio_comp_hw *hw);
+void vtpci_compdev_reinit_complete(struct virtio_comp_hw *hw);
 
-uint8_t vtpci_cryptodev_get_status(struct virtio_comp_hw *hw);
-void vtpci_cryptodev_set_status(struct virtio_comp_hw *hw, uint8_t status);
+uint8_t vtpci_compdev_get_status(struct virtio_comp_hw *hw);
+void vtpci_compdev_set_status(struct virtio_comp_hw *hw, uint8_t status);
 
-uint64_t vtpci_cryptodev_negotiate_features(struct virtio_comp_hw *hw,
+uint64_t vtpci_compdev_negotiate_features(struct virtio_comp_hw *hw,
 	uint64_t host_features);
 
-void vtpci_write_cryptodev_config(struct virtio_comp_hw *hw, size_t offset,
+void vtpci_write_compdev_config(struct virtio_comp_hw *hw, size_t offset,
 	const void *src, int length);
 
-void vtpci_read_cryptodev_config(struct virtio_comp_hw *hw, size_t offset,
+void vtpci_read_compdev_config(struct virtio_comp_hw *hw, size_t offset,
 	void *dst, int length);
 
-uint8_t vtpci_cryptodev_isr(struct virtio_comp_hw *hw);
+uint8_t vtpci_compdev_isr(struct virtio_comp_hw *hw);
 
 #endif /* _VIRTIO_PCI_H_ */

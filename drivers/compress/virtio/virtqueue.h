@@ -120,11 +120,11 @@ struct vq_desc_extra {
 	uint16_t next;
 };
 
-#define virtcrypto_dq_to_vq(dvq) container_of(dvq, struct virtqueue, dq)
-#define virtcrypto_cq_to_vq(cvq) container_of(cvq, struct virtqueue, cq)
+#define virtcomp_dq_to_vq(dvq) container_of(dvq, struct virtqueue, dq)
+#define virtcomp_cq_to_vq(cvq) container_of(cvq, struct virtqueue, cq)
 
 struct virtqueue {
-	/**< virtio_crypto_hw structure pointer. */
+	/**< virtio_comp_hw structure pointer. */
 	struct virtio_comp_hw *hw;
 	union {
 		struct {
@@ -195,10 +195,10 @@ void virtqueue_disable_intr(struct virtqueue *vq);
  */
 void virtqueue_detatch_unused(struct virtqueue *vq);
 
-struct virtqueue *virtcomp_queue_alloc(struct virtio_crypto_hw *hw, uint16_t index,
+struct virtqueue *virtcomp_queue_alloc(struct virtio_comp_hw *hw, uint16_t index,
 		uint16_t num, int node, const char *name);
 
-void virtcrypto_queue_free(struct virtqueue *vq);
+void virtcomp_queue_free(struct virtqueue *vq);
 
 static inline int
 virtqueue_full(const struct virtqueue *vq)
@@ -286,7 +286,7 @@ vring_desc_init_split(struct vring_desc *dp, uint16_t n)
 }
 
 static inline int
-virtio_get_queue_type(struct virtio_crypto_hw *hw, uint16_t vq_idx)
+virtio_get_queue_type(struct virtio_comp_hw *hw, uint16_t vq_idx)
 {
 	if (vq_idx == hw->max_dataqueues)
 		return VTCOMP_CTRLQ;

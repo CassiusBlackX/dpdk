@@ -16,7 +16,7 @@ virtio_send_command_packed(struct virtcomp_ctl *cvq,
 			   struct virtio_pmd_ctrl *ctrl,
 			   int *dlen, int dnum)
 {
-	struct virtqueue *vq = virtcrypto_cq_to_vq(cvq);
+	struct virtqueue *vq = virtcomp_cq_to_vq(cvq);
 	int head;
 	struct vring_packed_desc *desc = vq->vq_packed.ring.desc;
 	struct virtio_pmd_ctrl *result;
@@ -34,7 +34,7 @@ virtio_send_command_packed(struct virtcomp_ctl *cvq,
 	head = vq->vq_avail_idx;
 	flags = vq->vq_packed.cached_flags;
 	desc[head].addr = cvq->hdr_mem;
-	desc[head].len = sizeof(struct virtio_crypto_op_ctrl_req);
+	desc[head].len = sizeof(struct virtio_comp_op_ctrl_req);
 	vq->vq_free_cnt--;
 	nb_descs++;
 	if (++vq->vq_avail_idx >= vq->vq_nentries) {
@@ -44,7 +44,7 @@ virtio_send_command_packed(struct virtcomp_ctl *cvq,
 
 	for (k = 0; k < dnum; k++) {
 		desc[vq->vq_avail_idx].addr = cvq->hdr_mem
-			+ sizeof(struct virtio_crypto_op_ctrl_req)
+			+ sizeof(struct virtio_comp_op_ctrl_req)
 			+ sizeof(ctrl->input) + sizeof(uint8_t) * sum;
 		desc[vq->vq_avail_idx].len = dlen[k];
 		desc[vq->vq_avail_idx].flags = VRING_DESC_F_NEXT |
@@ -60,7 +60,7 @@ virtio_send_command_packed(struct virtcomp_ctl *cvq,
 	}
 
 	desc[vq->vq_avail_idx].addr = cvq->hdr_mem
-		+ sizeof(struct virtio_crypto_op_ctrl_req);
+		+ sizeof(struct virtio_comp_op_ctrl_req);
 	desc[vq->vq_avail_idx].len = sizeof(ctrl->input);
 	desc[vq->vq_avail_idx].flags = VRING_DESC_F_WRITE |
 		vq->vq_packed.cached_flags;
@@ -111,7 +111,7 @@ virtio_send_command_split(struct virtcomp_ctl *cvq,
 			  struct virtio_pmd_ctrl *ctrl,
 			  int *dlen, int dnum)
 {
-	struct virtqueue *vq = virtcrypto_cq_to_vq(cvq);
+	struct virtqueue *vq = virtcomp_cq_to_vq(cvq);
 	struct virtio_pmd_ctrl *result;
 	uint32_t head, i;
 	int k, sum = 0;
@@ -126,14 +126,14 @@ virtio_send_command_split(struct virtcomp_ctl *cvq,
 	 */
 	vq->vq_split.ring.desc[head].flags = VRING_DESC_F_NEXT;
 	vq->vq_split.ring.desc[head].addr = cvq->hdr_mem;
-	vq->vq_split.ring.desc[head].len = sizeof(struct virtio_crypto_op_ctrl_req);
+	vq->vq_split.ring.desc[head].len = sizeof(struct virtio_comp_op_ctrl_req);
 	vq->vq_free_cnt--;
 	i = vq->vq_split.ring.desc[head].next;
 
 	for (k = 0; k < dnum; k++) {
 		vq->vq_split.ring.desc[i].flags = VRING_DESC_F_NEXT;
 		vq->vq_split.ring.desc[i].addr = cvq->hdr_mem
-			+ sizeof(struct virtio_crypto_op_ctrl_req)
+			+ sizeof(struct virtio_comp_op_ctrl_req)
 			+ sizeof(ctrl->input) + sizeof(uint8_t) * sum;
 		vq->vq_split.ring.desc[i].len = dlen[k];
 		sum += dlen[k];
@@ -143,7 +143,7 @@ virtio_send_command_split(struct virtcomp_ctl *cvq,
 
 	vq->vq_split.ring.desc[i].flags = VRING_DESC_F_WRITE;
 	vq->vq_split.ring.desc[i].addr = cvq->hdr_mem
-			+ sizeof(struct virtio_crypto_op_ctrl_req);
+			+ sizeof(struct virtio_comp_op_ctrl_req);
 	vq->vq_split.ring.desc[i].len = sizeof(ctrl->input);
 	vq->vq_free_cnt--;
 
@@ -190,7 +190,7 @@ virtio_send_command_split(struct virtcomp_ctl *cvq,
 }
 
 int
-virtio_crypto_send_command(struct virtcomp_ctl *cvq, struct virtio_pmd_ctrl *ctrl,
+virtio_comp_send_command(struct virtcomp_ctl *cvq, struct virtio_pmd_ctrl *ctrl,
 	int *dlen, int dnum)
 {
 	struct virtio_pmd_ctrl *result;
@@ -205,7 +205,7 @@ virtio_crypto_send_command(struct virtcomp_ctl *cvq, struct virtio_pmd_ctrl *ctr
 	}
 
 	rte_spinlock_lock(&cvq->lock);
-	vq = virtcrypto_cq_to_vq(cvq);
+	vq = virtcomp_cq_to_vq(cvq);
 
 	PMD_INIT_LOG(DEBUG, "vq->vq_desc_head_idx = %d, status = %d, "
 		"vq->hw->cvq = %p vq = %p",

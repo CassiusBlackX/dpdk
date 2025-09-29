@@ -7,16 +7,16 @@
 
 #include <rte_log.h>
 
-extern int virtio_crypto_logtype_init;
-#define RTE_LOGTYPE_VIRTIO_CRYPTO_INIT virtio_crypto_logtype_init
+extern int virtio_comp_logtype_init;
+#define RTE_LOGTYPE_VIRTIO_CRYPTO_INIT virtio_comp_logtype_init
 
 #define PMD_INIT_LOG(level, ...) \
 	RTE_LOG_LINE_PREFIX(level, VIRTIO_CRYPTO_INIT, "%s(): ", __func__, __VA_ARGS__)
 
 #define PMD_INIT_FUNC_TRACE() PMD_INIT_LOG(DEBUG, " >>")
 
-extern int virtio_crypto_logtype_driver;
-#define RTE_LOGTYPE_VIRTIO_CRYPTO_DRIVER virtio_crypto_logtype_driver
+extern int virtio_comp_logtype_driver;
+#define RTE_LOGTYPE_VIRTIO_CRYPTO_DRIVER virtio_comp_logtype_driver
 #define PMD_DRV_LOG(level, ...) \
 	RTE_LOG_LINE_PREFIX(level, VIRTIO_CRYPTO_DRIVER, "%s(): ", __func__, __VA_ARGS__)
 
@@ -32,8 +32,8 @@ extern int virtio_crypto_logtype_driver;
 #define VIRTIO_CRYPTO_INIT_LOG_ERR(fmt, ...) \
 	VIRTIO_CRYPTO_INIT_LOG_IMPL(ERR, fmt, ## __VA_ARGS__)
 
-extern int virtio_crypto_logtype_session;
-#define RTE_LOGTYPE_VIRTIO_CRYPTO_SESSION virtio_crypto_logtype_session
+extern int virtio_comp_logtype_session;
+#define RTE_LOGTYPE_VIRTIO_CRYPTO_SESSION virtio_comp_logtype_session
 
 #define VIRTIO_CRYPTO_SESSION_LOG_IMPL(level, ...) \
 	RTE_LOG_LINE_PREFIX(level, VIRTIO_CRYPTO_SESSION, "%s(): ", __func__, __VA_ARGS__)
@@ -47,8 +47,8 @@ extern int virtio_crypto_logtype_session;
 #define VIRTIO_CRYPTO_SESSION_LOG_ERR(fmt, ...) \
 	VIRTIO_CRYPTO_SESSION_LOG_IMPL(ERR, fmt, ## __VA_ARGS__)
 
-extern int virtio_crypto_logtype_rx;
-#define RTE_LOGTYPE_VIRTIO_CRYPTO_RX virtio_crypto_logtype_rx
+extern int virtio_comp_logtype_rx;
+#define RTE_LOGTYPE_VIRTIO_CRYPTO_RX virtio_comp_logtype_rx
 
 #define VIRTIO_CRYPTO_RX_LOG_IMPL(level, ...) \
 	RTE_LOG_LINE_PREFIX(level, VIRTIO_CRYPTO_RX, "%s(): ", __func__, __VA_ARGS__)
@@ -62,8 +62,8 @@ extern int virtio_crypto_logtype_rx;
 #define VIRTIO_CRYPTO_RX_LOG_ERR(fmt, ...) \
 	VIRTIO_CRYPTO_RX_LOG_IMPL(ERR, fmt, ## __VA_ARGS__)
 
-extern int virtio_crypto_logtype_tx;
-#define RTE_LOGTYPE_VIRTIO_CRYPTO_TX virtio_crypto_logtype_tx
+extern int virtio_comp_logtype_tx;
+#define RTE_LOGTYPE_VIRTIO_CRYPTO_TX virtio_comp_logtype_tx
 
 #define VIRTIO_CRYPTO_TX_LOG_IMPL(level, ...) \
 	RTE_LOG_LINE_PREFIX(level, VIRTIO_CRYPTO_TX, "%s(): ", __func__, __VA_ARGS__)
@@ -77,8 +77,8 @@ extern int virtio_crypto_logtype_tx;
 #define VIRTIO_CRYPTO_TX_LOG_ERR(fmt, ...) \
 	VIRTIO_CRYPTO_TX_LOG_IMPL(ERR, fmt, ## __VA_ARGS__)
 
-extern int virtio_crypto_logtype_driver;
-#define RTE_LOGTYPE_VIRTIO_CRYPTO_DRIVER virtio_crypto_logtype_driver
+extern int virtio_comp_logtype_driver;
+#define RTE_LOGTYPE_VIRTIO_CRYPTO_DRIVER virtio_comp_logtype_driver
 
 #define VIRTIO_CRYPTO_DRV_LOG_IMPL(level, ...) \
 	RTE_LOG_LINE_PREFIX(level, VIRTIO_CRYPTO_DRIVER, "%s(): ", __func__, __VA_ARGS__)

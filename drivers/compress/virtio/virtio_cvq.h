@@ -27,7 +27,7 @@ struct virtio_pmd_ctrl {
 };
 
 int
-virtio_crypto_send_command(struct virtcomp_ctl *cvq, struct virtio_pmd_ctrl *ctrl,
+virtio_comp_send_command(struct virtcomp_ctl *cvq, struct virtio_pmd_ctrl *ctrl,
 	int *dlen, int pkt_num);
 
 #endif /* _VIRTIO_CVQ_H_ */

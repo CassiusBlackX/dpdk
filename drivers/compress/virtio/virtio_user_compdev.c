@@ -11,8 +11,6 @@
 #include <rte_malloc.h>
 #include <rte_kvargs.h>
 #include <bus_vdev_driver.h>
-#include <rte_cryptodev.h>
-#include <cryptodev_pmd.h>
 #include <rte_alarm.h>
 #include <rte_cycles.h>
 #include <rte_io.h>
@@ -26,39 +24,39 @@
 
 #define virtio_user_get_dev(hwp) container_of(hwp, struct virtio_user_dev, hw)
 
-uint8_t cryptodev_virtio_user_driver_id;
+uint8_t compdev_virtio_user_driver_id;
 
 static void
-virtio_user_read_dev_config(struct virtio_crypto_hw *hw, size_t offset,
+virtio_user_read_dev_config(struct virtio_comp_hw *hw, size_t offset,
 		     void *dst, int length __rte_unused)
 {
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 
-	if (offset == offsetof(struct virtio_crypto_config, status)) {
+	if (offset == offsetof(struct virtio_comp_config, status)) {
 		comp_virtio_user_dev_update_link_state(dev);
-		*(uint32_t *)dst = dev->crypto_status;
-	} else if (offset == offsetof(struct virtio_crypto_config, max_dataqueues))
+		*(uint32_t *)dst = dev->comp_status;
+	} else if (offset == offsetof(struct virtio_comp_config, max_dataqueues))
 		*(uint16_t *)dst = dev->max_queue_pairs;
-	else if (offset == offsetof(struct virtio_crypto_config, crypto_services))
-		*(uint32_t *)dst = dev->crypto_services;
-	else if (offset == offsetof(struct virtio_crypto_config, cipher_algo_l))
-		*(uint32_t *)dst = dev->cipher_algo & 0xFFFF;
-	else if (offset == offsetof(struct virtio_crypto_config, cipher_algo_h))
-		*(uint32_t *)dst = dev->cipher_algo >> 32;
-	else if (offset == offsetof(struct virtio_crypto_config, hash_algo))
+	else if (offset == offsetof(struct virtio_comp_config, comp_services))
+		*(uint32_t *)dst = dev->comp_services;
+	else if (offset == offsetof(struct virtio_comp_config, cipher_algo_l))
+		*(uint32_t *)dst = dev->comp_algo & 0xFFFF;
+	else if (offset == offsetof(struct virtio_comp_config, cipher_algo_h))
+		*(uint32_t *)dst = dev->comp_algo >> 32;
+	else if (offset == offsetof(struct virtio_comp_config, hash_algo))
 		*(uint32_t *)dst = dev->hash_algo;
-	else if (offset == offsetof(struct virtio_crypto_config, mac_algo_l))
+	else if (offset == offsetof(struct virtio_comp_config, mac_algo_l))
 		*(uint32_t *)dst = dev->auth_algo & 0xFFFF;
-	else if (offset == offsetof(struct virtio_crypto_config, mac_algo_h))
+	else if (offset == offsetof(struct virtio_comp_config, mac_algo_h))
 		*(uint32_t *)dst = dev->auth_algo >> 32;
-	else if (offset == offsetof(struct virtio_crypto_config, aead_algo))
+	else if (offset == offsetof(struct virtio_comp_config, aead_algo))
 		*(uint32_t *)dst = dev->aead_algo;
-	else if (offset == offsetof(struct virtio_crypto_config, akcipher_algo))
+	else if (offset == offsetof(struct virtio_comp_config, akcipher_algo))
 		*(uint32_t *)dst = dev->akcipher_algo;
 }
 
 static void
-virtio_user_write_dev_config(struct virtio_crypto_hw *hw, size_t offset,
+virtio_user_write_dev_config(struct virtio_comp_hw *hw, size_t offset,
 		      const void *src, int length)
 {
 	RTE_SET_USED(hw);
@@ -69,7 +67,7 @@ virtio_user_write_dev_config(struct virtio_crypto_hw *hw, size_t offset,
 }
 
 static void
-virtio_user_reset(struct virtio_crypto_hw *hw)
+virtio_user_reset(struct virtio_comp_hw *hw)
 {
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 
@@ -78,7 +76,7 @@ virtio_user_reset(struct virtio_crypto_hw *hw)
 }
 
 static void
-virtio_user_set_status(struct virtio_crypto_hw *hw, uint8_t status)
+virtio_user_set_status(struct virtio_comp_hw *hw, uint8_t status)
 {
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 	uint8_t old_status = dev->status;
@@ -112,7 +110,7 @@ virtio_user_set_status(struct virtio_crypto_hw *hw, uint8_t status)
 }
 
 static uint8_t
-virtio_user_get_status(struct virtio_crypto_hw *hw)
+virtio_user_get_status(struct virtio_comp_hw *hw)
 {
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 
@@ -121,9 +119,11 @@ virtio_user_get_status(struct virtio_crypto_hw *hw)
 	return dev->status;
 }
 
-#define VIRTIO_USER_CRYPTO_PMD_GUEST_FEATURES   \
-	(1ULL << VIRTIO_CRYPTO_SERVICE_CIPHER     | \
-	 1ULL << VIRTIO_CRYPTO_SERVICE_AKCIPHER   | \
+/* TODO: determine what features does 
+VIRTIO_USER_COMP_PMD_GUEST_FEATURES have*/
+#define VIRTIO_USER_COMP_PMD_GUEST_FEATURES   \
+	(1ULL << VIRTIO_COMP_SERVICE_STATEFUL     | \
+	 1ULL << VIRTIO_COMP_SERVICE_STATELESS   | \
 	 1ULL << VIRTIO_F_VERSION_1               | \
 	 1ULL << VIRTIO_F_IN_ORDER                | \
 	 1ULL << VIRTIO_F_RING_PACKED             | \
@@ -132,17 +132,17 @@ virtio_user_get_status(struct virtio_crypto_hw *hw)
 	 1ULL << VIRTIO_F_ORDER_PLATFORM)
 
 static uint64_t
-virtio_user_get_features(struct virtio_crypto_hw *hw)
+virtio_user_get_features(struct virtio_comp_hw *hw)
 {
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 
 	/* unmask feature bits defined in vhost user protocol */
 	return (dev->device_features | dev->frontend_features) &
-		VIRTIO_USER_CRYPTO_PMD_GUEST_FEATURES;
+		VIRTIO_USER_COMP_PMD_GUEST_FEATURES;
 }
 
 static void
-virtio_user_set_features(struct virtio_crypto_hw *hw, uint64_t features)
+virtio_user_set_features(struct virtio_comp_hw *hw, uint64_t features)
 {
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 
@@ -150,7 +150,7 @@ virtio_user_set_features(struct virtio_crypto_hw *hw, uint64_t features)
 }
 
 static uint8_t
-virtio_user_get_isr(struct virtio_crypto_hw *hw __rte_unused)
+virtio_user_get_isr(struct virtio_comp_hw *hw __rte_unused)
 {
 	/* rxq interrupts and config interrupt are separated in virtio-user,
 	 * here we only report config change.
@@ -159,14 +159,14 @@ virtio_user_get_isr(struct virtio_crypto_hw *hw __rte_unused)
 }
 
 static uint16_t
-virtio_user_set_config_irq(struct virtio_crypto_hw *hw __rte_unused,
+virtio_user_set_config_irq(struct virtio_comp_hw *hw __rte_unused,
 		    uint16_t vec __rte_unused)
 {
 	return 0;
 }
 
 static uint16_t
-virtio_user_set_queue_irq(struct virtio_crypto_hw *hw __rte_unused,
+virtio_user_set_queue_irq(struct virtio_comp_hw *hw __rte_unused,
 			  struct virtqueue *vq __rte_unused,
 			  uint16_t vec)
 {
@@ -179,7 +179,7 @@ virtio_user_set_queue_irq(struct virtio_crypto_hw *hw __rte_unused,
  * max supported queues.
  */
 static uint16_t
-virtio_user_get_queue_num(struct virtio_crypto_hw *hw, uint16_t queue_id __rte_unused)
+virtio_user_get_queue_num(struct virtio_comp_hw *hw, uint16_t queue_id __rte_unused)
 {
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 
@@ -238,7 +238,7 @@ virtio_user_setup_queue_split(struct virtqueue *vq, struct virtio_user_dev *dev)
 }
 
 static int
-virtio_user_setup_queue(struct virtio_crypto_hw *hw, struct virtqueue *vq)
+virtio_user_setup_queue(struct virtio_comp_hw *hw, struct virtqueue *vq)
 {
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 
@@ -250,21 +250,21 @@ virtio_user_setup_queue(struct virtio_crypto_hw *hw, struct virtqueue *vq)
 	if (dev->notify_area)
 		vq->notify_addr = dev->notify_area[vq->vq_queue_index];
 
-	if (virtcrypto_cq_to_vq(hw->cvq) == vq)
-		dev->scvq = virtcrypto_cq_to_vq(hw->cvq);
+	if (virtcomp_cq_to_vq(hw->cvq) == vq)
+		dev->scvq = virtcomp_cq_to_vq(hw->cvq);
 
 	return 0;
 }
 
 static void
-virtio_user_del_queue(struct virtio_crypto_hw *hw, struct virtqueue *vq)
+virtio_user_del_queue(struct virtio_comp_hw *hw, struct virtqueue *vq)
 {
 	RTE_SET_USED(hw);
 	RTE_SET_USED(vq);
 }
 
 static void
-virtio_user_notify_queue(struct virtio_crypto_hw *hw, struct virtqueue *vq)
+virtio_user_notify_queue(struct virtio_comp_hw *hw, struct virtqueue *vq)
 {
 	struct virtio_user_dev *dev = virtio_user_get_dev(hw);
 	uint64_t notify_data = 1;
@@ -299,7 +299,7 @@ virtio_user_notify_queue(struct virtio_crypto_hw *hw, struct virtqueue *vq)
 	rte_write32(notify_data, vq->notify_addr);
 }
 
-const struct virtio_pci_ops crypto_virtio_user_ops = {
+const struct virtio_pci_ops comp_virtio_user_ops = {
 	.read_dev_cfg	= virtio_user_read_dev_config,
 	.write_dev_cfg	= virtio_user_write_dev_config,
 	.reset		= virtio_user_reset,
@@ -362,40 +362,39 @@ get_integer_arg(const char *key __rte_unused,
 	return -errno;
 }
 
-static struct rte_cryptodev *
-virtio_user_cryptodev_alloc(struct rte_vdev_device *vdev)
+static struct rte_compressdev *
+virtio_user_compdev_alloc(struct rte_vdev_device *vdev)
 {
-	struct rte_cryptodev_pmd_init_params init_params = {
+	struct rte_compressdev_pmd_init_params init_params = {
 		.name = "",
-		.private_data_size = sizeof(struct virtio_user_dev),
 	};
-	struct rte_cryptodev_data *data;
-	struct rte_cryptodev *cryptodev;
+	struct rte_compressdev_data *data;
+	struct rte_compressdev *compdev;
 	struct virtio_user_dev *dev;
-	struct virtio_crypto_hw *hw;
+	struct virtio_comp_hw *hw;
 
 	init_params.socket_id = vdev->device.numa_node;
-	init_params.private_data_size = sizeof(struct virtio_user_dev);
-	cryptodev = rte_cryptodev_pmd_create(vdev->device.name, &vdev->device, &init_params);
-	if (cryptodev == NULL) {
-		PMD_INIT_LOG(ERR, "failed to create cryptodev vdev");
+	size_t private_data_size = sizeof(struct virtio_user_dev);
+	compdev = rte_compressdev_pmd_create(vdev->device.name, &vdev->device,  private_data_size, &init_params);
+	if (compdev == NULL) {
+		PMD_INIT_LOG(ERR, "failed to create compdev vdev");
 		return NULL;
 	}
 
-	data = cryptodev->data;
+	data = compdev->data;
 	dev = data->dev_private;
 	hw = &dev->hw;
 
 	hw->dev_id = data->dev_id;
-	VTPCI_OPS(hw) = &crypto_virtio_user_ops;
+	VTPCI_OPS(hw) = &comp_virtio_user_ops;
 
-	return cryptodev;
+	return compdev;
 }
 
 static void
-virtio_user_cryptodev_free(struct rte_cryptodev *cryptodev)
+virtio_user_compdev_free(struct rte_compressdev *compdev)
 {
-	rte_cryptodev_pmd_destroy(cryptodev);
+	rte_compressdev_pmd_destroy(compdev);
 }
 
 static int
@@ -404,7 +403,7 @@ virtio_user_pmd_probe(struct rte_vdev_device *vdev)
 	uint64_t server_mode = VIRTIO_USER_DEF_SERVER_MODE;
 	uint64_t queue_size = VIRTIO_USER_DEF_Q_SZ;
 	uint64_t queues = VIRTIO_USER_DEF_Q_NUM;
-	struct rte_cryptodev *cryptodev = NULL;
+	struct rte_compressdev *compdev = NULL;
 	struct rte_kvargs *kvlist = NULL;
 	struct virtio_user_dev *dev;
 	char *path = NULL;
@@ -448,30 +447,31 @@ virtio_user_pmd_probe(struct rte_vdev_device *vdev)
 		}
 	}
 
-	cryptodev = virtio_user_cryptodev_alloc(vdev);
-	if (!cryptodev) {
+	compdev = virtio_user_compdev_alloc(vdev);
+	if (!compdev) {
 		PMD_INIT_LOG(ERR, "virtio_user fails to alloc device");
 		goto end;
 	}
 
-	dev = cryptodev->data->dev_private;
+	dev = compdev->data->dev_private;
 	if (comp_virtio_user_dev_init(dev, path, queues, queue_size,
 			server_mode) < 0) {
 		PMD_INIT_LOG(ERR, "virtio_user_dev_init fails");
-		virtio_user_cryptodev_free(cryptodev);
+		virtio_user_compdev_free(compdev);
 		goto end;
 	}
 
-	cryptodev->driver_id = cryptodev_virtio_user_driver_id;
-	if (crypto_virtio_dev_init(cryptodev, VIRTIO_USER_CRYPTO_PMD_GUEST_FEATURES,
+	compdev->driver_id = compdev_virtio_user_driver_id;
+	if (comp_virtio_dev_init(compdev, VIRTIO_USER_COMP_PMD_GUEST_FEATURES,
 			NULL) < 0) {
-		PMD_INIT_LOG(ERR, "crypto_virtio_dev_init fails");
+		PMD_INIT_LOG(ERR, "comp_virtio_dev_init fails");
 		comp_virtio_user_dev_uninit(dev);
-		virtio_user_cryptodev_free(cryptodev);
+		virtio_user_compdev_free(compdev);
 		goto end;
 	}
 
-	rte_cryptodev_pmd_probing_finish(cryptodev);
+	// TODO: there is no probing finish function in `lib/compressdev/rte_compressdev_pmd.h`
+	// rte_cryptodev_pmd_probing_finish(compdev);
 
 	ret = 0;
 end:
@@ -483,7 +483,7 @@ end:
 static int
 virtio_user_pmd_remove(struct rte_vdev_device *vdev)
 {
-	struct rte_cryptodev *cryptodev;
+	struct rte_compressdev *compdev;
 	const char *name;
 	int devid;
 
@@ -493,17 +493,17 @@ virtio_user_pmd_remove(struct rte_vdev_device *vdev)
 	name = rte_vdev_device_name(vdev);
 	PMD_DRV_LOG(INFO, "Removing %s", name);
 
-	devid = rte_cryptodev_get_dev_id(name);
+	devid = rte_compressdev_get_dev_id(name);
 	if (devid < 0)
 		return -EINVAL;
 
-	rte_cryptodev_stop(devid);
+	rte_compressdev_stop(devid);
 
-	cryptodev = rte_cryptodev_pmd_get_named_dev(name);
-	if (cryptodev == NULL)
+	compdev = rte_compressdev_pmd_get_named_dev(name);
+	if (compdev == NULL)
 		return -ENODEV;
 
-	if (rte_cryptodev_pmd_destroy(cryptodev) < 0) {
+	if (rte_compressdev_pmd_destroy(compdev) < 0) {
 		PMD_DRV_LOG(ERR, "Failed to remove %s", name);
 		return -EFAULT;
 	}
@@ -514,7 +514,7 @@ virtio_user_pmd_remove(struct rte_vdev_device *vdev)
 static int virtio_user_pmd_dma_map(struct rte_vdev_device *vdev, void *addr,
 		uint64_t iova, size_t len)
 {
-	struct rte_cryptodev *cryptodev;
+	struct rte_compressdev *compdev;
 	struct virtio_user_dev *dev;
 	const char *name;
 
@@ -522,11 +522,11 @@ static int virtio_user_pmd_dma_map(struct rte_vdev_device *vdev, void *addr,
 		return -EINVAL;
 
 	name = rte_vdev_device_name(vdev);
-	cryptodev = rte_cryptodev_pmd_get_named_dev(name);
-	if (cryptodev == NULL)
+	compdev = rte_compressdev_pmd_get_named_dev(name);
+	if (compdev == NULL)
 		return -EINVAL;
 
-	dev = cryptodev->data->dev_private;
+	dev = compdev->data->dev_private;
 
 	if (dev->ops->dma_map)
 		return dev->ops->dma_map(dev, addr, iova, len);
@@ -537,7 +537,7 @@ static int virtio_user_pmd_dma_map(struct rte_vdev_device *vdev, void *addr,
 static int virtio_user_pmd_dma_unmap(struct rte_vdev_device *vdev, void *addr,
 		uint64_t iova, size_t len)
 {
-	struct rte_cryptodev *cryptodev;
+	struct rte_compressdev *compdev;
 	struct virtio_user_dev *dev;
 	const char *name;
 
@@ -545,11 +545,11 @@ static int virtio_user_pmd_dma_unmap(struct rte_vdev_device *vdev, void *addr,
 		return -EINVAL;
 
 	name = rte_vdev_device_name(vdev);
-	cryptodev = rte_cryptodev_pmd_get_named_dev(name);
-	if (cryptodev == NULL)
+	compdev = rte_compressdev_pmd_get_named_dev(name);
+	if (compdev == NULL)
 		return -EINVAL;
 
-	dev = cryptodev->data->dev_private;
+	dev = compdev->data->dev_private;
 
 	if (dev->ops->dma_unmap)
 		return dev->ops->dma_unmap(dev, addr, iova, len);
@@ -566,11 +566,11 @@ static struct rte_vdev_driver virtio_user_driver = {
 
 static struct cryptodev_driver virtio_crypto_drv;
 
-RTE_PMD_REGISTER_VDEV(crypto_virtio_user, virtio_user_driver);
+RTE_PMD_REGISTER_VDEV(comp_virtio_user, virtio_user_driver);
 RTE_PMD_REGISTER_CRYPTO_DRIVER(virtio_crypto_drv,
 	virtio_user_driver.driver,
-	cryptodev_virtio_user_driver_id);
-RTE_PMD_REGISTER_PARAM_STRING(crypto_virtio_user,
+	compdev_virtio_user_driver_id);
+RTE_PMD_REGISTER_PARAM_STRING(comp_virtio_user,
 	"path=<path> "
 	"queues=<int> "
 	"queue_size=<int>");

@@ -516,8 +516,8 @@ virtio_comp_ctrlq_start(struct rte_compressdev *dev)
 
 	if (hw->cvq) {
 		rte_spinlock_init(&hw->cvq->lock);
-		virtio_comp_vring_start(virtcrypto_cq_to_vq(hw->cvq));
-		VIRTQUEUE_DUMP(virtcrypto_cq_to_vq(hw->cvq));
+		virtio_comp_vring_start(virtcomp_cq_to_vq(hw->cvq));
+		VIRTQUEUE_DUMP(virtcomp_cq_to_vq(hw->cvq));
 	}
 }
 

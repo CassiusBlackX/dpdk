@@ -605,7 +605,7 @@ static int
 vhost_vdpa_update_link_state(struct virtio_user_dev *dev)
 {
 	/* TODO: It is W/A until a cleaner approach to find cpt status */
-	dev->crypto_status = VIRTIO_CRYPTO_S_HW_READY;
+	dev->comp_status = VIRTIO_CRYPTO_S_HW_READY;
 	return 0;
 }
 

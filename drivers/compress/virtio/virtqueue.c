@@ -180,7 +180,7 @@ virtio_free_queue_headers(struct virtqueue *vq)
 }
 
 struct virtqueue *
-virtcomp_queue_alloc(struct virtio_crypto_hw *hw, uint16_t index, uint16_t num,
+virtcomp_queue_alloc(struct virtio_comp_hw *hw, uint16_t index, uint16_t num,
 		int node, const char *name)
 {
 	const struct rte_memzone *mz;
@@ -252,7 +252,7 @@ free_vq:
 }
 
 void
-virtcrypto_queue_free(struct virtqueue *vq)
+virtcomp_queue_free(struct virtqueue *vq)
 {
 	virtio_free_queue_headers(vq);
 	rte_memzone_free(vq->mz);

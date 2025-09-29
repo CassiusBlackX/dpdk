@@ -42,13 +42,14 @@ struct virtio_user_dev {
 	uint64_t	frontend_features; /* enabled frontend features */
 	uint64_t	unsupported_features; /* unsupported features mask */
 	uint8_t		status;
-	uint32_t	crypto_status;
-	uint32_t	crypto_services;
-	uint64_t	cipher_algo;
-	uint32_t	hash_algo;
-	uint64_t	auth_algo;
-	uint32_t	aead_algo;
-	uint32_t	akcipher_algo;
+	/* TODO: configs for compress! */
+	uint32_t	comp_status;
+	uint32_t	comp_services;
+	uint64_t	comp_algo;
+	// uint32_t	hash_algo;
+	// uint64_t	auth_algo;
+	// uint32_t	aead_algo;
+	// uint32_t	akcipher_algo;
 	char		path[PATH_MAX];
 
 	union {
