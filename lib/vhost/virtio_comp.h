@@ -110,7 +110,7 @@ struct virtio_comp_data_para {
 	/* length of source data */
 	uint32_t src_data_len;
 	/* length of dst data */
-	// uint32_t dst_data_len;  // BUG: this var is potentially not needed
+	uint32_t dst_data_len;  // BUG: this var is potentially not needed
 	uint32_t padding;
 };
 
@@ -167,17 +167,7 @@ struct virtio_comp_config {
 	uint32_t compress_services;
 
 	/* Detailed algorithms mask */
-	uint32_t cipher_algo_l;
-	uint32_t cipher_algo_h;
-	uint32_t hash_algo;
-	uint32_t mac_algo_l;
-	uint32_t mac_algo_h;
-	uint32_t aead_algo;
-	/* Maximum length of cipher key */
-	uint32_t max_key_len;
-	/* Maximum length of authenticated key */
-	uint32_t max_auth_key_len;
-	uint32_t akcipher_algo;
+	uint32_t comp_algo;
 	/* Maximum size of each compress request's content */
 	uint64_t max_size;
 };

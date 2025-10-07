@@ -378,14 +378,8 @@ virtio_user_dev_init_cipher_services(struct virtio_user_dev *dev)
 	}
 
 	/* TODO: the following variables are not needed in compression*/
-	dev->comp_services = config.compress_services;
-	dev->comp_algo = ((uint64_t)config.cipher_algo_h << 32) |
-						config.cipher_algo_l;
-	dev->hash_algo = config.hash_algo;
-	dev->auth_algo = ((uint64_t)config.mac_algo_h << 32) |
-						config.mac_algo_l;
-	dev->aead_algo = config.aead_algo;
-	dev->akcipher_algo = config.akcipher_algo;
+	dev->compress_services = config.compress_services;
+	dev->comp_algo = ((uint64_t)config.comp_algo << 32);
 	return 0;
 }
 

@@ -6,7 +6,7 @@
 #include "virtqueue.h"
 #include "virtio_ring.h"
 #include "virtio_compdev.h"
-#include "virtio_compress_algs.h"
+#include "virtio_comp_algs.h"
 
 static void
 vq_ring_free_chain(struct virtqueue *vq, uint16_t desc_idx)
@@ -73,22 +73,22 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 		inhdr = &(op_cookie->inhdr);
 		switch (inhdr->status) {
 		case VIRTIO_COMP_OK:
-			cop->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
+			cop->status = RTE_COMP_OP_STATUS_SUCCESS;
 			break;
 		case VIRTIO_COMP_ERR:
-			cop->status = RTE_CRYPTO_OP_STATUS_ERROR;
+			cop->status = RTE_COMP_OP_STATUS_ERROR;
 			vq->packets_received_failed++;
 			break;
 		case VIRTIO_COMP_BADMSG:
-			cop->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+			cop->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
 			vq->packets_received_failed++;
 			break;
 		case VIRTIO_COMP_NOTSUPP:
-			cop->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+			cop->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
 			vq->packets_received_failed++;
 			break;
 		case VIRTIO_COMP_INVSESS:
-			cop->status = RTE_CRYPTO_OP_STATUS_INVALID_SESSION;
+			cop->status = RTE_COMP_OP_STATUS_INVALID_SESSION;
 			vq->packets_received_failed++;
 			break;
 		default:
@@ -141,22 +141,22 @@ virtqueue_dequeue_burst_rx_packed(struct virtqueue *vq,
 		inhdr = &(op_cookie->inhdr);
 		switch (inhdr->status) {
 		case VIRTIO_COMP_OK:
-			cop->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
+			cop->status = RTE_COMP_OP_STATUS_SUCCESS;
 			break;
 		case VIRTIO_COMP_ERR:
-			cop->status = RTE_CRYPTO_OP_STATUS_ERROR;
+			cop->status = RTE_COMP_OP_STATUS_ERROR;
 			vq->packets_received_failed++;
 			break;
 		case VIRTIO_COMP_BADMSG:
-			cop->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+			cop->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
 			vq->packets_received_failed++;
 			break;
 		case VIRTIO_COMP_NOTSUPP:
-			cop->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+			cop->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
 			vq->packets_received_failed++;
 			break;
 		case VIRTIO_COMP_INVSESS:
-			cop->status = RTE_CRYPTO_OP_STATUS_INVALID_SESSION;
+			cop->status = RTE_COMP_OP_STATUS_INVALID_SESSION;
 			vq->packets_received_failed++;
 			break;
 		default:

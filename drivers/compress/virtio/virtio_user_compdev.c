@@ -37,22 +37,10 @@ virtio_user_read_dev_config(struct virtio_comp_hw *hw, size_t offset,
 		*(uint32_t *)dst = dev->comp_status;
 	} else if (offset == offsetof(struct virtio_comp_config, max_dataqueues))
 		*(uint16_t *)dst = dev->max_queue_pairs;
-	else if (offset == offsetof(struct virtio_comp_config, comp_services))
-		*(uint32_t *)dst = dev->comp_services;
-	else if (offset == offsetof(struct virtio_comp_config, cipher_algo_l))
+	else if (offset == offsetof(struct virtio_comp_config, compress_services))
+		*(uint32_t *)dst = dev->compress_services;
+	else if (offset == offsetof(struct virtio_comp_config, comp_algo))
 		*(uint32_t *)dst = dev->comp_algo & 0xFFFF;
-	else if (offset == offsetof(struct virtio_comp_config, cipher_algo_h))
-		*(uint32_t *)dst = dev->comp_algo >> 32;
-	else if (offset == offsetof(struct virtio_comp_config, hash_algo))
-		*(uint32_t *)dst = dev->hash_algo;
-	else if (offset == offsetof(struct virtio_comp_config, mac_algo_l))
-		*(uint32_t *)dst = dev->auth_algo & 0xFFFF;
-	else if (offset == offsetof(struct virtio_comp_config, mac_algo_h))
-		*(uint32_t *)dst = dev->auth_algo >> 32;
-	else if (offset == offsetof(struct virtio_comp_config, aead_algo))
-		*(uint32_t *)dst = dev->aead_algo;
-	else if (offset == offsetof(struct virtio_comp_config, akcipher_algo))
-		*(uint32_t *)dst = dev->akcipher_algo;
 }
 
 static void

@@ -44,12 +44,10 @@ struct virtio_user_dev {
 	uint8_t		status;
 	/* TODO: configs for compress! */
 	uint32_t	comp_status;
-	uint32_t	comp_services;
+	uint32_t	compress_services;
 	uint64_t	comp_algo;
-	// uint32_t	hash_algo;
-	// uint64_t	auth_algo;
-	// uint32_t	aead_algo;
-	// uint32_t	akcipher_algo;
+
+	
 	char		path[PATH_MAX];
 
 	union {

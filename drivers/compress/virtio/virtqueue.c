@@ -58,9 +58,9 @@ virtqueue_detatch_unused(struct virtqueue *vq)
 		for (idx = 0; idx < vq->vq_nentries; idx++) {
 			cop = vq->vq_descx[idx].comp_op;
 			if (cop) {
-				if (cop->type == RTE_COMP_OP_STATELESS) {
-					rte_pktmbuf_free(cop->sym->m_src);
-					rte_pktmbuf_free(cop->sym->m_dst);
+				if (cop->op_type == RTE_COMP_OP_STATELESS) {
+					rte_pktmbuf_free(cop->m_src);
+					rte_pktmbuf_free(cop->m_dst);
 				}
 
 				rte_comp_op_free(cop);

@@ -11,6 +11,7 @@
 #include <rte_pci.h>
 #include <bus_pci_driver.h>
 #include <rte_compressdev.h>
+#include <rte_compressdev_pmd.h>
 
 #include "virtio_comp.h"
 
