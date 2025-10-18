@@ -124,6 +124,10 @@ enum rte_comp_algorithm {
 	/**< LZ4 compression algorithm
 	 * https://github.com/lz4/lz4
 	 */
+	RTE_COMP_ALGO_ZSTD,
+	/**< ZSTD compression algorithm
+	 * TODO: there was not such algorithm here, added by cassius
+	 */
 };
 
 /** Compression Hash Algorithms */

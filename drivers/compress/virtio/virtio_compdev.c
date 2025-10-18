@@ -13,6 +13,7 @@
 #include <rte_eal.h>
 
 #include "virtio_compdev.h"
+#include "rte_comp.h"
 #include "virtqueue.h"
 #include "virtio_comp_algs.h"
 #include "virtio_comp_capabilities.h"
@@ -29,7 +30,7 @@ static void virtio_comp_dev_stats_get(struct rte_compressdev *dev,
 static void virtio_comp_dev_stats_reset(struct rte_compressdev *dev);
 static int virtio_comp_qp_setup(struct rte_compressdev *dev,
 		uint16_t queue_pair_id,
-		const struct rte_cryptodev_qp_conf *qp_conf,  /* TODO: no similar struct in rte_compressdev.h*/
+		uint32_t max_inflight_ops,
 		int socket_id);
 static int virtio_comp_qp_release(struct rte_compressdev *dev,
 		uint16_t queue_pair_id);
@@ -46,6 +47,8 @@ static int virtio_comp_private_xform_create(struct rte_compressdev *dev,
 static int virtio_comp_private_xform_free(struct rte_compressdev *dev,
 		void *private_xform);
 
+static int virtio_comp_set_priv_xform_parameters(struct virtio_comp_priv_xform *private_xform, const struct rte_comp_xform *xform);
+
 /*
  * The set of PCI devices this driver supports
  */
@@ -59,8 +62,6 @@ static const struct rte_compressdev_capabilities virtio_capabilities[] = {
 	VIRTIO_COMP_DEFLATE_CAPABILITIES,
 	RTE_COMP_END_OF_CAPABILITIES_LIST()
 };
-
-uint8_t compdev_virtio_driver_id;
 
 void
 virtio_comp_queue_release(struct virtqueue *vq)
@@ -165,7 +166,7 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 					NULL, NULL, NULL, NULL, socket_id,
 					0);
 		if (!vq->mpool) {
-			VIRTIO_CRYPTO_DRV_LOG_ERR("Virtio Crypto PMD "
+			VIRTIO_CRYPTO_DRV_LOG_ERR("Virtio Comp PMD "
 					"Cannot create mempool");
 			goto mpool_create_err;
 		}
@@ -227,29 +228,57 @@ virtio_comp_dev_close(struct rte_compressdev *dev __rte_unused)
 	return 0;
 }
 
-/*
- * dev_ops for virtio, bare necessities for basic operation
- */
-static struct rte_compressdev_ops virtio_comp_dev_ops = {
-	/* Device related operations */
-	.dev_configure			 = virtio_comp_dev_configure,
-	.dev_start			 = virtio_comp_dev_start,
-	.dev_stop			 = virtio_comp_dev_stop,
-	.dev_close			 = virtio_comp_dev_close,
-	.dev_infos_get			 = virtio_comp_dev_info_get,
+static int virtio_comp_stream_create(struct rte_compressdev *dev,
+		const struct rte_comp_xform *xform, 
+		void **stream) {
+	// TODO: not implement for stateful compress
+}
 
-	.stats_get			 = virtio_comp_dev_stats_get,
-	.stats_reset			 = virtio_comp_dev_stats_reset,
+static int virtio_comp_stream_free(struct rte_compressdev *dev,
+		void *stream) {
+	// TODO: not implement for stateful compress
+}
 
-	.queue_pair_setup                = virtio_comp_qp_setup,
-	.queue_pair_release              = virtio_comp_qp_release,
+static int virtio_comp_private_xform_create(struct rte_compressdev *dev,
+		const struct rte_comp_xform *xform,
+		void **private_xform) {
+	int ret = 0;
+	struct virtio_comp_private *internals = dev->data->dev_private;
 
-	/* Compress related operations */
-	.stream_create		 			= virtio_comp_stream_create,
-	.stream_free		 			= virtio_comp_stream_free,
-	.private_xform_create			= virtio_comp_private_xform_create,	
-	.private_xform_free			= virtio_comp_private_xform_free,
-};
+	if (xform == NULL) {
+		VIRTIO_CRYPTO_DRV_LOG_ERR("Invalid Xform struct");
+		return -EINVAL;
+	}
+
+	if (rte_mempool_get(internals->mp, private_xform)) {
+		VIRTIO_CRYPTO_DRV_LOG_ERR(
+			"Couldn't get object from private xform mempool");
+		return -ENOMEM;
+	}
+
+	ret = virtio_comp_set_priv_xform_parameters(*private_xform, xform);
+	if (ret != 0) {
+		VIRTIO_CRYPTO_DRV_LOG_ERR(
+			"Failed to configure private xform parameters");
+		/* Return privatge xform to mempool */
+		rte_mempool_put(internals->mp, private_xform);
+		return ret;
+	}
+	return 0;
+}
+
+static int virtio_comp_private_xform_free(struct rte_compressdev *dev,
+		void *private_xform) {
+	struct virtio_comp_private *internals = dev->data->dev_private;
+
+	if (private_xform) {
+		memset(private_xform, 0, sizeof(struct rte_comp_xform));
+		rte_mempool_put(internals->mp, private_xform);
+	}
+	return 0;
+}
+
+
 
 static void
 virtio_comp_update_stats(struct rte_compressdev *dev,
@@ -311,9 +340,8 @@ virtio_comp_dev_stats_reset(struct rte_compressdev *dev)
 }
 
 static int
-virtio_comp_qp_setup(struct rte_compressdev *dev, uint16_t queue_pair_id,
-		const struct rte_cryptodev_qp_conf *qp_conf,   /* BUG: there is no similar qp_conf  in `rte_compressdev.h` */
-		int socket_id)
+virtio_comp_qp_setup(struct rte_compressdev *dev, uint16_t qp_id,
+		uint32_t max_inflight_ops, int socket_id)
 {
 	int ret;
 	struct virtqueue *vq;
@@ -324,15 +352,15 @@ virtio_comp_qp_setup(struct rte_compressdev *dev, uint16_t queue_pair_id,
 	if (dev->data->dev_started)
 		return 0;
 
-	ret = virtio_comp_queue_setup(dev, VTCOMP_DATAQ, queue_pair_id,
-			qp_conf->nb_descriptors, socket_id, &vq);
+	ret = virtio_comp_queue_setup(dev, VTCOMP_DATAQ, qp_id,
+			max_inflight_ops, socket_id, &vq);
 	if (ret < 0) {
 		VIRTIO_CRYPTO_INIT_LOG_ERR(
 			"virtio comp data queue initialization failed");
 		return ret;
 	}
 
-	dev->data->queue_pairs[queue_pair_id] = vq;
+	dev->data->queue_pairs[qp_id] = vq;
 
 	return 0;
 }
@@ -365,7 +393,7 @@ virtio_negotiate_features(struct virtio_comp_hw *hw, uint64_t req_features)
 	/* Prepare guest_features: feature that driver wants to support */
 	VIRTIO_CRYPTO_INIT_LOG_DBG("guest_features before negotiate = %" PRIx64,
 		req_features);
-.
+
 	/* Read device(host) feature bits */
 	host_features = VTPCI_OPS(hw)->get_features(hw);
 	VIRTIO_CRYPTO_INIT_LOG_DBG("host_features before negotiate = %" PRIx64,
@@ -521,7 +549,7 @@ virtio_comp_init_device(struct rte_compressdev *compdev,
 	vtpci_read_compdev_config(hw,
 		offsetof(struct virtio_comp_config, status),
 		&config->status, sizeof(config->status));
-	if (config->status != VIRTIO_CRYPTO_S_HW_READY) {
+	if (config->status != VIRTIO_COMP_S_HW_READY) {
 		VIRTIO_CRYPTO_DRV_LOG_ERR("accelerator hardware is "
 				"not ready");
 		return -1;
@@ -593,19 +621,14 @@ comp_virtio_create(const char *name, struct rte_pci_device *pci_dev,
 	PMD_INIT_FUNC_TRACE();
 
 	compdev = rte_compressdev_pmd_create(name, &pci_dev->device,
-		sizeof(struct virtio_comp_dev_private),	 /* BUG: cassius add this struct here to be passed in */
+		sizeof(struct virtio_comp_private),	 /* BUG: cassius add this struct here to be passed in */
 		init_params);
 	if (compdev == NULL)
 		return -ENODEV;
 
-	compdev->driver_id = compdev_virtio_driver_id;
-	if (comp_virtio_dev_init(compdev, VIRTIO_CRYPTO_PMD_GUEST_FEATURES,
+	if (comp_virtio_dev_init(compdev, VIRTIO_COMP_PMD_GUEST_FEATURES,
 			pci_dev) < 0)
 		return -1;
-
-	// FIXME: the following function is potentially not needed 
-	// since qat did not use it
-	// rte_cryptodev_pmd_probing_finish(cryptodev);
 
 	return 0;
 }
@@ -641,7 +664,7 @@ virtio_comp_dev_configure(struct rte_compressdev *compdev,
 	PMD_INIT_FUNC_TRACE();
 
 	if (virtio_comp_init_device(compdev,
-			VIRTIO_CRYPTO_PMD_GUEST_FEATURES) < 0)
+			VIRTIO_COMP_PMD_GUEST_FEATURES) < 0)
 		return -1;
 
 	/* setup control queue
@@ -723,11 +746,10 @@ virtio_comp_dev_info_get(struct rte_compressdev *dev,
 	PMD_INIT_FUNC_TRACE();
 
 	if (info != NULL) {
-		info->driver_id = dev->driver_id;
 		info->feature_flags = dev->feature_flags;
 		info->max_nb_queue_pairs = hw->max_dataqueues;
-		/* No limit of number of sessions */
-		info->sym.max_nb_sessions = 0;
+		/* No limit of number of queue pairs */
+		info->max_nb_queue_pairs = 0;
 		info->capabilities = hw->virtio_dev_capabilities;
 	}
 }
@@ -740,9 +762,8 @@ comp_virtio_pci_probe(
 	struct rte_compressdev_pmd_init_params init_params = {
 		.name = "",
 		.socket_id = pci_dev->device.numa_node,
-		.private_data_size = sizeof(struct virtio_comp_hw)
 	};
-	char name[RTE_CRYPTODEV_NAME_MAX_LEN];
+	char name[RTE_COMPRESSDEV_NAME_MAX_LEN];
 
 	VIRTIO_CRYPTO_DRV_LOG_DBG("Found Crypto device at %02x:%02x.%x",
 			pci_dev->addr.bus,
@@ -759,7 +780,7 @@ comp_virtio_pci_remove(
 	struct rte_pci_device *pci_dev __rte_unused)
 {
 	struct rte_compressdev *compdev;
-	char compdev_name[RTE_CRYPTODEV_NAME_MAX_LEN];
+	char compdev_name[RTE_COMPRESSDEV_NAME_MAX_LEN];
 
 	if (pci_dev == NULL)
 		return -EINVAL;
@@ -774,6 +795,73 @@ comp_virtio_pci_remove(
 	return virtio_comp_dev_uninit(compdev);
 }
 
+static int 
+virtio_comp_set_priv_xform_parameters(
+		struct virtio_comp_priv_xform *private_xform, 
+		const struct rte_comp_xform *xform) 
+{
+	if (xform == NULL) 
+		return -EINVAL;
+	
+	int strategy, level, window_size;
+	/* set compression private xform variables */
+	switch (xform->type) {
+		case RTE_COMP_COMPRESS:
+			/* set private xform type - COMPRESS/DECOMPRESS */
+			private_xform = RTE_COMP_COMPRESS;
+
+			/* set private xform algorithm */
+			switch (xform->compress.algo) {
+				case RTE_COMP_ALGO_DEFLATE:
+					private_xform->compress.algo = RTE_COMP_ALGO_DEFLATE;
+					break;
+				case RTE_COMP_ALGO_LZ4:
+					private_xform->compress.algo = RTE_COMP_ALGO_LZ4;
+					break;
+				case RTE_COMP_ALGO_ZSTD:
+					private_xform->compress.algo = RTE_COMP_ALGO_ZSTD;
+					break;
+				default:
+					VIRTIO_CRYPTO_DRV_LOG_ERR("algorithm not supported!");
+					return -ENOTSUP;
+			}
+
+			break;
+		case RTE_COMP_DECOMPRESS:
+			
+			break;
+		default:
+			VIRTIO_CRYPTO_DRV_LOG_ERR("xform type not supported!");
+			return -ENOTSUP;
+	}
+	
+}
+
+
+/*
+ * dev_ops for virtio, bare necessities for basic operation
+ */
+static struct rte_compressdev_ops virtio_comp_dev_ops = {
+	/* Device related operations */
+	.dev_configure			 = virtio_comp_dev_configure,
+	.dev_start			 = virtio_comp_dev_start,
+	.dev_stop			 = virtio_comp_dev_stop,
+	.dev_close			 = virtio_comp_dev_close,
+	.dev_infos_get			 = virtio_comp_dev_info_get,
+
+	.stats_get			 = virtio_comp_dev_stats_get,
+	.stats_reset			 = virtio_comp_dev_stats_reset,
+
+	.queue_pair_setup                = virtio_comp_qp_setup,
+	.queue_pair_release              = virtio_comp_qp_release,
+
+	/* Compress related operations */
+	.stream_create		 			= virtio_comp_stream_create,
+	.stream_free		 			= virtio_comp_stream_free,
+	.private_xform_create			= virtio_comp_private_xform_create,	
+	.private_xform_free			= virtio_comp_private_xform_free,
+};
+
 static struct rte_pci_driver rte_virtio_comp_driver = {
 	.id_table = pci_id_virtio_comp_map,
 	.drv_flags = 0,
@@ -785,9 +873,8 @@ static struct rte_pci_driver rte_virtio_comp_driver = {
 static struct cryptodev_driver virtio_crypto_drv;
 
 RTE_PMD_REGISTER_PCI(COMPDEV_NAME_VIRTIO_PMD, rte_virtio_comp_driver);
-RTE_PMD_REGISTER_CRYPTO_DRIVER(virtio_crypto_drv,
-	rte_virtio_comp_driver.driver,
-	compdev_virtio_driver_id);
+
+
 RTE_LOG_REGISTER_SUFFIX(virtio_comp_logtype_init, init, NOTICE);
 RTE_LOG_REGISTER_SUFFIX(virtio_comp_logtype_session, session, NOTICE);
 RTE_LOG_REGISTER_SUFFIX(virtio_comp_logtype_rx, rx, NOTICE);

@@ -449,7 +449,8 @@ virtio_user_pmd_probe(struct rte_vdev_device *vdev)
 		goto end;
 	}
 
-	compdev->driver_id = compdev_virtio_user_driver_id;
+	// BUG: there is no `driver_id` member in `struct rte_compressdev`
+	// compdev->driver_id = compdev_virtio_user_driver_id;
 	if (comp_virtio_dev_init(compdev, VIRTIO_USER_COMP_PMD_GUEST_FEATURES,
 			NULL) < 0) {
 		PMD_INIT_LOG(ERR, "comp_virtio_dev_init fails");
@@ -552,12 +553,9 @@ static struct rte_vdev_driver virtio_user_driver = {
 	.dma_unmap = virtio_user_pmd_dma_unmap,
 };
 
-static struct cryptodev_driver virtio_crypto_drv;
+static struct compdev_driver virtio_compress_drv;
 
 RTE_PMD_REGISTER_VDEV(comp_virtio_user, virtio_user_driver);
-RTE_PMD_REGISTER_CRYPTO_DRIVER(virtio_crypto_drv,
-	virtio_user_driver.driver,
-	compdev_virtio_user_driver_id);
 RTE_PMD_REGISTER_PARAM_STRING(comp_virtio_user,
 	"path=<path> "
 	"queues=<int> "

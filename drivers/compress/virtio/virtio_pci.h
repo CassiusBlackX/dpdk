@@ -10,6 +10,7 @@
 #include <rte_eal_paging.h>
 #include <rte_pci.h>
 #include <bus_pci_driver.h>
+#include <rte_comp.h>
 #include <rte_compressdev.h>
 #include <rte_compressdev_pmd.h>
 

@@ -10,7 +10,7 @@
 #include "virtio_ring.h"
 
 /* Features desired/implemented by this driver. */
-#define VIRTIO_CRYPTO_PMD_GUEST_FEATURES (1ULL << VIRTIO_F_VERSION_1 | \
+#define VIRTIO_COMP_PMD_GUEST_FEATURES (1ULL << VIRTIO_F_VERSION_1 | \
 	1ULL << VIRTIO_F_IN_ORDER                | \
 	1ULL << VIRTIO_F_RING_PACKED             | \
 	1ULL << VIRTIO_F_NOTIFICATION_DATA       | \
@@ -21,16 +21,12 @@
 
 #define NUM_ENTRY_VIRTIO_CRYPTO_OP 7
 
-#define VIRTIO_CRYPTO_MAX_IV_SIZE 16
 #define VIRTIO_CRYPTO_MAX_MSG_SIZE 512
 #define VIRTIO_CRYPTO_MAX_SIGN_SIZE 1024
-#define VIRTIO_CRYPTO_MAX_CIPHER_SIZE 1024
 
 #define VIRTIO_CRYPTO_MAX_KEY_SIZE 256
 
 #define VIRTIO_CRYPTO_MAX_CTRL_DATA 4096
-
-extern uint8_t compdev_virtio_driver_id;
 
 /* TODO: determine what is needed in op_cookie */
 struct virtio_comp_op_cookie {
@@ -68,5 +64,33 @@ uint16_t virtio_comp_pkt_rx_burst(void *tx_queue,
 
 int comp_virtio_dev_init(struct rte_compressdev *compdev, uint64_t features,
 		struct rte_pci_device *pci_dev);
+
+/* FIXME: copied from zlib_pmd_ops.c*/
+struct virtio_comp_qp {
+	struct rte_ring *processed_pkts;
+	/**< Ring for placing process packets */
+	struct rte_compressdev_stats qp_stats;
+	/**< Queue pair statistics */
+	uint16_t id;
+	/**< Queue Pair Identifier */
+	char name[RTE_COMPRESSDEV_NAME_MAX_LEN];
+	/**< Unique Queue Pair Name */
+};
+
+/* TODO: all the followings are copied from isal
+*/
+struct virtio_comp_private {
+	struct rte_mempool *mp;
+};
+
+struct virtio_comp_priv_xform {
+	enum rte_comp_xform_type type;
+	union {
+		struct rte_comp_compress_xform compress;
+		struct rte_comp_decompress_xform decompress;
+	};
+	uint32_t level;
+};
+
 
 #endif /* _VIRTIO_CRYPTODEV_H_ */
