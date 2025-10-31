@@ -101,6 +101,10 @@ enum rte_comp_op_status {
 	 * is not an error case. Output data up to op.produced can be used and
 	 * next op in the stream should continue on from op.consumed+1.
 	 */
+	RTE_COMP_OP_STATUS_INVALID_SESSION,
+	/**< Operation failed due to invalid session arguments, or if
+	 * in session-less mode, failed to allocate private operation material.
+	 */
 };
 
 /** Compression Algorithms */

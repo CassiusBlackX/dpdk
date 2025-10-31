@@ -63,6 +63,8 @@ static const struct rte_compressdev_capabilities virtio_capabilities[] = {
 	RTE_COMP_END_OF_CAPABILITIES_LIST()
 };
 
+static struct rte_compressdev_ops virtio_comp_dev_ops;
+
 void
 virtio_comp_queue_release(struct virtqueue *vq)
 {
@@ -120,18 +122,23 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 		return -EINVAL;
 	}
 
-	if (queue_type == VTCOMP_DATAQ) {
-		snprintf(vq_name, sizeof(vq_name), "dev%d_dataqueue%d",
+	switch (queue_type) {
+		case VTCOMP_DATAQ:
+			snprintf(vq_name, sizeof(vq_name), "dev%d_dataqueue%d",
 				dev->data->dev_id, vtpci_queue_idx);
-		snprintf(mpool_name, sizeof(mpool_name),
+			snprintf(mpool_name, sizeof(mpool_name),
 				"dev%d_dataqueue%d_mpool",
 				dev->data->dev_id, vtpci_queue_idx);
-	} else if (queue_type == VTCOMP_CTRLQ) {
-		snprintf(vq_name, sizeof(vq_name), "dev%d_controlqueue",
-				dev->data->dev_id);
-		snprintf(mpool_name, sizeof(mpool_name),
-				"dev%d_controlqueue_mpool",
-				dev->data->dev_id);
+			break;
+		case VTCOMP_CTRLQ:
+			snprintf(vq_name, sizeof(vq_name), "dev%d_controlqueue",
+					dev->data->dev_id);
+			snprintf(mpool_name, sizeof(mpool_name),
+					"dev%d_controlqueue_mpool",
+					dev->data->dev_id);
+			break;
+		default:
+			VIRTIO_CRYPTO_INIT_LOG_ERR("Invalid queue type");
 	}
 
 	/*
@@ -243,14 +250,27 @@ static int virtio_comp_private_xform_create(struct rte_compressdev *dev,
 		const struct rte_comp_xform *xform,
 		void **private_xform) {
 	int ret = 0;
-	struct virtio_comp_private *internals = dev->data->dev_private;
+	int dlen[2] = {0, 0};
+	int dnum = 1;
+	struct virtio_comp_hw *hw = dev->data->dev_private;
+	struct virtio_comp_op_ctrl_req *ctrl_req;
+	struct virtio_comp_session_input *input;
+	struct virtio_pmd_ctrl *ctrl;
+	struct virtio_comp_session *session = (struct virtio_comp_session *)private_xform;
+
+	ctrl_req = &ctrl->hdr;
+	ctrl_req->header.opcode = VIRTIO_COMP_STATELESS_CREATE_SESSION;
+	ctrl_req->header.queue_id = 0;
+	input = &ctrl->input;
+	input->status = VIRTIO_COMP_ERR;
+	input->session_id = ~0ULL;
 
 	if (xform == NULL) {
 		VIRTIO_CRYPTO_DRV_LOG_ERR("Invalid Xform struct");
 		return -EINVAL;
 	}
 
-	if (rte_mempool_get(internals->mp, private_xform)) {
+	if (rte_mempool_get(hw->xform_pool, private_xform)) {
 		VIRTIO_CRYPTO_DRV_LOG_ERR(
 			"Couldn't get object from private xform mempool");
 		return -ENOMEM;
@@ -261,19 +281,41 @@ static int virtio_comp_private_xform_create(struct rte_compressdev *dev,
 		VIRTIO_CRYPTO_DRV_LOG_ERR(
 			"Failed to configure private xform parameters");
 		/* Return privatge xform to mempool */
-		rte_mempool_put(internals->mp, private_xform);
+		rte_mempool_put(hw->xform_pool, private_xform);
 		return ret;
 	}
+
+	ret = virtio_comp_send_command(hw->cvq, ctrl, dlen, dnum);
+	if (ret < 0) {
+		VIRTIO_CRYPTO_SESSION_LOG_ERR("create session failed: %d", ret);
+		goto error_out;
+	}
+
+	ctrl = hw->cvq->hdr_mz->addr;
+	input = &ctrl->input;
+	if (input->status != VIRTIO_COMP_OK) {
+		VIRTIO_CRYPTO_SESSION_LOG_ERR("Something wrong on backend! "
+				"status=%u, session_id=%" PRIu64 "",
+				input->status, input->session_id);
+		goto error_out;
+	} else {
+		session->session_id = input->session_id;
+		VIRTIO_CRYPTO_SESSION_LOG_INFO("Create session successfully, "
+				"session_id=%" PRIu64 "", input->session_id);
+	}
 	return 0;
+
+error_out:
+	return ret;
 }
 
 static int virtio_comp_private_xform_free(struct rte_compressdev *dev,
 		void *private_xform) {
-	struct virtio_comp_private *internals = dev->data->dev_private;
+	struct virtio_comp_hw *hw = dev->data->dev_private;
 
 	if (private_xform) {
 		memset(private_xform, 0, sizeof(struct rte_comp_xform));
-		rte_mempool_put(internals->mp, private_xform);
+		rte_mempool_put(hw->xform_pool, private_xform);
 	}
 	return 0;
 }
@@ -870,7 +912,7 @@ static struct rte_pci_driver rte_virtio_comp_driver = {
 };
 
 // BUG: there is no similar struct in `rte_compressdev_pmd.h`
-static struct cryptodev_driver virtio_crypto_drv;
+// static struct cryptodev_driver virtio_crypto_drv;
 
 RTE_PMD_REGISTER_PCI(COMPDEV_NAME_VIRTIO_PMD, rte_virtio_comp_driver);
 

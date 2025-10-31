@@ -220,6 +220,9 @@ struct virtio_comp_hw {
 	uint8_t weak_barriers;
 	struct virtcomp_ctl *cvq;
 	bool use_va;
+
+	/* added by cassius, mempool for compress */
+	struct rte_mempool *xform_pool;
 };
 
 /*

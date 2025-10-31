@@ -553,8 +553,6 @@ static struct rte_vdev_driver virtio_user_driver = {
 	.dma_unmap = virtio_user_pmd_dma_unmap,
 };
 
-static struct compdev_driver virtio_compress_drv;
-
 RTE_PMD_REGISTER_VDEV(comp_virtio_user, virtio_user_driver);
 RTE_PMD_REGISTER_PARAM_STRING(comp_virtio_user,
 	"path=<path> "

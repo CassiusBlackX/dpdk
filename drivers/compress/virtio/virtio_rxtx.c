@@ -88,7 +88,7 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 			vq->packets_received_failed++;
 			break;
 		case VIRTIO_COMP_INVSESS:
-			cop->status = RTE_COMP_OP_STATUS_INVALID_SESSION;
+			cop->status = RTE_COMP_OP_STATUS_INVALID_SESSION; /* BUG: adding more err in `rte_comp.h`? */
 			vq->packets_received_failed++;
 			break;
 		default:
@@ -272,10 +272,10 @@ virtqueue_comp_stateless_enqueue_xmit_split(
 	if (virtqueue_comp_sym_pkt_header_arrange(cop, op_data_req, session))
 		return -EFAULT;
 
-	/* status is initialized to VIRTIO_CRYPTO_ERR */
+	/* status is initialized to VIRTIO_COMP_ERR */
 	((struct virtio_comp_inhdr *)
 		((uint8_t *)op_data_req + req_data_len))->status =
-		VIRTIO_CRYPTO_ERR;
+		VIRTIO_COMP_ERR;
 
 	/* point to indirect vring entry */
 	desc = (struct vring_desc *)
@@ -364,10 +364,7 @@ virtqueue_comp_stateless_enqueue_xmit_packed(
 	struct vring_packed_desc *desc;
 	uint64_t op_data_req_phys_addr;
 	uint16_t req_data_len = sizeof(struct virtio_comp_op_data_req);
-	uint32_t iv_addr_offset =
-			offsetof(struct virtio_comp_op_cookie, iv);
-	struct virtio_comp_session *session =
-		CRYPTODEV_GET_SYM_SESS_PRIV(cop->sym->session);
+	struct virtio_comp_session *session =cop->private_xform;
 	struct virtio_comp_op_data_req *op_data_req;
 	uint32_t hash_result_len = 0;
 	struct virtio_comp_op_cookie *comp_op_cookie;
@@ -402,7 +399,7 @@ virtqueue_comp_stateless_enqueue_xmit_packed(
 	/* status is initialized to VIRTIO_CRYPTO_ERR */
 	((struct virtio_comp_inhdr *)
 		((uint8_t *)op_data_req + req_data_len))->status =
-		VIRTIO_CRYPTO_ERR;
+		VIRTIO_COMP_ERR;
 
 	desc = &txvq->vq_packed.ring.desc[txvq->vq_desc_head_idx];
 	needed = 4;
@@ -425,7 +422,7 @@ virtqueue_comp_stateless_enqueue_xmit_packed(
 	if (cop->m_dst) {
 		desc[idx].addr = rte_pktmbuf_iova_offset(cop->m_dst, 0);
 	} else {
-		desc[idx].addr = rte_pktmbuf_iova_offset(sym_op->m_src, 0);
+		desc[idx].addr = rte_pktmbuf_iova_offset(cop->m_src, 0);
 	}
 	desc[idx].len = (sym_op->cipher.data.offset + sym_op->cipher.data.length);
 	desc[idx++].flags = VRING_DESC_F_WRITE | VRING_DESC_F_NEXT;
@@ -587,38 +584,36 @@ virtio_comp_pkt_tx_burst(void *tx_queue, struct rte_comp_op **tx_pkts,
 	VIRTIO_CRYPTO_TX_LOG_DBG("%d packets to xmit", nb_pkts);
 
 	for (nb_tx = 0; nb_tx < nb_pkts; nb_tx++) {
-		if (tx_pkts[nb_tx]->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
-			struct rte_mbuf *txm = tx_pkts[nb_tx]->sym->m_src;
-			/* nb_segs is always 1 at virtio crypto situation */
+		if (tx_pkts[nb_tx]->op_type == RTE_COMP_OP_STATELESS) {
+			struct rte_mbuf *txm = tx_pkts[nb_tx]->m_src;
+			/* nb_segs is always 1 at virtio comp situation */
 			int need = txm->nb_segs - txvq->vq_free_cnt;
-
 			/*
-			 * Positive value indicates it hasn't enough space in vring
-			 * descriptors
-			 */
+			* positive value indicates that there isn't enough space in vring descriptors
+			*/
 			if (unlikely(need > 0)) {
 				/*
-				 * try it again because the receive process may be
-				 * free some space
-				 */
+				* try again, because the receive process itself may free some space
+				*/
 				need = txm->nb_segs - txvq->vq_free_cnt;
 				if (unlikely(need > 0)) {
-					VIRTIO_CRYPTO_TX_LOG_DBG("No free tx "
-											 "descriptors to transmit");
+					VIRTIO_CRYPTO_TX_LOG_DBG("no free tx descryptos to transmit");
 					break;
 				}
 			}
 
-			/* Enqueue Packet buffers */
+			/* enqueue packet buffers */
 			error = virtqueue_comp_stateless_enqueue_xmit(txvq, tx_pkts[nb_tx]);
-		// } else if (tx_pkts[nb_tx]->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
-		// 	/* Enqueue Packet buffers */
-		// 	error = virtqueue_crypto_asym_enqueue_xmit(txvq, tx_pkts[nb_tx]);
-		} else {
-			VIRTIO_CRYPTO_TX_LOG_ERR("invalid comp op type %u",
-				tx_pkts[nb_tx]->type);
+			break;
+		} else if (tx_pkts[nb_tx]->op_type == RTE_COMP_OP_STATEFUL) {
+			VIRTIO_CRYPTO_TX_LOG_ERR("stateful comp op is not supported for now");
 			txvq->packets_sent_failed++;
 			continue;
+		} else {
+			VIRTIO_CRYPTO_TX_LOG_ERR("invalid comp op type %u",
+				tx_pkts[nb_tx]->op_type);
+			txvq->packets_sent_failed++;
+			break;
 		}
 
 		if (unlikely(error)) {
@@ -653,5 +648,5 @@ virtio_comp_pkt_tx_burst(void *tx_queue, struct rte_comp_op **tx_pkts,
 		}
 	}
 
-	return nb_tx;
+	return nb_tx;	
 }

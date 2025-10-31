@@ -65,23 +65,8 @@ uint16_t virtio_comp_pkt_rx_burst(void *tx_queue,
 int comp_virtio_dev_init(struct rte_compressdev *compdev, uint64_t features,
 		struct rte_pci_device *pci_dev);
 
-/* FIXME: copied from zlib_pmd_ops.c*/
-struct virtio_comp_qp {
-	struct rte_ring *processed_pkts;
-	/**< Ring for placing process packets */
-	struct rte_compressdev_stats qp_stats;
-	/**< Queue pair statistics */
-	uint16_t id;
-	/**< Queue Pair Identifier */
-	char name[RTE_COMPRESSDEV_NAME_MAX_LEN];
-	/**< Unique Queue Pair Name */
-};
-
-/* TODO: all the followings are copied from isal
+/* TODO: all the followings are added by zal
 */
-struct virtio_comp_private {
-	struct rte_mempool *mp;
-};
 
 struct virtio_comp_priv_xform {
 	enum rte_comp_xform_type type;
@@ -90,6 +75,11 @@ struct virtio_comp_priv_xform {
 		struct rte_comp_decompress_xform decompress;
 	};
 	uint32_t level;
+};
+
+enum virtio_comp_cmd_id {
+	// TODO: sync with backend
+	VIRTIO_COMP_CMD_STATELESS_CREATE_SESSION = 0,
 };
 
 
