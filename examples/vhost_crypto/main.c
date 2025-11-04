@@ -414,44 +414,83 @@ vhost_crypto_worker(void *arg)
 				continue;
 
 			for (j = 0; j < NB_VIRTIO_QUEUES; j++) {
-				to_fetch = RTE_MIN(burst_size,
-						(NB_CRYPTO_DESCRIPTORS -
-						info->nb_inflight_ops));
-				fetched = rte_vhost_crypto_fetch_requests(
-						info->vids[i], j, ops[j],
-						to_fetch);
-				info->nb_inflight_ops +=
-						rte_cryptodev_enqueue_burst(
-						info->cid, info->qid, ops[j],
-						fetched);
-				if (unlikely(rte_crypto_op_bulk_alloc(
-						info->cop_pool,
-						cop_type,
-						ops[j], fetched) < fetched)) {
-					RTE_LOG(ERR, USER1, "Failed realloc\n");
-					return -1;
-				}
-				fetched = rte_cryptodev_dequeue_burst(
-						info->cid, info->qid,
-						ops_deq[j], RTE_MIN(burst_size,
-						info->nb_inflight_ops));
-				fetched = rte_vhost_crypto_finalize_requests(
-						ops_deq[j], fetched, callfds,
-						&nb_callfds);
+				/* 0) 当前在途容量：避免无符号下溢 */
+				uint32_t room = (info->nb_inflight_ops >= NB_CRYPTO_DESCRIPTORS)
+								? 0u
+								: (NB_CRYPTO_DESCRIPTORS - info->nb_inflight_ops);
+				to_fetch = RTE_MIN(burst_size, room);
+				if (to_fetch == 0)
+					continue;
 
-				info->nb_inflight_ops -= fetched;
+				/* 1) fetch：只抓活，不计 inflight */
+				uint16_t fetched = rte_vhost_crypto_fetch_requests(
+						info->vids[i], j, ops[j], to_fetch);
+				if (unlikely(fetched == 0))
+					continue;
+
+				/* 2) enqueue：仅以 enq 计“真正在途” */
+				uint16_t enq = rte_cryptodev_enqueue_burst(
+						info->cid, info->qid, ops[j], fetched);
+
+				info->nb_inflight_ops += enq;
+
+				/* 调试输出：仅在 inflight 有变化时打印 */
+				static __thread uint64_t last_log_tsc;
+				uint64_t now_tsc = rte_rdtsc();
+				if (enq && now_tsc - last_log_tsc > rte_get_tsc_hz() / 10) { // 每100ms最多打印一次
+					RTE_LOG(INFO, USER1, "[Lcore %u] inflight += %u → %u\n",
+							lcore_id, enq, info->nb_inflight_ops);
+					last_log_tsc = now_tsc;
+				}
+
+				/* 未入队的尾巴直接回收 */
+				if (enq < fetched) {
+					for (uint16_t k2 = enq; k2 < fetched; k2++)
+						rte_crypto_op_free(ops[j][k2]);
+				}
+
+				/* 3) 只为 enq 个已入队的 op 做补充分配 */
+				if (enq) {
+					if (unlikely(rte_crypto_op_bulk_alloc(info->cop_pool, cop_type,
+														ops[j], enq) < enq)) {
+						RTE_LOG(ERR, USER1, "Failed realloc\n");
+						ret = -1;
+						goto exit;
+					}
+				}
+
+				/* 4) dequeue + finalize：按完成数 deq 回落在途 */
+				uint16_t deq = rte_cryptodev_dequeue_burst(
+						info->cid, info->qid, ops_deq[j],
+						RTE_MIN(burst_size, info->nb_inflight_ops));
+
+				nb_callfds = 0;
+				deq = rte_vhost_crypto_finalize_requests(
+						ops_deq[j], deq, callfds, &nb_callfds);
+
+				info->nb_inflight_ops -= deq;
+
+				/* 调试输出：dequeue 后 inflight 变化 */
+				if (deq && now_tsc - last_log_tsc > rte_get_tsc_hz() / 10) {
+					RTE_LOG(INFO, USER1, "[Lcore %u] inflight -= %u → %u\n",
+							lcore_id, deq, info->nb_inflight_ops);
+					last_log_tsc = now_tsc;
+				}
 
 				if (!options.guest_polling) {
 					for (k = 0; k < nb_callfds; k++)
-						eventfd_write(callfds[k],
-								(eventfd_t)1);
+						eventfd_write(callfds[k], (eventfd_t)1);
 				}
 
-				rte_mempool_put_bulk(info->cop_pool,
-						(void **)ops_deq[j], fetched);
+				if (deq) {
+					rte_mempool_put_bulk(info->cop_pool,
+										(void **)ops_deq[j], deq);
+				}
 			}
 		}
 	}
+
+
 exit:
 	return ret;
 }
