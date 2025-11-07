@@ -12,6 +12,12 @@
 /* refer to hw/virtio/vhost-user.c */
 
 #define VHOST_MEMORY_MAX_NREGIONS 8
+#ifndef VHOST_USER_CRYPTO_FREEZE
+#define VHOST_USER_CRYPTO_FREEZE      28
+#define VHOST_USER_CRYPTO_SAVE        29
+#define VHOST_USER_CRYPTO_LOAD        30
+#define VHOST_USER_CRYPTO_THAW        31
+#endif
 
 #define VHOST_USER_NET_SUPPORTED_FEATURES \
 	(VIRTIO_NET_SUPPORTED_FEATURES | \

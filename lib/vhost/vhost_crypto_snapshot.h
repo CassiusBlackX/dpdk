@@ -47,15 +47,18 @@ struct VC_PACKED vc_dev_meta_v1 {
 };
 
 /* ---------- session payload (fixed head + variable blob) ---------- */
-enum vc_sess_kind { VC_SESS_SYM = 1, VC_SESS_ASYM = 2 };
-
-struct VC_PACKED vc_sess_head_v1 {
-    uint64_t session_id;
-    uint8_t  kind;        // symmetric / asymmetric
-    uint8_t  rsvd0;
-    uint16_t rsvd1;
-    uint32_t flags;       // feature bits / future use
+enum vc_sess_kind {
+    VC_SESS_SYM  = 0,
+    VC_SESS_ASYM = 1,
 };
+
+struct vc_sess_head_v1 {
+    uint64_t session_id;   // 来宾视角的 id
+    uint8_t  kind;         // 0: sym, 1: asym
+    uint8_t  flags;        // 目前置 0
+    uint16_t rsvd0;        // 置 0（这俩不是“预留字段”，只是对齐，不用就别读）
+    uint32_t rsvd1;        // 置 0
+} __attribute__((packed));
 
 /* symmetric session fixed meta */
 struct VC_PACKED vc_sym_meta_v1 {
