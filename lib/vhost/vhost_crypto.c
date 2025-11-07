@@ -82,6 +82,23 @@ static inline void explicit_bzero_fallback(void *p, size_t n) {
 #define explicit_bzero explicit_bzero_fallback
 #endif
 
+/* duplicate bytes into DPDK heap */
+static inline uint8_t *dup_bytes_dpdk(const void *src, size_t len) {
+    if (!src || !len) return NULL;
+    uint8_t *p = rte_malloc(NULL, len, 0);
+    if (p) memcpy(p, src, len);
+    return p;
+}
+
+/* secure zero + free (best effort) */
+static inline void secure_free(void *p, size_t len) {
+    if (!p) return;
+    /* try to wipe; avoid being optimized out */
+    volatile uint8_t *vp = (volatile uint8_t *)p;
+    for (size_t i = 0; i < len; i++) vp[i] = 0;
+    rte_free(p);
+}
+
 struct vc_session_meta_blob {
     void    *blob;      // 连续缓冲：key|auth_key|iv_seed|…
     uint32_t blob_len;
@@ -666,7 +683,7 @@ rsa_param_transform(const VhostUserCryptoAsymSessionParam *A,
     /* 默认 PKCS#1 v1.5；再按 A->padding_algo 覆盖 */
     ax->rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5;
 
-    switch (A->padding_algo) {
+    switch (A->u.rsa.padding_algo) {
     case VIRTIO_CRYPTO_RSA_RAW_PADDING:
         ax->rsa.padding.type = RTE_CRYPTO_RSA_PADDING_NONE;
         break;
@@ -1730,7 +1747,7 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 	struct vhost_crypto_data_req data_req = {0};
 	struct vhost_crypto_session *vhost_session;
 	struct vhost_crypto_desc *desc = descs;
-	uint32_t nb_descs = 0, max_n_descs, i;
+	uint32_t nb_descs = 0, max_n_descs = 0, i;
 	struct virtio_crypto_op_data_req req;
 	struct virtio_crypto_inhdr *inhdr;
 	struct vring_desc *src_desc;
@@ -2325,7 +2342,7 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 			op->sym->m_src->data_off = 0;
 
 			if (unlikely(vhost_crypto_process_one_req(vcrypto, vq,
-					op, head, descs, desc_idx) < 0))
+					op, head, descs, used_idx) < 0))
 				break;
 		}
 
@@ -2335,6 +2352,9 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 					count - i);
 
 		break;
+	default:
+		VC_LOG_ERR("Unknown zero-copy option %d", vcrypto->option);
+		goto out_unlock;
 
 	}
 
@@ -2542,55 +2562,93 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
                       const struct vc_sym_meta_v1 *D,
                       const void *blob, uint32_t blob_len)
 {
-    /* 切分 key | auth_key（我们当前不保存会话级 IV 模板） */
-    const uint8_t *p = (const uint8_t*)blob;
+    /* 1) 从 blob 切分 key | auth_key（当前不保存会话级 IV 模板） */
+    const uint8_t *p = (const uint8_t *)blob;
     const uint8_t *key = NULL, *auth_key = NULL;
     uint16_t key_len = D->key_len, auth_key_len = 0;
 
-    if (key_len) { if (blob_len < key_len) return NULL; key = p; p += key_len; }
-    if (blob_len > key_len) { auth_key_len = (uint16_t)(blob_len - key_len); auth_key = p; }
+    if (key_len) {
+        if (blob_len < key_len)
+            return NULL;
+        key = p;
+        p += key_len;
+    }
+    if (blob_len > key_len) {
+        auth_key_len = (uint16_t)(blob_len - key_len);
+        auth_key = p;
+    }
 
-    /* 构造 xform：纯 CIPHER 或 AUTH->CIPHER 链式 */
-    struct rte_crypto_sym_xform cx = {0}, ax = {0};
+    /* 2) 为 DPDK xform 准备“可写”密钥副本，避免 const-cast */
+    uint8_t *cipher_key_copy = NULL;
+    uint8_t *auth_key_copy   = NULL;
+
+    if (key_len) {
+        cipher_key_copy = dup_bytes_dpdk(key, key_len);
+        if (!cipher_key_copy)
+            return NULL;
+    }
+    if (auth_key_len) {
+        auth_key_copy = dup_bytes_dpdk(auth_key, auth_key_len);
+        if (!auth_key_copy) {
+            secure_free(cipher_key_copy, key_len);
+            return NULL;
+        }
+    }
+
+    /* 3) 构造 xform：若存在 auth，则 AUTH->CIPHER 链式，否则纯 CIPHER */
+    struct rte_crypto_sym_xform cx; memset(&cx, 0, sizeof(cx));
+    struct rte_crypto_sym_xform ax; memset(&ax, 0, sizeof(ax));
     struct rte_crypto_sym_xform *head = NULL;
 
     if (D->algo_auth && D->tag_len && auth_key_len) {
-        ax.type = RTE_CRYPTO_SYM_XFORM_AUTH;
-        ax.next = &cx;
-        ax.auth.algo         = (enum rte_crypto_auth_algorithm)D->algo_auth;
-        ax.auth.op           = RTE_CRYPTO_AUTH_OP_GENERATE;
-        ax.auth.digest_length= D->tag_len;
-        ax.auth.key.data     = (uint8_t*)auth_key;
-        ax.auth.key.length   = auth_key_len;
+        ax.type                 = RTE_CRYPTO_SYM_XFORM_AUTH;
+        ax.next                 = &cx;
+        ax.auth.algo            = (enum rte_crypto_auth_algorithm)D->algo_auth;
+        ax.auth.op              = RTE_CRYPTO_AUTH_OP_GENERATE; /* 生成 tag 的常见方向 */
+        ax.auth.digest_length   = D->tag_len;
+        ax.auth.key.data        = auth_key_copy;               /* 可写副本 */
+        ax.auth.key.length      = auth_key_len;
         head = &ax;
     }
 
-    cx.type = RTE_CRYPTO_SYM_XFORM_CIPHER;
-    cx.cipher.algo        = (enum rte_crypto_cipher_algorithm)D->algo_cipher;
-    cx.cipher.op          = RTE_CRYPTO_CIPHER_OP_ENCRYPT;
-    cx.cipher.iv.length   = D->iv_len;
-    cx.cipher.key.data    = (uint8_t*)key;
-    cx.cipher.key.length  = key_len;
+    cx.type                    = RTE_CRYPTO_SYM_XFORM_CIPHER;
+    cx.next                    = NULL;
+    cx.cipher.algo             = (enum rte_crypto_cipher_algorithm)D->algo_cipher;
+    cx.cipher.op               = RTE_CRYPTO_CIPHER_OP_ENCRYPT; /* 与 D->op 对应时可再做映射 */
+    cx.cipher.iv.length        = D->iv_len;
+    cx.cipher.key.data         = cipher_key_copy;              /* 可写副本 */
+    cx.cipher.key.length       = key_len;
+
     if (!head) head = &cx;
 
-    /* 创建 cryptodev 会话 */
+    /* 4) 创建 cryptodev 会话 */
     struct rte_cryptodev_sym_session *sess =
         rte_cryptodev_sym_session_create(vcrypto->cid, head, vcrypto->sess_pool);
-    if (!sess) return NULL;
+    if (!sess) {
+        secure_free(cipher_key_copy, key_len);
+        secure_free(auth_key_copy,   auth_key_len);
+        return NULL;
+    }
 
-    /* 分配 vhost 会话并回填 meta（让下一次 save 还能复原） */
+    /* 会话创建成功后，PMD 一般已拷贝/展开密钥至私有区，立刻擦除临时副本 */
+    secure_free(cipher_key_copy, key_len);
+    secure_free(auth_key_copy,   auth_key_len);
+
+    /* 5) 分配 vhost 会话并回填 meta（供后续 save 复原） */
     struct vhost_crypto_session *vs = rte_zmalloc(NULL, sizeof(*vs), 0);
     if (!vs) {
         rte_cryptodev_sym_session_free(vcrypto->cid, sess);
         return NULL;
     }
+
     vs->type = RTE_CRYPTO_OP_TYPE_SYMMETRIC;
     vs->sym  = sess;
 
-    vs->meta.valid = true;
-    vs->meta.session_id = sid;
-    vs->meta.kind = VC_SESS_SYM;
+    vs->meta.valid       = true;
+    vs->meta.session_id  = sid;
+    vs->meta.kind        = VC_SESS_SYM;
     memcpy(&vs->meta.sym.desc, D, sizeof(*D));
+
     if (blob_len) {
         vs->meta.sym.b.blob = rte_zmalloc(NULL, blob_len, 0);
         if (!vs->meta.sym.b.blob) {
@@ -2601,8 +2659,10 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
         memcpy(vs->meta.sym.b.blob, blob, blob_len);
         vs->meta.sym.b.blob_len = blob_len;
     }
+
     return vs;
 }
+
 
 static struct vhost_crypto_session*
 vc_session_create_asym(struct vhost_crypto *vcrypto, uint64_t sid,
@@ -2616,48 +2676,56 @@ vc_session_create_asym(struct vhost_crypto *vcrypto, uint64_t sid,
     if (A->algo_asym != VIRTIO_CRYPTO_AKCIPHER_RSA)
         return NULL;
 
-    struct rte_crypto_asym_xform ax = (struct rte_crypto_asym_xform){0};
-
-    /* 1) DER → xform（你工程现成函数） */
-    if (virtio_crypto_asym_rsa_der_to_xform((uint8_t*)blob, blob_len, &ax) < 0)
+    /* 1) 先把只读 DER 拷到一块可写内存，避免 const-cast */
+    uint8_t *der_copy = dup_bytes_dpdk(blob, blob_len);
+    if (!der_copy)
         return NULL;
 
-    /* 2) 设置 padding / key_type / xform_type
-       - 如果 vc_asym_meta_v1 里已有 padding_algo 字段：用它；
-       - 若暂时没有：先默认 PKCS#1 v1.5，后续再把字段加上更严谨。 */
+    struct rte_crypto_asym_xform ax;
+    memset(&ax, 0, sizeof(ax));
+
+    /* 2) DER → xform（你工程的现成函数会解析 n/e/d/p/q... 写入 ax.rsa） */
+    if (virtio_crypto_asym_rsa_der_to_xform(der_copy, blob_len, &ax) < 0) {
+        secure_free(der_copy, blob_len);
+        return NULL;
+    }
+    /* 拷贝已完成，立即擦除 DER 副本 */
+    secure_free(der_copy, blob_len);
+
+    /* 3) 固定 xform 类型与 key 类型（按你工程的用法） */
     ax.xform_type  = RTE_CRYPTO_ASYM_XFORM_RSA;
     ax.rsa.key_type = RTE_RSA_KEY_TYPE_QT;
 
-    /* 映射 virtio 的 padding 到 DPDK 的 padding type */
-    /* A->padding_algo 来自快照/会话描述 */
-	{
-		uint16_t pad = A->padding_algo;
+    /* 4) 映射 virtio 的 padding 到 DPDK 的 padding type
+          注意：padding 在 A->u.rsa.padding_algo */
+    {
+        uint16_t pad = A->padding_algo;  /* ← 关键：使用 u.rsa 成员 */
 
-		switch (pad) {
-		case VIRTIO_CRYPTO_RSA_RAW_PADDING:
-			ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_NONE;
-			break;
+        switch (pad) {
+        case VIRTIO_CRYPTO_RSA_RAW_PADDING:
+            ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_NONE;
+            break;
+#ifdef VIRTIO_CRYPTO_RSA_PSS_PADDING
+        case VIRTIO_CRYPTO_RSA_PSS_PADDING:
+            ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PSS;
+            break;
+#endif
+        case VIRTIO_CRYPTO_RSA_PKCS1_PADDING:
+        default:
+            ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5;
+            break;
+        }
+    }
 
-	#if defined(VIRTIO_CRYPTO_RSA_PSS_PADDING)
-		case VIRTIO_CRYPTO_RSA_PSS_PADDING:
-			ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PSS;
-			break;
-	#endif
-
-		case VIRTIO_CRYPTO_RSA_PKCS1_PADDING:
-		default:
-			ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5;
-			break;
-		}
-	}
-
-    /* 3) 创建 cryptodev 会话（按你工程 API 形态） */
+    /* 5) 创建 cryptodev 非对称会话（签名按你工程封装来）
+          你给出的接口是：create(cid, &ax, pool, &out_sess) */
     struct rte_cryptodev_asym_session *sess = NULL;
     if (rte_cryptodev_asym_session_create(vcrypto->cid, &ax,
-                                          vcrypto->sess_pool, (void*)&sess) < 0 || !sess)
+                                          vcrypto->sess_pool, (void *)&sess) < 0 || !sess) {
         return NULL;
+    }
 
-    /* 4) vhost 会话对象 + 回填 meta（保证再次 save 仍可复原） */
+    /* 6) vhost 会话对象 + 回填 meta（保证再次 save 仍可复原） */
     struct vhost_crypto_session *vs = rte_zmalloc(NULL, sizeof(*vs), 0);
     if (!vs) {
         rte_cryptodev_asym_session_free(vcrypto->cid, sess);
@@ -2667,9 +2735,9 @@ vc_session_create_asym(struct vhost_crypto *vcrypto, uint64_t sid,
     vs->type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
     vs->asym = sess;
 
-    vs->meta.valid = true;
-    vs->meta.session_id = sid;
-    vs->meta.kind = VC_SESS_ASYM;
+    vs->meta.valid       = true;
+    vs->meta.session_id  = sid;
+    vs->meta.kind        = VC_SESS_ASYM;
 
     memcpy(&vs->meta.asym.desc, A, sizeof(*A));
 
@@ -2686,6 +2754,7 @@ vc_session_create_asym(struct vhost_crypto *vcrypto, uint64_t sid,
 
     return vs;
 }
+
 
 /* Load: read header + payload from fd and rebuild backend state */
 int vhost_crypto_load_state(int vid, int fd)
