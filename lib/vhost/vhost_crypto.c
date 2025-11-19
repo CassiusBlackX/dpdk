@@ -82,11 +82,18 @@ static inline void explicit_bzero_fallback(void *p, size_t n) {
 #define explicit_bzero explicit_bzero_fallback
 #endif
 
-/* duplicate bytes into DPDK heap */
-static inline uint8_t *dup_bytes_dpdk(const void *src, size_t len) {
-    if (!src || !len) return NULL;
-    uint8_t *p = rte_malloc(NULL, len, 0);
-    if (p) memcpy(p, src, len);
+/* duplicate bytes into DPDK heap (zero-inited) */
+static inline uint8_t *
+dup_bytes_dpdk(const void *src, size_t len)
+{
+    if (!src || len == 0)
+        return NULL;
+
+    uint8_t *p = rte_zmalloc(NULL, len, 0);  /* zero-init for safety */
+    if (p == NULL)
+        return NULL;
+
+    rte_memcpy(p, src, len);
     return p;
 }
 
@@ -2596,30 +2603,30 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
     }
 
     /* 3) 构造 xform：若存在 auth，则 AUTH->CIPHER 链式，否则纯 CIPHER */
-    struct rte_crypto_sym_xform cx; memset(&cx, 0, sizeof(cx));
-    struct rte_crypto_sym_xform ax; memset(&ax, 0, sizeof(ax));
+    struct rte_crypto_sym_xform xform1; memset(&xform1, 0, sizeof(xform1));
+    struct rte_crypto_sym_xform xform2; memset(&xform2, 0, sizeof(xform2));
     struct rte_crypto_sym_xform *head = NULL;
 
     if (D->algo_auth && D->tag_len && auth_key_len) {
-        ax.type                 = RTE_CRYPTO_SYM_XFORM_AUTH;
-        ax.next                 = &cx;
-        ax.auth.algo            = (enum rte_crypto_auth_algorithm)D->algo_auth;
-        ax.auth.op              = RTE_CRYPTO_AUTH_OP_GENERATE; /* 生成 tag 的常见方向 */
-        ax.auth.digest_length   = D->tag_len;
-        ax.auth.key.data        = auth_key_copy;               /* 可写副本 */
-        ax.auth.key.length      = auth_key_len;
-        head = &ax;
+        xform2.type                 = RTE_CRYPTO_SYM_XFORM_AUTH;
+        xform2.next                 = &xform1;
+        xform2.auth.algo            = (enum rte_crypto_auth_algorithm)D->algo_auth;
+        xform2.auth.op              = RTE_CRYPTO_AUTH_OP_GENERATE; /* 生成 tag 的常见方向 */
+        xform2.auth.digest_length   = D->tag_len;
+        xform2.auth.key.data        = auth_key_copy;               /* 可写副本 */
+        xform2.auth.key.length      = auth_key_len;
+        head = &xform2;
     }
 
-    cx.type                    = RTE_CRYPTO_SYM_XFORM_CIPHER;
-    cx.next                    = NULL;
-    cx.cipher.algo             = (enum rte_crypto_cipher_algorithm)D->algo_cipher;
-    cx.cipher.op               = RTE_CRYPTO_CIPHER_OP_ENCRYPT; /* 与 D->op 对应时可再做映射 */
-    cx.cipher.iv.length        = D->iv_len;
-    cx.cipher.key.data         = cipher_key_copy;              /* 可写副本 */
-    cx.cipher.key.length       = key_len;
+    xform1.type                    = RTE_CRYPTO_SYM_XFORM_CIPHER;
+    xform1.next                    = NULL;
+    xform1.cipher.algo             = (enum rte_crypto_cipher_algorithm)D->algo_cipher;
+    xform1.cipher.op               = RTE_CRYPTO_CIPHER_OP_ENCRYPT; /* 与 D->op 对应时可再做映射 */
+    xform1.cipher.iv.length        = D->iv_len;
+    xform1.cipher.key.data         = cipher_key_copy;              /* 可写副本 */
+    xform1.cipher.key.length       = key_len;
 
-    if (!head) head = &cx;
+    if (!head) head = &xform1;
 
     /* 4) 创建 cryptodev 会话 */
     struct rte_cryptodev_sym_session *sess =
