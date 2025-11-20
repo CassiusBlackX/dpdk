@@ -408,6 +408,10 @@ vhost_compress_worker(void *arg)
 				fetched = rte_vhost_comp_fetch_requests(
 						info->vids[i], j, ops[j],
 						to_fetch);
+				if (fetched != 0)
+				{
+				RTE_LOG(ERR, USER1, "try to enqueue\n");
+				}
 				info->nb_inflight_ops +=
 						rte_compressdev_enqueue_burst(
 						info->cid, info->qid, ops[j],

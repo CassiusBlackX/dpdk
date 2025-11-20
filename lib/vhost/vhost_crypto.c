@@ -700,6 +700,7 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 		VC_LOG_ERR("Cannot find required data, is it initialized?");
 		return RTE_VHOST_MSG_RESULT_ERR;
 	}
+	vcrypto->dev = dev;
 
 	switch (ctx->msg.request.frontend) {
 	case VHOST_USER_CRYPTO_CREATE_SESS:
@@ -1729,6 +1730,8 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
 
 	if (old_vq && (vq != old_vq))
 		return vq;
+	VC_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, op->status);
+	VC_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, vc_req->zero_copy);
 
 	if (unlikely(op->status != RTE_CRYPTO_OP_STATUS_SUCCESS))
 		vc_req->inhdr->status = VIRTIO_CRYPTO_ERR;
@@ -1740,6 +1743,7 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
 	desc_idx = vq->avail->ring[used_idx];
 	vq->used->ring[desc_idx].id = vq->avail->ring[desc_idx];
 	vq->used->ring[desc_idx].len = vc_req->len;
+	VC_LOG_ERR("%s %d %u %u", __FUNCTION__, __LINE__, desc_idx, used_idx);
 
 	if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
 		rte_mempool_put(m_src->pool, (void *)m_src);
@@ -1844,7 +1848,7 @@ rte_vhost_crypto_create(int vid, uint8_t cryptodev_id,
 	params.socket_id = socket_id;
 	vcrypto->session_map = rte_hash_create(&params);
 	if (!vcrypto->session_map) {
-		VC_LOG_ERR("Failed to creath session map");
+		VC_LOG_ERR("Failed to create session map");
 		ret = -ENOMEM;
 		goto error_exit;
 	}
@@ -1856,7 +1860,7 @@ rte_vhost_crypto_create(int vid, uint8_t cryptodev_id,
 			VHOST_CRYPTO_MAX_DATA_SIZE + RTE_PKTMBUF_HEADROOM,
 			rte_socket_id());
 	if (!vcrypto->mbuf_pool) {
-		VC_LOG_ERR("Failed to creath mbuf pool");
+		VC_LOG_ERR("Failed to create mbuf pool");
 		ret = -ENOMEM;
 		goto error_exit;
 	}
@@ -1868,7 +1872,7 @@ rte_vhost_crypto_create(int vid, uint8_t cryptodev_id,
 			128, 0, NULL, NULL, NULL, NULL,
 			rte_socket_id(), 0);
 	if (!vcrypto->wb_pool) {
-		VC_LOG_ERR("Failed to creath mempool");
+		VC_LOG_ERR("Failed to create mempool");
 		ret = -ENOMEM;
 		goto error_exit;
 	}
@@ -1961,7 +1965,7 @@ rte_vhost_crypto_set_zero_copy(int vid, enum rte_vhost_crypto_zero_copy option)
 				128, 0, NULL, NULL, NULL, NULL,
 				rte_socket_id(), 0);
 		if (!vcrypto->wb_pool) {
-			VC_LOG_ERR("Failed to creath mbuf pool");
+			VC_LOG_ERR("Failed to create mbuf pool");
 			return -ENOMEM;
 		}
 	} else {

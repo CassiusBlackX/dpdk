@@ -616,6 +616,9 @@ reset_vring_queue(struct virtio_net *dev, struct vhost_virtqueue *vq)
 int
 alloc_vring_queue(struct virtio_net *dev, uint32_t vring_idx)
 {
+	VHOST_CONFIG_LOG(dev->ifname, ERR,
+			"alloc_vring_queue %u",
+			vring_idx);
 	struct vhost_virtqueue *vq;
 	uint32_t i;
 
@@ -717,6 +720,7 @@ vhost_new_device(struct vhost_backend_ops *ops)
 	}
 
 	vhost_devices[i] = dev;
+	VHOST_CONFIG_LOG("device", ERR, "%s %d feature:%p %lu", __FUNCTION__, __LINE__, dev, dev->features);
 	pthread_mutex_unlock(&vhost_dev_lock);
 
 	dev->vid = i;

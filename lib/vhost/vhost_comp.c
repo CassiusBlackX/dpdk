@@ -82,6 +82,8 @@ compress_algo_transform_stateless(VhostUserCompSessionParam *param,
 {
 	int ret = 0;
 
+	VC_LOG_ERR("%s %d %d %d", __FUNCTION__, __LINE__, param->u.stateless.algo, param->u.stateless.level);
+
 	switch (param->u.stateless.algo) {
 	case VIRTIO_COMP_ALGO_DEFLATE:
 		ret = compress_algo_deflate_transform_stateless(param, xform);
@@ -92,6 +94,7 @@ compress_algo_transform_stateless(VhostUserCompSessionParam *param,
 	// 	*algo = RTE_COMP_ALGO_LZ4;
 	// 	break;
 	default:
+		VC_LOG_ERR("unsupported compress algo");
 		return -VIRTIO_COMP_BADMSG;
 		break;
 	}
@@ -156,13 +159,16 @@ transform_comp_stateless_param(struct rte_comp_xform *xform,
 {
 	int ret;
 
+	VC_LOG_ERR("%s %d %d %d %p %p", __FUNCTION__, __LINE__, param->u.stateless.dir, param->u.stateless.algo,
+	&param->u.stateless.dir, &param->u.stateless.algo);
+
 	// 1. compress or decompress
-	if (param->dir == VIRTIO_COMP_OP_COMPRESS)
+	if (param->u.stateless.dir == VIRTIO_COMP_OP_COMPRESS)
 		xform->type = RTE_COMP_COMPRESS;
-	else if (param->dir == VIRTIO_COMP_OP_DECOMPRESS)
+	else if (param->u.stateless.dir == VIRTIO_COMP_OP_DECOMPRESS)
 		xform->type = RTE_COMP_DECOMPRESS;
 	else {
-		VC_LOG_DBG("Bad operation type");
+		VC_LOG_ERR("Bad operation type");
 		return -VIRTIO_COMP_BADMSG;
 	}
 
@@ -227,7 +233,8 @@ vhost_comp_create_private_xform(struct vhost_comp *vcompress,
 		goto error_exit;
 	}
 
-	// VC_LOG_INFO("Session %"PRIu64" created for vdev %i.", vcompress->last_session_id, vcompress->dev->vid);
+	VC_LOG_INFO("Session %"PRIu64" created for vdev %i.", vcompress->last_session_id, vcompress->dev->vid);
+	VC_LOG_ERR("features %p %lu", vcompress->dev, vcompress->dev->features);
 
 	param->session_id = vcompress->last_session_id;
 	vcompress->last_session_id++;
@@ -321,14 +328,17 @@ vhost_comp_msg_post_handler(int vid, void *msg)
 		return RTE_VHOST_MSG_RESULT_ERR;
 	}
 
+	vcompress->dev = dev;
+
+	VC_LOG_ERR("request frontend %d", ctx->msg.request.frontend);
 	switch (ctx->msg.request.frontend) {
-	case VHOST_USER_COMP_CREATE_SESS:
+	case VHOST_USER_COMPRESS_CREATE_SESS:
 		vhost_comp_create_sess(vcompress,
 				&ctx->msg.payload.comp_session);
 		ctx->fd_num = 0;
 		ret = RTE_VHOST_MSG_RESULT_REPLY;
 		break;
-	case VHOST_USER_COMP_CLOSE_SESS:
+	case VHOST_USER_COMPRESS_CLOSE_SESS:
 		if (vhost_comp_close_sess(vcompress, ctx->msg.payload.u64))
 			ret = RTE_VHOST_MSG_RESULT_ERR;
 		break;
@@ -464,6 +474,8 @@ copy_data(void *data, struct virtio_net *dev, struct vhost_virtqueue *vq,
 
 	do {
 		uint32_t copied;
+
+		VC_LOG_ERR("%s %d %p %u", __FUNCTION__, __LINE__, (void*)desc, left);
 
 		copied = copy_data_from_desc(data, dev, vq, desc, left);
 		if (copied == 0)
@@ -649,6 +661,9 @@ error_exit:
 static __rte_always_inline uint8_t
 vhost_comp_check_stateless_request(struct virtio_comp_stateless_data_req *req)
 {
+	VC_LOG_ERR("%s %d %u %u %u", __FUNCTION__, __LINE__,
+	req->para.src_data_len, RTE_MBUF_DEFAULT_BUF_SIZE, 
+	req->para.dst_data_len);
 	if (likely((req->para.src_data_len <= RTE_MBUF_DEFAULT_BUF_SIZE) &&
 		(req->para.dst_data_len >= req->para.src_data_len) &&
 		(req->para.dst_data_len <= RTE_MBUF_DEFAULT_BUF_SIZE)))
@@ -669,6 +684,7 @@ prepare_stateless_comp_op(struct vhost_comp *vcomp, struct rte_comp_op *op,
 	struct vhost_comp_writeback_data *ewb = NULL;
 	struct rte_mbuf *m_src = op->m_src, *m_dst = op->m_dst;
 	uint8_t ret = vhost_comp_check_stateless_request(comp);
+	VC_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, ret);
 
 	if (unlikely(ret != VIRTIO_COMP_OK))
 		goto error_exit;
@@ -677,6 +693,8 @@ prepare_stateless_comp_op(struct vhost_comp *vcomp, struct rte_comp_op *op,
 
 	switch (vcomp->option) {
 	case RTE_VHOST_COMP_ZERO_COPY_ENABLE:
+	case RTE_VHOST_COMP_ZERO_COPY_DISABLE:
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 		m_src->data_len = comp->para.src_data_len;
 		rte_mbuf_iova_set(m_src,
 				  gpa_to_hpa(vcomp->dev, desc->addr, comp->para.src_data_len));
@@ -695,17 +713,18 @@ prepare_stateless_comp_op(struct vhost_comp *vcomp, struct rte_comp_op *op,
 		}
 
 		break;
-	case RTE_VHOST_COMP_ZERO_COPY_DISABLE:
-		vc_req->wb_pool = vcomp->wb_pool;
-		m_src->data_len = comp->para.src_data_len;
-		if (unlikely(copy_data(rte_pktmbuf_mtod(m_src, uint8_t *),
-				vcomp->dev, vq, head, &desc,
-				comp->para.src_data_len, max_n_descs) < 0)) {
-			VC_LOG_ERR("Incorrect virtio descriptor");
-			ret = VIRTIO_COMP_BADMSG;
-			goto error_exit;
-		}
-		break;
+	// case RTE_VHOST_COMP_ZERO_COPY_DISABLE:
+	// VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
+	// 	vc_req->wb_pool = vcomp->wb_pool;
+	// 	m_src->data_len = comp->para.src_data_len;
+	// 	if (unlikely(copy_data(rte_pktmbuf_mtod(m_src, uint8_t *),
+	// 			vcomp->dev, vq, head, &desc,
+	// 			comp->para.src_data_len, max_n_descs) < 0)) {
+	// 		VC_LOG_ERR("Incorrect virtio descriptor");
+	// 		ret = VIRTIO_COMP_BADMSG;
+	// 		goto error_exit;
+	// 	}
+	// 	break;
 	default:
 		ret = VIRTIO_COMP_BADMSG;
 		goto error_exit;
@@ -719,8 +738,11 @@ prepare_stateless_comp_op(struct vhost_comp *vcomp, struct rte_comp_op *op,
 		goto error_exit;
 	}
 
+	VC_LOG_ERR("%s %d %p %u", __FUNCTION__, __LINE__, m_dst, vcomp->option);
+
 	switch (vcomp->option) {
 	case RTE_VHOST_COMP_ZERO_COPY_ENABLE:
+	case RTE_VHOST_COMP_ZERO_COPY_DISABLE:
 		rte_mbuf_iova_set(m_dst,
 				  gpa_to_hpa(vcomp->dev, desc->addr, comp->para.dst_data_len));
 		m_dst->buf_addr = get_data_ptr(vq, vc_req, desc, VHOST_ACCESS_RW);
@@ -739,16 +761,16 @@ prepare_stateless_comp_op(struct vhost_comp *vcomp, struct rte_comp_op *op,
 
 		m_dst->data_len = comp->para.dst_data_len;
 		break;
-	case RTE_VHOST_COMP_ZERO_COPY_DISABLE:
-		vc_req->wb = prepare_write_back_data(vq, vc_req, head, &desc, &ewb,
-				rte_pktmbuf_mtod(m_src, uint8_t *), 0,
-				comp->para.dst_data_len, max_n_descs);
-		if (unlikely(vc_req->wb == NULL)) {
-			ret = VIRTIO_COMP_ERR;
-			goto error_exit;
-		}
+	// case RTE_VHOST_COMP_ZERO_COPY_DISABLE:
+	// 	vc_req->wb = prepare_write_back_data(vq, vc_req, head, &desc, &ewb,
+	// 			rte_pktmbuf_mtod(m_src, uint8_t *), 0,
+	// 			comp->para.dst_data_len, max_n_descs);
+	// 	if (unlikely(vc_req->wb == NULL)) {
+	// 		ret = VIRTIO_COMP_ERR;
+	// 		goto error_exit;
+	// 	}
 
-		break;
+		// break;
 	default:
 		ret = VIRTIO_COMP_BADMSG;
 		goto error_exit;
@@ -767,6 +789,9 @@ prepare_stateless_comp_op(struct vhost_comp *vcomp, struct rte_comp_op *op,
 
 	vc_req->inhdr->status = VIRTIO_COMP_OK;
 	vc_req->len = comp->para.dst_data_len + INHDR_LEN;
+
+	//TODO: flush type 
+	op->flush_flag = RTE_COMP_FLUSH_FINAL;
 
 	return 0;
 
@@ -799,6 +824,7 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 		uint16_t desc_idx)
 	__rte_requires_shared_capability(&vq->iotlb_lock)
 {
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 	struct vhost_comp_data_req *vc_req, *vc_req_out;
 	void *private_xform;
 	void *stream;
@@ -812,6 +838,7 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 	uint64_t session_id;
 	uint64_t dlen;
 	int err;
+	VC_LOG_ERR("%s %d %p %p %lu", __FUNCTION__, __LINE__, vcompress, vcompress->dev, vcompress->dev->features);
 
 	vc_req = &data_req;
 	vc_req->desc_idx = desc_idx;
@@ -823,7 +850,10 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 		return -1;
 	}
 
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 	dlen = head->len;
+	VC_LOG_ERR("%s %d %p %p %p %lu %lu ", __FUNCTION__, __LINE__,
+	vc_req->dev, vq, (void*)head->addr, dlen, vc_req->dev->features);
 	src_desc = IOVA_TO_VVA(struct vring_desc *, vc_req->dev, vq,
 			head->addr, &dlen, VHOST_ACCESS_RO);
 	if (unlikely(!src_desc || dlen != head->len)) {
@@ -831,6 +861,7 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 		return -1;
 	}
 	head = src_desc;
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 
 	nb_descs = max_n_descs = dlen / sizeof(struct vring_desc);
 	if (unlikely(nb_descs > VHOST_COMP_MAX_N_DESC || nb_descs == 0)) {
@@ -854,6 +885,7 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 			return -1;
 		}
 	}
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 
 	/* copy descriptors to local variable */
 	for (i = 0; i < max_n_descs; i++) {
@@ -861,6 +893,7 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 		desc->len = src_desc->len;
 		desc->flags = src_desc->flags;
 		desc++;
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 		if (unlikely((src_desc->flags & VRING_DESC_F_NEXT) == 0))
 			break;
 		if (unlikely(src_desc->next >= max_n_descs)) {
@@ -873,6 +906,7 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 
 	vc_req->head = head;
 	vc_req->zero_copy = vcompress->option;
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 
 	nb_descs = desc - descs;
 	desc = descs;
@@ -882,6 +916,7 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 		VC_LOG_ERR("Invalid descriptor");
 		goto error_exit;
 	}
+	VC_LOG_ERR("%s %d %d", __FUNCTION__, __LINE__, max_n_descs);
 
 	if (unlikely(copy_data(&req, vcompress->dev, vq, descs, &desc, sizeof(req),
 			max_n_descs) < 0)) {
@@ -889,6 +924,7 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 		VC_LOG_ERR("Invalid descriptor");
 		goto error_exit;
 	}
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 
 	/* desc is advanced by 1 now */
 	max_n_descs -= 1;
@@ -899,6 +935,7 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 		vc_req_out = rte_mbuf_to_priv(op->m_src);
 		memcpy(vc_req_out, vc_req, sizeof(struct vhost_comp_data_req));
 		session_id = req.header.session_id;
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 
 		/* one branch to avoid unnecessary table lookup */
 		if (vcompress->cache_stateless_session_id != session_id) {
@@ -909,6 +946,7 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 				VC_LOG_ERR("Failed to find session %"PRIu64, session_id);
 				goto error_exit;
 			}
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 
 			vcompress->cache_private_xform = vhost_session->private_xform;
 			vcompress->cache_stateless_session_id = session_id;
@@ -917,10 +955,12 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 		private_xform = vcompress->cache_private_xform;
 		op->op_type = RTE_COMP_OP_STATELESS;
 		op->private_xform = private_xform;
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 
 		err = prepare_stateless_comp_op(vcompress, op, vq, vc_req_out,
 				&req.u.stateless_req, desc,
 				max_n_descs);
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 
 		if (unlikely(err != 0)) {
 			VC_LOG_ERR("Failed to process stateless request");
@@ -932,10 +972,12 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 		VC_LOG_ERR("Unsupported symmetric compress request type %u", req.header.opcode);
 		goto error_exit;
 	}
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 
 	return 0;
 
 error_exit:
+	VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 
 	inhdr = reach_inhdr(vc_req->dev, vq, descs, max_n_descs);
 	if (likely(inhdr != NULL))
@@ -972,6 +1014,8 @@ vhost_comp_finalize_one_request(struct rte_comp_op *op,
 	}
 	vq = vc_req->vq;
 	used_idx = vc_req->desc_idx;
+	VC_LOG_ERR("%s %d %u %u", __FUNCTION__, __LINE__, op->status, op->produced);
+	VC_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, vc_req->zero_copy);
 
 	if (old_vq && (vq != old_vq))
 		return vq;
@@ -983,9 +1027,13 @@ vhost_comp_finalize_one_request(struct rte_comp_op *op,
 			write_back_data(vc_req);
 	}
 
+	vc_req->inhdr->consumed = op->consumed;
+	vc_req->inhdr->produced = op->produced;
+
 	desc_idx = vq->avail->ring[used_idx];
 	vq->used->ring[desc_idx].id = vq->avail->ring[desc_idx];
 	vq->used->ring[desc_idx].len = vc_req->len;
+	VC_LOG_ERR("%s %d %u %u", __FUNCTION__, __LINE__, desc_idx, used_idx);
 
 	if (op->op_type == RTE_COMP_OP_STATELESS) {
 		rte_mempool_put(m_src->pool, (void *)m_src);
@@ -1079,6 +1127,7 @@ rte_vhost_comp_create(int vid, uint8_t compressdev_id,
 	vcompress->cache_stateless_session_id = UINT64_MAX;
 	vcompress->last_session_id = 1;
 	vcompress->dev = dev;
+	VC_LOG_ERR("%s %d %p %d", __FUNCTION__, __LINE__, dev, vid);
 	vcompress->option = RTE_VHOST_COMP_ZERO_COPY_DISABLE;
 
 	snprintf(name, 127, "HASH_VHOST_CRYPT_%u", (uint32_t)vid);
@@ -1089,7 +1138,7 @@ rte_vhost_comp_create(int vid, uint8_t compressdev_id,
 	params.socket_id = socket_id;
 	vcompress->session_map = rte_hash_create(&params);
 	if (!vcompress->session_map) {
-		VC_LOG_ERR("Failed to creath session map");
+		VC_LOG_ERR("Failed to create session map");
 		ret = -ENOMEM;
 		goto error_exit;
 	}
@@ -1101,7 +1150,7 @@ rte_vhost_comp_create(int vid, uint8_t compressdev_id,
 			VHOST_COMP_MAX_DATA_SIZE + RTE_PKTMBUF_HEADROOM,
 			rte_socket_id());
 	if (!vcompress->mbuf_pool) {
-		VC_LOG_ERR("Failed to creath mbuf pool");
+		VC_LOG_ERR("Failed to create mbuf pool");
 		ret = -ENOMEM;
 		goto error_exit;
 	}
@@ -1113,7 +1162,7 @@ rte_vhost_comp_create(int vid, uint8_t compressdev_id,
 			128, 0, NULL, NULL, NULL, NULL,
 			rte_socket_id(), 0);
 	if (!vcompress->wb_pool) {
-		VC_LOG_ERR("Failed to creath mempool");
+		VC_LOG_ERR("Failed to create mempool");
 		ret = -ENOMEM;
 		goto error_exit;
 	}
@@ -1206,7 +1255,7 @@ rte_vhost_comp_set_zero_copy(int vid, enum rte_vhost_comp_zero_copy option)
 				128, 0, NULL, NULL, NULL, NULL,
 				rte_socket_id(), 0);
 		if (!vcompress->wb_pool) {
-			VC_LOG_ERR("Failed to creath mbuf pool");
+			VC_LOG_ERR("Failed to create mbuf pool");
 			return -ENOMEM;
 		}
 	} else {
@@ -1246,14 +1295,14 @@ rte_vhost_comp_fetch_requests(int vid, uint32_t qid,
 
 	vcompress = (struct vhost_comp *)dev->extern_data;
 	if (unlikely(vcompress == NULL)) {
-		VC_LOG_ERR("Cannot find required data, is it initialized?");
+		// VC_LOG_ERR("Cannot find required data, is it initialized?");
 		return 0;
 	}
 
 	vq = dev->virtqueue[qid];
 
 	if (unlikely(vq == NULL)) {
-		VC_LOG_ERR("Invalid virtqueue %u", qid);
+		// VC_LOG_ERR("Invalid virtqueue %u", qid);
 		return 0;
 	}
 
@@ -1272,6 +1321,12 @@ rte_vhost_comp_fetch_requests(int vid, uint32_t qid,
 	count = RTE_MIN(count, VHOST_COMP_MAX_BURST_SIZE);
 	count = RTE_MIN(count, nb_ops);
 
+	// VC_LOG_ERR("%d %d", avail_idx, start_idx);
+	if (count != 0)
+	{
+		VC_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
+	}
+
 	if (unlikely(count == 0))
 		goto out_unlock;
 
@@ -1280,6 +1335,7 @@ rte_vhost_comp_fetch_requests(int vid, uint32_t qid,
 	 */
 	switch (vcompress->option) {
 	case RTE_VHOST_COMP_ZERO_COPY_ENABLE:
+	case RTE_VHOST_COMP_ZERO_COPY_DISABLE:
 		if (unlikely(rte_mempool_get_bulk(vcompress->mbuf_pool,
 				(void **)mbufs, count * 2) < 0)) {
 			VC_LOG_ERR("Insufficient memory");
@@ -1301,7 +1357,7 @@ rte_vhost_comp_fetch_requests(int vid, uint32_t qid,
 					op, head, descs, used_idx) < 0))
 				break;
 		}
-
+		VC_LOG_ERR("%s %d try to put bulk", __FUNCTION__, __LINE__);
 		if (unlikely(i < count))
 			rte_mempool_put_bulk(vcompress->mbuf_pool,
 					(void **)&mbufs[i * 2],
@@ -1309,34 +1365,35 @@ rte_vhost_comp_fetch_requests(int vid, uint32_t qid,
 
 		break;
 
-	case RTE_VHOST_COMP_ZERO_COPY_DISABLE:
-		if (unlikely(rte_mempool_get_bulk(vcompress->mbuf_pool,
-				(void **)mbufs, count) < 0)) {
-			VC_LOG_ERR("Insufficient memory");
-			goto out_unlock;
-		}
+	// case RTE_VHOST_COMP_ZERO_COPY_DISABLE:
+	// 	if (unlikely(rte_mempool_get_bulk(vcompress->mbuf_pool,
+	// 			(void **)mbufs, count) < 0)) {
+	// 		VC_LOG_ERR("Insufficient memory");
+	// 		goto out_unlock;
+	// 	}
 
-		for (i = 0; i < count; i++) {
-			uint16_t used_idx = (start_idx + i) & (vq->size - 1);
-			uint16_t desc_idx = vq->avail->ring[used_idx];
-			struct vring_desc *head = &vq->desc[desc_idx];
-			struct rte_comp_op *op = ops[i];
+	// 	for (i = 0; i < count; i++) {
+	// 		uint16_t used_idx = (start_idx + i) & (vq->size - 1);
+	// 		uint16_t desc_idx = vq->avail->ring[used_idx];
+	// 		struct vring_desc *head = &vq->desc[desc_idx];
+	// 		struct rte_comp_op *op = ops[i];
 
-			op->m_src = mbufs[i];
-			op->m_dst = NULL;
-			op->m_src->data_off = 0;
+	// 		op->m_src = mbufs[i];
+	// 		op->m_dst = NULL;
+	// 		op->m_src->data_off = 0;
 
-			if (unlikely(vhost_comp_process_one_req(vcompress, vq,
-					op, head, descs, desc_idx) < 0))
-				break;
-		}
+	// 		if (unlikely(vhost_comp_process_one_req(vcompress, vq,
+	// 				op, head, descs, desc_idx) < 0))
+	// 			break;
+	// 	}
+	// 	VC_LOG_ERR("%s %d try to put bulk", __FUNCTION__, __LINE__);
 
-		if (unlikely(i < count))
-			rte_mempool_put_bulk(vcompress->mbuf_pool,
-					(void **)&mbufs[i],
-					count - i);
+	// 	if (unlikely(i < count))
+	// 		rte_mempool_put_bulk(vcompress->mbuf_pool,
+	// 				(void **)&mbufs[i],
+	// 				count - i);
 
-		break;
+	// 	break;
 
 	}
 

@@ -71,9 +71,10 @@ typedef enum VhostUserRequest {
 	VHOST_USER_SET_INFLIGHT_FD = 32,
 	VHOST_USER_SET_STATUS = 39,
 	VHOST_USER_GET_STATUS = 40,
-	VHOST_USER_COMP_CREATE_SESS = 41,
-	VHOST_USER_COMP_CLOSE_SESS = 42,
 } VhostUserRequest;
+
+#define VHOST_USER_COMPRESS_CREATE_SESS VHOST_USER_CRYPTO_CREATE_SESS
+#define VHOST_USER_COMPRESS_CLOSE_SESS VHOST_USER_CRYPTO_CLOSE_SESS
 
 typedef enum VhostUserBackendRequest {
 	VHOST_USER_BACKEND_NONE = 0,
@@ -141,7 +142,7 @@ typedef struct VhostUserCryptoAsymSessionParam {
 } VhostUserCryptoAsymSessionParam;
 
 typedef struct VhostUserCryptoSessionParam {
-	uint32_t op_code;
+	uint64_t op_code;
 	union {
 		VhostUserCryptoSymSessionParam sym_sess;
 		VhostUserCryptoAsymSessionParam asym_sess;
@@ -155,7 +156,7 @@ typedef struct VhostUserCompDeflateParam {
 
 typedef struct VhostUserCompStatelessSessionParam {
 	uint32_t algo;
-	uint8_t op_type;
+	uint8_t dir;
 
 	int level;
 	uint8_t window_size;
@@ -173,8 +174,8 @@ typedef struct VhostUserCompStatefulSessionParam {
 } VhostUserCompStatefulSessionParam;
 
 typedef struct VhostUserCompSessionParam {
-	uint32_t op_code;
-	uint32_t dir; // VIRTIO_COMP_OP_COMPRESS or VIRTIO_COMP_OP_DECOMPRESS
+	uint64_t op_code;
+	// uint32_t dir; // VIRTIO_COMP_OP_COMPRESS or VIRTIO_COMP_OP_DECOMPRESS
 	union {
 		VhostUserCompStatelessSessionParam stateless;
 		VhostUserCompStatefulSessionParam stateful;

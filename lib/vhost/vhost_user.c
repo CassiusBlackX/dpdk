@@ -435,6 +435,8 @@ vhost_user_set_features(struct virtio_net **pdev,
 	VHOST_CONFIG_LOG(dev->ifname, INFO,
 		"negotiated Virtio features: 0x%" PRIx64,
 		dev->features);
+	VHOST_CONFIG_LOG(dev->ifname, ERR,
+		"%p %lu", dev, dev->features);
 	VHOST_CONFIG_LOG(dev->ifname, DEBUG,
 		"mergeable RX buffers %s, virtio 1 %s",
 		(dev->features & (1 << VIRTIO_NET_F_MRG_RXBUF)) ? "on" : "off",
@@ -573,6 +575,7 @@ numa_realloc(struct virtio_net **pdev, struct vhost_virtqueue **pvq)
 	 * If VQ is ready, it is too late to reallocate, it certainly already
 	 * happened anyway on VHOST_USER_SET_VRING_ADRR.
 	 */
+	VHOST_CONFIG_LOG(dev->ifname, ERR, "%s %d %d", __FUNCTION__, __LINE__, vq->ready);
 	if (vq->ready)
 		return;
 
@@ -693,6 +696,8 @@ out_dev_realloc:
 	if (dev_node == node)
 		return;
 
+	VHOST_CONFIG_LOG(dev->ifname, ERR, "%s %d %p %p", __FUNCTION__, __LINE__, *pdev, (*pdev)->extern_data);
+	struct vhost_comp *tmp = (struct vhost_comp *)((*pdev)->extern_data);
 	dev = rte_realloc_socket(*pdev, sizeof(**pdev), 0, node);
 	if (!dev) {
 		VHOST_CONFIG_LOG((*pdev)->ifname, ERR, "failed to realloc dev on node %d", node);
@@ -702,6 +707,7 @@ out_dev_realloc:
 
 	VHOST_CONFIG_LOG(dev->ifname, INFO, "reallocated device on node %d", node);
 	vhost_devices[dev->vid] = dev;
+	VHOST_CONFIG_LOG("device", ERR, "%s %d feature: %p %lu", __FUNCTION__, __LINE__, dev, dev->features);
 
 	mem_size = sizeof(struct rte_vhost_memory) +
 		sizeof(struct rte_vhost_mem_region) * dev->mem->nregions;
@@ -978,12 +984,14 @@ vhost_user_set_vring_addr(struct virtio_net **pdev,
 	struct vhost_virtqueue *vq;
 	struct vhost_vring_addr *addr = &ctx->msg.payload.addr;
 	bool access_ok;
+	VHOST_CONFIG_LOG("111", ERR, "%s %d %p %p", __FUNCTION__, __LINE__, addr, (void*)addr->avail_user_addr);
 
 	if (dev->mem == NULL)
 		return RTE_VHOST_MSG_RESULT_ERR;
 
 	/* addr->index refers to the queue index. The txq 1, rxq is 0. */
 	vq = dev->virtqueue[ctx->msg.payload.addr.index];
+	VHOST_CONFIG_LOG("111", ERR, "%s %d %u", __FUNCTION__, __LINE__, ctx->msg.payload.addr.index);
 
 	/*
 	 * Rings addresses should not be interpreted as long as the ring is not
@@ -1046,6 +1054,11 @@ vhost_user_set_vring_base(struct virtio_net **pdev,
 	}
 
 	VHOST_CONFIG_LOG(dev->ifname, INFO,
+		"vring base idx:%u last_used_idx:%u last_avail_idx:%u.",
+		ctx->msg.payload.state.index, vq->last_used_idx, vq->last_avail_idx);
+
+		
+	VHOST_CONFIG_LOG(dev->ifname, ERR,
 		"vring base idx:%u last_used_idx:%u last_avail_idx:%u.",
 		ctx->msg.payload.state.index, vq->last_used_idx, vq->last_avail_idx);
 
@@ -3113,6 +3126,7 @@ vhost_user_msg_handler(int vid, int fd)
 	dev = get_device(vid);
 	if (dev == NULL)
 		return -1;
+	VHOST_CONFIG_LOG(dev->ifname, ERR, "%s %d %d %p %lu", __FUNCTION__, __LINE__, vid, dev, dev->features);
 
 	if (!dev->notify_ops) {
 		dev->notify_ops = vhost_driver_callback_get(dev->ifname);
