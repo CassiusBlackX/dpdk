@@ -11,8 +11,10 @@
 #include <rte_cryptodev.h>
 #include <cryptodev_pmd.h>
 #include <rte_eal.h>
+#include <rte_malloc.h>
 
 #include "virtio_cryptodev.h"
+#include "virtio_logs.h"
 #include "virtqueue.h"
 #include "virtio_crypto_algs.h"
 #include "virtio_crypto_capabilities.h"
@@ -422,6 +424,7 @@ virtio_crypto_init_queue(struct rte_cryptodev *dev, uint16_t queue_idx)
 	unsigned int vq_size;
 	struct virtqueue *vq;
 	int ret;
+	VIRTIO_CRYPTO_DRV_LOG_ERR("virtio comp dev configure222 %p", hw);
 
 	PMD_INIT_LOG(INFO, "setting up queue: %u on NUMA node %d",
 			queue_idx, numa_node);
@@ -431,6 +434,7 @@ virtio_crypto_init_queue(struct rte_cryptodev *dev, uint16_t queue_idx)
 	 * Always power of 2 and if 0 virtqueue does not exist
 	 */
 	vq_size = VTPCI_OPS(hw)->get_queue_num(hw, queue_idx);
+	PMD_INIT_LOG(ERR, "vq_size: %u", vq_size);
 	PMD_INIT_LOG(DEBUG, "vq_size: %u", vq_size);
 	if (vq_size == 0) {
 		PMD_INIT_LOG(ERR, "virtqueue does not exist");
@@ -1362,6 +1366,7 @@ virtio_crypto_sym_configure_session(
 		return ret;
 	}
 	session = CRYPTODEV_GET_SYM_SESS_PRIV(sess);
+	VIRTIO_CRYPTO_TX_LOG_ERR("%s %d %p", __FUNCTION__, __LINE__, session);
 	memset(session, 0, sizeof(struct virtio_crypto_session));
 	ctrl = &session->ctrl;
 	ctrl_req = &ctrl->hdr;
@@ -1379,6 +1384,8 @@ virtio_crypto_sym_configure_session(
 		ctrl_req->u.sym_create_session.u.chain.para.alg_chain_order
 			= VIRTIO_CRYPTO_SYM_ALG_CHAIN_ORDER_HASH_THEN_CIPHER;
 
+	VIRTIO_CRYPTO_SESSION_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, 
+		cmd_id);
 	switch (cmd_id) {
 	case VIRTIO_CRYPTO_CMD_CIPHER_HASH:
 	case VIRTIO_CRYPTO_CMD_HASH_CIPHER: {

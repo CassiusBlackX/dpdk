@@ -1491,7 +1491,7 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 {
 	struct vhost_crypto_data_req *vc_req, *vc_req_out;
 	struct rte_cryptodev_asym_session *asym_session;
-	struct rte_cryptodev_sym_session *sym_session;
+	struct _session *sym_session;
 	struct vhost_crypto_data_req data_req = {0};
 	struct vhost_crypto_session *vhost_session;
 	struct vhost_crypto_desc *desc = descs;

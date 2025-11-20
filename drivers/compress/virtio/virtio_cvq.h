@@ -23,7 +23,7 @@ struct virtcomp_ctl {
 struct virtio_pmd_ctrl {
 	struct virtio_comp_op_ctrl_req hdr;
 	struct virtio_comp_session_input input;
-	uint8_t data[VIRTIO_CRYPTO_MAX_CTRL_DATA];
+	uint8_t data[VIRTIO_COMP_MAX_CTRL_DATA];
 };
 
 int

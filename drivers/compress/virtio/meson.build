@@ -14,7 +14,7 @@ sources = files(
         'virtio_cvq.c',
         'virtio_pci.c',
         'virtio_rxtx.c',
-        'virtqueue.c',
+        'virtqueue_comp.c',
 )
 
 if is_linux

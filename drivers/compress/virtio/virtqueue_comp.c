@@ -10,7 +10,7 @@
 #include <rte_errno.h>
 
 #include "virtio_compdev.h"
-#include "virtqueue.h"
+#include "virtqueue_comp.h"
 
 static inline void
 virtqueue_disable_intr_packed(struct virtqueue *vq)
@@ -39,7 +39,7 @@ virtqueue_disable_intr_split(struct virtqueue *vq)
 }
 
 void
-virtqueue_disable_intr(struct virtqueue *vq)
+virtqueue_disable_intr_comp(struct virtqueue *vq)
 {
 	if (vtpci_with_packed_queue(vq->hw))
 		virtqueue_disable_intr_packed(vq);
@@ -48,7 +48,7 @@ virtqueue_disable_intr(struct virtqueue *vq)
 }
 
 void
-virtqueue_detatch_unused(struct virtqueue *vq)
+virtqueue_detatch_unused_comp(struct virtqueue *vq)
 {
 	struct rte_comp_op *cop = NULL;
 
@@ -98,7 +98,7 @@ virtio_init_vring(struct virtqueue *vq)
 	/*
 	 * Disable device(host) interrupting guest
 	 */
-	virtqueue_disable_intr(vq);
+	virtqueue_disable_intr_comp(vq);
 }
 
 static int
@@ -136,6 +136,7 @@ virtio_alloc_queue_headers(struct virtqueue *vq, int numa_node, const char *name
 	snprintf(hdr_name, sizeof(hdr_name), "%s_hdr", name);
 	*hdr_mz = rte_memzone_reserve_aligned(hdr_name, size, numa_node,
 			RTE_MEMZONE_IOVA_CONTIG, RTE_CACHE_LINE_SIZE);
+	PMD_INIT_LOG(ERR, "%p %lu %d", *hdr_mz, size, rte_errno);
 	if (*hdr_mz == NULL) {
 		if (rte_errno == EEXIST)
 			*hdr_mz = rte_memzone_lookup(hdr_name);

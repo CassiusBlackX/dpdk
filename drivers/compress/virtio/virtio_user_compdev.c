@@ -18,9 +18,9 @@
 #include "virtio_user/virtio_user_dev.h"
 #include "virtio_user/vhost.h"
 #include "virtio_compdev.h"
-#include "virtio_logs.h"
+#include "virtio_logs_comp.h"
 #include "virtio_pci.h"
-#include "virtqueue.h"
+#include "virtqueue_comp.h"
 
 #define virtio_user_get_dev(hwp) container_of(hwp, struct virtio_user_dev, hw)
 
@@ -372,6 +372,7 @@ virtio_user_compdev_alloc(struct rte_vdev_device *vdev)
 	data = compdev->data;
 	dev = data->dev_private;
 	hw = &dev->hw;
+	PMD_INIT_LOG(ERR, "user comp alloc %u ", hw->dev_id);
 
 	hw->dev_id = data->dev_id;
 	VTPCI_OPS(hw) = &comp_virtio_user_ops;

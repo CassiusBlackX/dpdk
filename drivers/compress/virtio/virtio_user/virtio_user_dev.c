@@ -22,12 +22,12 @@
 #include <rte_io.h>
 
 #include "vhost.h"
-#include "virtio_logs.h"
+#include "virtio_logs_comp.h"
 #include "rte_compressdev_pmd.h"
 #include "virtio_comp.h"
 #include "virtio_cvq.h"
 #include "virtio_user_dev.h"
-#include "virtqueue.h"
+#include "virtqueue_comp.h"
 
 #define VIRTIO_USER_MEM_EVENT_CLB_NAME "virtio_user_mem_event_clb"
 
@@ -358,15 +358,13 @@ virtio_user_dev_init_max_queue_pairs(struct virtio_user_dev *dev, uint32_t user_
 }
 
 static int
-virtio_user_dev_init_cipher_services(struct virtio_user_dev *dev)
+virtio_user_dev_init_stateless_services(struct virtio_user_dev *dev)
 {
 	struct virtio_comp_config config;
 	int ret;
 
-	dev->comp_services = RTE_BIT32(VIRTIO_CRYPTO_SERVICE_CIPHER);
+	dev->compress_services = RTE_BIT32(VIRTIO_COMP_SERVICE_STATELESS);
 	dev->comp_algo = 0;
-	dev->auth_algo = 0;
-	dev->akcipher_algo = 0;
 
 	if (!dev->ops->get_config)
 		return 0;
@@ -623,7 +621,7 @@ comp_virtio_user_dev_init(struct virtio_user_dev *dev, char *path, uint16_t queu
 		goto destroy;
 	}
 
-	if (virtio_user_dev_init_cipher_services(dev)) {
+	if (virtio_user_dev_init_stateless_services(dev)) {
 		PMD_INIT_LOG(ERR, "(%s) Failed to get cipher services", dev->path);
 		goto destroy;
 	}

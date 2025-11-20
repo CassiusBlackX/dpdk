@@ -1,22 +1,21 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright(c) 2018 HUAWEI TECHNOLOGIES CO., LTD.
  */
-#include <stdbool.h>
-#include <unistd.h>
-
-#include <rte_common.h>
-#include <rte_errno.h>
-#include <rte_pci.h>
-#include <bus_pci_driver.h>
-#include <rte_compressdev.h>
-#include <rte_compressdev_pmd.h>
-#include <rte_eal.h>
-
-#include "virtio_compdev.h"
-#include "rte_comp.h"
-#include "virtqueue.h"
-#include "virtio_comp_algs.h"
-#include "virtio_comp_capabilities.h"
+ #include <stdbool.h>
+ #include <unistd.h>
+ 
+ #include <rte_common.h>
+ #include <rte_errno.h>
+ #include <rte_pci.h>
+ #include <bus_pci_driver.h>
+ #include <rte_cryptodev.h>
+ #include <rte_malloc.h>
+ #include <rte_eal.h>
+ 
+ #include "virtio_compdev.h"
+ #include "virtqueue_comp.h"
+ #include "virtio_comp_algs.h"
+ #include "virtio_comp_capabilities.h"
 
 static int virtio_comp_dev_configure(struct rte_compressdev *dev,
 		struct rte_compressdev_config *config);
@@ -104,7 +103,7 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 
 	PMD_INIT_FUNC_TRACE();
 
-	VIRTIO_CRYPTO_INIT_LOG_DBG("setting up queue: %u", vtpci_queue_idx);
+	VIRTIO_COMP_INIT_LOG_DBG("setting up queue: %u", vtpci_queue_idx);
 
 	/*
 	 * Read the virtqueue size from the Queue Size field
@@ -112,13 +111,13 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 	 */
 	vq_size = VTPCI_OPS(hw)->get_queue_num(hw, vtpci_queue_idx);
 	if (vq_size == 0) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR("virtqueue does not exist");
+		VIRTIO_COMP_INIT_LOG_ERR("virtqueue does not exist");
 		return -EINVAL;
 	}
-	VIRTIO_CRYPTO_INIT_LOG_DBG("vq_size: %u", vq_size);
+	VIRTIO_COMP_INIT_LOG_DBG("vq_size: %u", vq_size);
 
 	if (!rte_is_power_of_2(vq_size)) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR("virtqueue size is not powerof 2");
+		VIRTIO_COMP_INIT_LOG_ERR("virtqueue size is not powerof 2");
 		return -EINVAL;
 	}
 
@@ -138,7 +137,7 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 					dev->data->dev_id);
 			break;
 		default:
-			VIRTIO_CRYPTO_INIT_LOG_ERR("Invalid queue type");
+			VIRTIO_COMP_INIT_LOG_ERR("Invalid queue type");
 	}
 
 	/*
@@ -154,7 +153,7 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 		vq = virtcomp_queue_alloc(hw, vtpci_queue_idx, nb_desc,
 				socket_id, vq_name);
 	if (vq == NULL) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR("Can not allocate virtqueue");
+		VIRTIO_COMP_INIT_LOG_ERR("Can not allocate virtqueue");
 		return -ENOMEM;
 	}
 
@@ -173,7 +172,7 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 					NULL, NULL, NULL, NULL, socket_id,
 					0);
 		if (!vq->mpool) {
-			VIRTIO_CRYPTO_DRV_LOG_ERR("Virtio Comp PMD "
+			VIRTIO_COMP_DRV_LOG_ERR("Virtio Comp PMD "
 					"Cannot create mempool");
 			goto mpool_create_err;
 		}
@@ -183,7 +182,7 @@ virtio_comp_queue_setup(struct rte_compressdev *dev,
 					sizeof(struct virtio_comp_op_cookie),
 					RTE_CACHE_LINE_SIZE);
 			if (vq->vq_descx[i].cookie == NULL) {
-				VIRTIO_CRYPTO_DRV_LOG_ERR("Failed to "
+				VIRTIO_COMP_DRV_LOG_ERR("Failed to "
 						"alloc mem for cookie");
 				goto cookie_alloc_err;
 			}
@@ -251,34 +250,55 @@ static int virtio_comp_private_xform_create(struct rte_compressdev *dev,
 		void **private_xform) {
 	int ret = 0;
 	int dlen[2] = {0, 0};
-	int dnum = 1;
+	int dnum = 0;
 	struct virtio_comp_hw *hw = dev->data->dev_private;
 	struct virtio_comp_op_ctrl_req *ctrl_req;
 	struct virtio_comp_session_input *input;
-	struct virtio_pmd_ctrl *ctrl;
-	struct virtio_comp_session *session = (struct virtio_comp_session *)private_xform;
 
+	if (rte_mempool_get(hw->xform_pool, private_xform)) {
+		VIRTIO_COMP_DRV_LOG_ERR(
+			"Couldn't get object from private xform mempool");
+		return -ENOMEM;
+	}
+
+	struct virtio_comp_session *session = (struct virtio_comp_session *)(*private_xform);
+	struct virtio_pmd_ctrl *ctrl = &session->ctrl;
 	ctrl_req = &ctrl->hdr;
 	ctrl_req->header.opcode = VIRTIO_COMP_STATELESS_CREATE_SESSION;
+	ctrl_req->header.algo = VIRTIO_COMP_ALGO_DEFLATE;
 	ctrl_req->header.queue_id = 0;
+	// TODO:
+	ctrl_req->u.stateless_create_session.req.para.algo = VIRTIO_COMP_ALGO_DEFLATE;
+	if (xform->type == RTE_COMP_COMPRESS)
+	{
+		ctrl_req->u.stateless_create_session.req.para.op = VIRTIO_COMP_OP_COMPRESS;
+	}
+	else {
+		ctrl_req->u.stateless_create_session.req.para.op = VIRTIO_COMP_OP_DECOMPRESS;
+	}
+	ctrl_req->u.stateless_create_session.req.para.level = xform->compress.level;
+	ctrl_req->u.stateless_create_session.req.para.window_size = xform->compress.window_size;
+	ctrl_req->u.stateless_create_session.req.para.chksum = xform->compress.chksum;
+	ctrl_req->u.stateless_create_session.req.para.hash_algo = xform->compress.hash_algo;
+	ctrl_req->u.stateless_create_session.req.para.u.deflate.huffman = xform->compress.deflate.huffman;
+	VIRTIO_COMP_DRV_LOG_ERR("%s %d %d %d %d", __FUNCTION__, __LINE__, 
+		ctrl_req->u.stateless_create_session.req.para.level,
+		ctrl_req->u.stateless_create_session.req.para.window_size,
+		ctrl_req->u.stateless_create_session.req.para.u.deflate.huffman);
+	
 	input = &ctrl->input;
 	input->status = VIRTIO_COMP_ERR;
 	input->session_id = ~0ULL;
 
 	if (xform == NULL) {
-		VIRTIO_CRYPTO_DRV_LOG_ERR("Invalid Xform struct");
+		VIRTIO_COMP_DRV_LOG_ERR("Invalid Xform struct");
 		return -EINVAL;
 	}
 
-	if (rte_mempool_get(hw->xform_pool, private_xform)) {
-		VIRTIO_CRYPTO_DRV_LOG_ERR(
-			"Couldn't get object from private xform mempool");
-		return -ENOMEM;
-	}
 
 	ret = virtio_comp_set_priv_xform_parameters(*private_xform, xform);
 	if (ret != 0) {
-		VIRTIO_CRYPTO_DRV_LOG_ERR(
+		VIRTIO_COMP_DRV_LOG_ERR(
 			"Failed to configure private xform parameters");
 		/* Return privatge xform to mempool */
 		rte_mempool_put(hw->xform_pool, private_xform);
@@ -287,20 +307,20 @@ static int virtio_comp_private_xform_create(struct rte_compressdev *dev,
 
 	ret = virtio_comp_send_command(hw->cvq, ctrl, dlen, dnum);
 	if (ret < 0) {
-		VIRTIO_CRYPTO_SESSION_LOG_ERR("create session failed: %d", ret);
+		VIRTIO_COMP_SESSION_LOG_ERR("create session failed: %d", ret);
 		goto error_out;
 	}
 
 	ctrl = hw->cvq->hdr_mz->addr;
 	input = &ctrl->input;
 	if (input->status != VIRTIO_COMP_OK) {
-		VIRTIO_CRYPTO_SESSION_LOG_ERR("Something wrong on backend! "
+		VIRTIO_COMP_SESSION_LOG_ERR("Something wrong on backend! "
 				"status=%u, session_id=%" PRIu64 "",
 				input->status, input->session_id);
 		goto error_out;
 	} else {
 		session->session_id = input->session_id;
-		VIRTIO_CRYPTO_SESSION_LOG_INFO("Create session successfully, "
+		VIRTIO_COMP_SESSION_LOG_INFO("Create session successfully, "
 				"session_id=%" PRIu64 "", input->session_id);
 	}
 	return 0;
@@ -332,7 +352,7 @@ virtio_comp_update_stats(struct rte_compressdev *dev,
 	PMD_INIT_FUNC_TRACE();
 
 	if (stats == NULL) {
-		VIRTIO_CRYPTO_DRV_LOG_ERR("invalid pointer");
+		VIRTIO_COMP_DRV_LOG_ERR("invalid pointer");
 		return;
 	}
 
@@ -397,7 +417,7 @@ virtio_comp_qp_setup(struct rte_compressdev *dev, uint16_t qp_id,
 	ret = virtio_comp_queue_setup(dev, VTCOMP_DATAQ, qp_id,
 			max_inflight_ops, socket_id, &vq);
 	if (ret < 0) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR(
+		VIRTIO_COMP_INIT_LOG_ERR(
 			"virtio comp data queue initialization failed");
 		return ret;
 	}
@@ -416,7 +436,7 @@ virtio_comp_qp_release(struct rte_compressdev *dev, uint16_t queue_pair_id)
 	PMD_INIT_FUNC_TRACE();
 
 	if (vq == NULL) {
-		VIRTIO_CRYPTO_DRV_LOG_DBG("vq already freed");
+		VIRTIO_COMP_DRV_LOG_DBG("vq already freed");
 		return 0;
 	}
 
@@ -433,12 +453,12 @@ virtio_negotiate_features(struct virtio_comp_hw *hw, uint64_t req_features)
 	PMD_INIT_FUNC_TRACE();
 
 	/* Prepare guest_features: feature that driver wants to support */
-	VIRTIO_CRYPTO_INIT_LOG_DBG("guest_features before negotiate = %" PRIx64,
+	VIRTIO_COMP_INIT_LOG_DBG("guest_features before negotiate = %" PRIx64,
 		req_features);
 
 	/* Read device(host) feature bits */
 	host_features = VTPCI_OPS(hw)->get_features(hw);
-	VIRTIO_CRYPTO_INIT_LOG_DBG("host_features before negotiate = %" PRIx64,
+	VIRTIO_COMP_INIT_LOG_DBG("host_features before negotiate = %" PRIx64,
 		host_features);
 
 	/*
@@ -448,12 +468,12 @@ virtio_negotiate_features(struct virtio_comp_hw *hw, uint64_t req_features)
 	hw->guest_features = req_features;
 	hw->guest_features = vtpci_compdev_negotiate_features(hw,
 							host_features);
-	VIRTIO_CRYPTO_INIT_LOG_DBG("features after negotiate = %" PRIx64,
+	VIRTIO_COMP_INIT_LOG_DBG("features after negotiate = %" PRIx64,
 		hw->guest_features);
 
 	if (hw->modern) {
 		if (!vtpci_with_feature(hw, VIRTIO_F_VERSION_1)) {
-			VIRTIO_CRYPTO_INIT_LOG_ERR(
+			VIRTIO_COMP_INIT_LOG_ERR(
 				"VIRTIO_F_VERSION_1 features is not enabled.");
 			return -1;
 		}
@@ -461,7 +481,7 @@ virtio_negotiate_features(struct virtio_comp_hw *hw, uint64_t req_features)
 			VIRTIO_CONFIG_STATUS_FEATURES_OK);
 		if (!(vtpci_compdev_get_status(hw) &
 			VIRTIO_CONFIG_STATUS_FEATURES_OK)) {
-			VIRTIO_CRYPTO_INIT_LOG_ERR("failed to set FEATURES_OK "
+			VIRTIO_COMP_INIT_LOG_ERR("failed to set FEATURES_OK "
 						"status!");
 			return -1;
 		}
@@ -592,7 +612,7 @@ virtio_comp_init_device(struct rte_compressdev *compdev,
 		offsetof(struct virtio_comp_config, status),
 		&config->status, sizeof(config->status));
 	if (config->status != VIRTIO_COMP_S_HW_READY) {
-		VIRTIO_CRYPTO_DRV_LOG_ERR("accelerator hardware is "
+		VIRTIO_COMP_DRV_LOG_ERR("accelerator hardware is "
 				"not ready");
 		return -1;
 	}
@@ -604,7 +624,7 @@ virtio_comp_init_device(struct rte_compressdev *compdev,
 		sizeof(config->max_dataqueues));
 	hw->max_dataqueues = config->max_dataqueues;
 
-	VIRTIO_CRYPTO_INIT_LOG_DBG("hw->max_dataqueues=%d",
+	VIRTIO_COMP_INIT_LOG_DBG("hw->max_dataqueues=%d",
 		hw->max_dataqueues);
 
 	return 0;
@@ -636,7 +656,7 @@ comp_virtio_dev_init(struct rte_compressdev *compdev, uint64_t features,
 
 	if (pci_dev) {
 		/* pci device init */
-		VIRTIO_CRYPTO_INIT_LOG_DBG("dev %d vendorID=0x%x deviceID=0x%x",
+		VIRTIO_COMP_INIT_LOG_DBG("dev %d vendorID=0x%x deviceID=0x%x",
 			compdev->data->dev_id, pci_dev->id.vendor_id,
 			pci_dev->id.device_id);
 
@@ -663,7 +683,7 @@ comp_virtio_create(const char *name, struct rte_pci_device *pci_dev,
 	PMD_INIT_FUNC_TRACE();
 
 	compdev = rte_compressdev_pmd_create(name, &pci_dev->device,
-		sizeof(struct virtio_comp_private),	 /* BUG: cassius add this struct here to be passed in */
+		sizeof(struct virtio_comp_hw),
 		init_params);
 	if (compdev == NULL)
 		return -ENODEV;
@@ -694,7 +714,7 @@ virtio_comp_dev_uninit(struct rte_compressdev *compdev)
 
 	rte_compressdev_pmd_release_device(compdev);
 
-	VIRTIO_CRYPTO_DRV_LOG_INFO("dev_uninit completed");
+	VIRTIO_COMP_DRV_LOG_INFO("dev_uninit completed");
 
 	return 0;
 }
@@ -704,17 +724,28 @@ virtio_comp_dev_configure(struct rte_compressdev *compdev,
 	struct rte_compressdev_config *config __rte_unused)
 {
 	PMD_INIT_FUNC_TRACE();
+	struct virtio_comp_hw *hw = compdev->data->dev_private;
 
 	if (virtio_comp_init_device(compdev,
 			VIRTIO_COMP_PMD_GUEST_FEATURES) < 0)
 		return -1;
+	char mp_name[RTE_MEMPOOL_NAMESIZE];
+	snprintf(mp_name, sizeof(mp_name), "%s_xform", compdev->data->name);
+		hw->xform_pool = rte_mempool_create(mp_name,
+			config->max_nb_priv_xforms, sizeof(struct virtio_comp_priv_xform),
+			0, 0, NULL, NULL, NULL, NULL,
+			config->socket_id, 0);
+	if (hw->xform_pool == NULL) {
+		VIRTIO_COMP_INIT_LOG_ERR("Failed to create xform pool");
+		return -1;
+	}
 
 	/* setup control queue
 	 * [0, 1, ... ,(config->max_dataqueues - 1)] are data queues
 	 * config->max_dataqueues is the control queue
 	 */
 	if (virtio_comp_alloc_queues(compdev) < 0) {
-		VIRTIO_CRYPTO_DRV_LOG_ERR("failed to create virtqueues");
+		VIRTIO_COMP_DRV_LOG_ERR("failed to create virtqueues");
 		return -1;
 	}
 
@@ -729,7 +760,7 @@ virtio_comp_dev_stop(struct rte_compressdev *dev)
 	struct virtio_comp_hw *hw = dev->data->dev_private;
 
 	PMD_INIT_FUNC_TRACE();
-	VIRTIO_CRYPTO_DRV_LOG_DBG("virtio_dev_stop");
+	VIRTIO_COMP_DRV_LOG_DBG("virtio_dev_stop");
 
 	vtpci_compdev_reset(hw);
 
@@ -742,14 +773,18 @@ virtio_comp_dev_stop(struct rte_compressdev *dev)
 static int
 virtio_comp_dev_start(struct rte_compressdev *dev)
 {
+	VIRTIO_COMP_DRV_LOG_ERR("virtio comp dev start 000");
 	struct virtio_comp_hw *hw = dev->data->dev_private;
+	VIRTIO_COMP_DRV_LOG_ERR("virtio comp dev start 111");
 
 	if (dev->data->dev_started)
 		return 0;
 
 	/* Do final configuration before queue engine starts */
 	virtio_comp_dataq_start(dev);
+	VIRTIO_COMP_DRV_LOG_ERR("virtio comp dev start 222");
 	vtpci_compdev_reinit_complete(hw);
+	VIRTIO_COMP_DRV_LOG_ERR("virtio comp dev start 333");
 
 	dev->data->dev_started = 1;
 
@@ -762,17 +797,17 @@ virtio_comp_dev_free_mbufs(struct rte_compressdev *dev)
 	uint32_t i;
 
 	for (i = 0; i < dev->data->nb_queue_pairs; i++) {
-		VIRTIO_CRYPTO_INIT_LOG_DBG("Before freeing dataq[%d] used "
+		VIRTIO_COMP_INIT_LOG_DBG("Before freeing dataq[%d] used "
 			"and unused buf", i);
 		VIRTQUEUE_DUMP((struct virtqueue *)
 			dev->data->queue_pairs[i]);
 
-		VIRTIO_CRYPTO_INIT_LOG_DBG("queue_pairs[%d]=%p",
+		VIRTIO_COMP_INIT_LOG_DBG("queue_pairs[%d]=%p",
 				i, dev->data->queue_pairs[i]);
 
-		virtqueue_detatch_unused(dev->data->queue_pairs[i]);
+		virtqueue_detatch_unused_comp(dev->data->queue_pairs[i]);
 
-		VIRTIO_CRYPTO_INIT_LOG_DBG("After freeing dataq[%d] used and "
+		VIRTIO_COMP_INIT_LOG_DBG("After freeing dataq[%d] used and "
 					"unused buf", i);
 		VIRTQUEUE_DUMP(
 			(struct virtqueue *)dev->data->queue_pairs[i]);
@@ -807,7 +842,7 @@ comp_virtio_pci_probe(
 	};
 	char name[RTE_COMPRESSDEV_NAME_MAX_LEN];
 
-	VIRTIO_CRYPTO_DRV_LOG_DBG("Found Crypto device at %02x:%02x.%x",
+	VIRTIO_COMP_DRV_LOG_DBG("Found Crypto device at %02x:%02x.%x",
 			pci_dev->addr.bus,
 			pci_dev->addr.devid,
 			pci_dev->addr.function);
@@ -844,13 +879,14 @@ virtio_comp_set_priv_xform_parameters(
 {
 	if (xform == NULL) 
 		return -EINVAL;
+	VIRTIO_COMP_DRV_LOG_ERR("%p %u", xform, xform->type);
 	
 	int strategy, level, window_size;
 	/* set compression private xform variables */
 	switch (xform->type) {
 		case RTE_COMP_COMPRESS:
 			/* set private xform type - COMPRESS/DECOMPRESS */
-			private_xform = RTE_COMP_COMPRESS;
+			private_xform->type = RTE_COMP_COMPRESS;
 
 			/* set private xform algorithm */
 			switch (xform->compress.algo) {
@@ -860,22 +896,41 @@ virtio_comp_set_priv_xform_parameters(
 				case RTE_COMP_ALGO_LZ4:
 					private_xform->compress.algo = RTE_COMP_ALGO_LZ4;
 					break;
-				case RTE_COMP_ALGO_ZSTD:
-					private_xform->compress.algo = RTE_COMP_ALGO_ZSTD;
-					break;
+				// case RTE_COMP_ALGO_ZSTD:
+				// 	private_xform->compress.algo = RTE_COMP_ALGO_ZSTD;
+				// 	break;
 				default:
-					VIRTIO_CRYPTO_DRV_LOG_ERR("algorithm not supported!");
+					VIRTIO_COMP_DRV_LOG_ERR("algorithm not supported!");
 					return -ENOTSUP;
 			}
 
 			break;
 		case RTE_COMP_DECOMPRESS:
-			
+			private_xform->type = RTE_COMP_DECOMPRESS;
+
+			/* set private xform algorithm */
+			switch (xform->decompress.algo) {
+				case RTE_COMP_ALGO_DEFLATE:
+					private_xform->decompress.algo = RTE_COMP_ALGO_DEFLATE;
+					break;
+				case RTE_COMP_ALGO_LZ4:
+					private_xform->decompress.algo = RTE_COMP_ALGO_LZ4;
+					break;
+				// case RTE_COMP_ALGO_ZSTD:
+				// 	private_xform->compress.algo = RTE_COMP_ALGO_ZSTD;
+				// 	break;
+				default:
+					VIRTIO_COMP_DRV_LOG_ERR("algorithm not supported!");
+					return -ENOTSUP;
+			}
+
 			break;
 		default:
-			VIRTIO_CRYPTO_DRV_LOG_ERR("xform type not supported!");
+			VIRTIO_COMP_DRV_LOG_ERR("xform type not supported!");
 			return -ENOTSUP;
 	}
+
+	return 0;
 	
 }
 

@@ -3,6 +3,7 @@
  */
 #include <cryptodev_pmd.h>
 
+#include "virtio_logs.h"
 #include "virtqueue.h"
 #include "virtio_ring.h"
 #include "virtio_cryptodev.h"
@@ -67,10 +68,13 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 					vq->vq_used_cons_idx);
 			break;
 		}
-
+		VIRTIO_CRYPTO_TX_LOG_ERR("%s %d %u %u", __FUNCTION__, __LINE__, used_idx, desc_idx);
+		VIRTIO_CRYPTO_TX_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, cop->status);
+		
 		op_cookie = (struct virtio_crypto_op_cookie *)
 						vq->vq_descx[desc_idx].cookie;
 		inhdr = &(op_cookie->inhdr);
+		VIRTIO_CRYPTO_TX_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, inhdr->status);
 		switch (inhdr->status) {
 		case VIRTIO_CRYPTO_OK:
 			cop->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
@@ -201,6 +205,9 @@ virtqueue_crypto_check_cipher_request(struct virtio_crypto_cipher_data_req *req)
 		(req->para.dst_data_len >= req->para.src_data_len) &&
 		(req->para.dst_data_len <= RTE_MBUF_DEFAULT_BUF_SIZE)))
 		return VIRTIO_CRYPTO_OK;
+	VIRTIO_CRYPTO_TX_LOG_ERR("%s %d %u %u %u %u %u", __FUNCTION__, __LINE__,
+	req->para.iv_len, VIRTIO_CRYPTO_MAX_IV_SIZE, req->para.src_data_len,
+	req->para.dst_data_len, RTE_MBUF_DEFAULT_BUF_SIZE);
 	return VIRTIO_CRYPTO_BADMSG;
 }
 
@@ -244,6 +251,9 @@ virtqueue_crypto_sym_pkt_header_arrange(
 
 	req_data->header.session_id = session->session_id;
 
+	VIRTIO_CRYPTO_TX_LOG_ERR("%s %d %p", __FUNCTION__, __LINE__, session);
+	VIRTIO_CRYPTO_TX_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, sym_sess_req->op_type);
+	VIRTIO_CRYPTO_TX_LOG_ERR("%s %d %lu", __FUNCTION__, __LINE__, session->session_id);
 	switch (sym_sess_req->op_type) {
 	case VIRTIO_CRYPTO_SYM_OP_CIPHER:
 		req_data->u.sym_req.op_type = VIRTIO_CRYPTO_SYM_OP_CIPHER;
@@ -349,6 +359,9 @@ virtqueue_crypto_sym_enqueue_xmit_split(
 	if (unlikely(txvq->vq_free_cnt < needed))
 		return -EMSGSIZE;
 	head_idx = txvq->vq_desc_head_idx;
+	VIRTIO_CRYPTO_TX_LOG_ERR("%s %d %p", __FUNCTION__, __LINE__, cop->sym->session);
+	VIRTIO_CRYPTO_TX_LOG_ERR("%s %d %u %u %p", __FUNCTION__, __LINE__,
+		head_idx, txvq->vq_desc_head_idx, (void*)session);
 	if (unlikely(head_idx >= txvq->vq_nentries))
 		return -EFAULT;
 	if (unlikely(session == NULL))

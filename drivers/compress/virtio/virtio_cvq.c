@@ -9,13 +9,17 @@
 #include <rte_errno.h>
 
 #include "virtio_cvq.h"
-#include "virtqueue.h"
+#include "virtio_logs_comp.h"
+#include "virtqueue_comp.h"
 
 static struct virtio_pmd_ctrl *
 virtio_send_command_packed(struct virtcomp_ctl *cvq,
 			   struct virtio_pmd_ctrl *ctrl,
 			   int *dlen, int dnum)
 {
+	PMD_INIT_LOG(ERR, "%d %s", __LINE__, __FUNCTION__);
+	PMD_INIT_LOG(ERR, "%u", dnum);
+
 	struct virtqueue *vq = virtcomp_cq_to_vq(cvq);
 	int head;
 	struct vring_packed_desc *desc = vq->vq_packed.ring.desc;
@@ -111,6 +115,9 @@ virtio_send_command_split(struct virtcomp_ctl *cvq,
 			  struct virtio_pmd_ctrl *ctrl,
 			  int *dlen, int dnum)
 {
+	PMD_INIT_LOG(ERR, "%d %s", __LINE__, __FUNCTION__);
+	PMD_INIT_LOG(ERR, "%u", dnum);
+
 	struct virtqueue *vq = virtcomp_cq_to_vq(cvq);
 	struct virtio_pmd_ctrl *result;
 	uint32_t head, i;
@@ -130,6 +137,9 @@ virtio_send_command_split(struct virtcomp_ctl *cvq,
 	vq->vq_free_cnt--;
 	i = vq->vq_split.ring.desc[head].next;
 
+	PMD_INIT_LOG(ERR, "%d %s", __LINE__, __FUNCTION__);
+	PMD_INIT_LOG(ERR, "%u %lu %u", head, vq->vq_split.ring.desc[head].addr, vq->vq_split.ring.desc[head].len);
+
 	for (k = 0; k < dnum; k++) {
 		vq->vq_split.ring.desc[i].flags = VRING_DESC_F_NEXT;
 		vq->vq_split.ring.desc[i].addr = cvq->hdr_mem
@@ -139,7 +149,12 @@ virtio_send_command_split(struct virtcomp_ctl *cvq,
 		sum += dlen[k];
 		vq->vq_free_cnt--;
 		i = vq->vq_split.ring.desc[i].next;
+		PMD_INIT_LOG(ERR, "%d %s", __LINE__, __FUNCTION__);
+		PMD_INIT_LOG(ERR, "%u %lu %u", i, vq->vq_split.ring.desc[i].addr, vq->vq_split.ring.desc[i].len);
+
 	}
+	PMD_INIT_LOG(ERR, "%d %s", __LINE__, __FUNCTION__);
+	PMD_INIT_LOG(ERR, "%lu %u", vq->vq_split.ring.desc[i].addr, vq->vq_split.ring.desc[i].len);
 
 	vq->vq_split.ring.desc[i].flags = VRING_DESC_F_WRITE;
 	vq->vq_split.ring.desc[i].addr = cvq->hdr_mem
@@ -211,7 +226,7 @@ virtio_comp_send_command(struct virtcomp_ctl *cvq, struct virtio_pmd_ctrl *ctrl,
 		"vq->hw->cvq = %p vq = %p",
 		vq->vq_desc_head_idx, status, vq->hw->cvq, vq);
 
-	if (vq->vq_free_cnt < dnum + 2 || dnum < 1) {
+	if (vq->vq_free_cnt < dnum + 2) {
 		rte_spinlock_unlock(&cvq->lock);
 		return -1;
 	}

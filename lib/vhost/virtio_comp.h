@@ -32,16 +32,21 @@ struct virtio_comp_deflate_session_para {
 };
 
 struct virtio_comp_session_para {
-#define	VIRTIO_COMP_ALGO_NONE 0
-#define	VIRTIO_COMP_ALGO_DEFLATE 1
-#define	VIRTIO_COMP_ALGO_LZS 2
-#define	VIRTIO_COMP_ALGO_LZ4 3
+#define	VIRTIO_COMP_ALGO_UNSPECIFIED 0
+#define	VIRTIO_COMP_ALGO_NONE 1
+#define	VIRTIO_COMP_ALGO_DEFLATE 2
+#define	VIRTIO_COMP_ALGO_LZS 3
+#define	VIRTIO_COMP_ALGO_LZ4 4
 	uint32_t algo;
 #define VIRTIO_COMP_OP_COMPRESS  1
 #define VIRTIO_COMP_OP_DECOMPRESS  2
 	/* compress or decompress */
 	uint32_t op;
 
+	int level;
+	uint8_t window_size;
+	uint32_t chksum;
+	uint32_t hash_algo;
 	union {
 		struct virtio_comp_deflate_session_para deflate;
 	} u;
@@ -175,5 +180,8 @@ struct virtio_comp_config {
 struct virtio_comp_inhdr {
 	/* See VIRTIO_COMP_* above */
 	uint8_t status;
+
+	uint32_t consumed;
+	uint32_t produced;
 };
 #endif /* _VIRTIO_COMP_H */

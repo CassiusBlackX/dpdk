@@ -15,7 +15,7 @@
 #include "virtio_cvq.h"
 #include "virtio_pci.h"
 #include "virtio_ring.h"
-#include "virtio_logs.h"
+#include "virtio_logs_comp.h"
 #include "virtio_comp.h"
 #include "virtio_rxtx.h"
 
@@ -188,12 +188,12 @@ struct virtqueue {
 /**
  * Tell the backend not to interrupt us.
  */
-void virtqueue_disable_intr(struct virtqueue *vq);
+void virtqueue_disable_intr_comp(struct virtqueue *vq);
 
 /**
  *  Get all mbufs to be freed.
  */
-void virtqueue_detatch_unused(struct virtqueue *vq);
+void virtqueue_detatch_unused_comp(struct virtqueue *vq);
 
 struct virtqueue *virtcomp_queue_alloc(struct virtio_comp_hw *hw, uint16_t index,
 		uint16_t num, int node, const char *name);
@@ -329,7 +329,7 @@ virtqueue_nused(const struct virtqueue *vq)
 	uint16_t used_idx, nused; \
 	used_idx = (vq)->vq_split.ring.used->idx; \
 	nused = (uint16_t)(used_idx - (vq)->vq_used_cons_idx); \
-	VIRTIO_CRYPTO_INIT_LOG_DBG(\
+	VIRTIO_COMP_INIT_LOG_DBG(\
 	  "VQ: - size=%d; free=%d; used=%d; desc_head_idx=%d;" \
 	  " avail.idx=%d; used_cons_idx=%d; used.idx=%d;" \
 	  " avail.flags=0x%x; used.flags=0x%x", \
@@ -342,7 +342,7 @@ virtqueue_nused(const struct virtqueue *vq)
 #define VIRTQUEUE_PACKED_DUMP(vq) do { \
 	uint16_t nused; \
 	nused = (vq)->vq_nentries - (vq)->vq_free_cnt; \
-	VIRTIO_CRYPTO_INIT_LOG_DBG(\
+	VIRTIO_COMP_INIT_LOG_DBG(\
 	  "VQ: - size=%d; free=%d; used=%d; desc_head_idx=%d;" \
 	  " avail_idx=%d; used_cons_idx=%d;" \
 	  " avail.flags=0x%x; wrap_counter=%d", \

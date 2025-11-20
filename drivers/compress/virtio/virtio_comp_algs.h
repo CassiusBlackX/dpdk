@@ -2,8 +2,8 @@
  * Copyright(c) 2018 HUAWEI TECHNOLOGIES CO., LTD.
  */
 
-#ifndef _VIRTIO_CRYPTO_ALGS_H_
-#define _VIRTIO_CRYPTO_ALGS_H_
+#ifndef _VIRTIO_COMP_ALGS_H_
+#define _VIRTIO_COMP_ALGS_H_
 
 #include <rte_memory.h>
 
@@ -32,4 +32,4 @@ struct virtio_comp_session {
 	struct virtio_pmd_ctrl ctrl;
 };
 
-#endif /* _VIRTIO_CRYPTO_ALGS_H_ */
+#endif /* _VIRTIO_COMP_ALGS_H_ */

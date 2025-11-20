@@ -187,6 +187,8 @@ virtcrypto_queue_alloc(struct virtio_crypto_hw *hw, uint16_t index, uint16_t num
 	struct virtqueue *vq;
 	unsigned int size;
 
+	num /= 2;
+	num += 1;
 	size = sizeof(*vq) + num * sizeof(struct vq_desc_extra);
 	size = RTE_ALIGN_CEIL(size, RTE_CACHE_LINE_SIZE);
 

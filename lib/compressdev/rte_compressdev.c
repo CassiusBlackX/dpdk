@@ -242,7 +242,6 @@ rte_compressdev_pmd_allocate(const char *name, int socket_id)
 			"comp device with name %s already allocated!", name);
 		return NULL;
 	}
-
 	dev_id = rte_compressdev_find_free_device_index();
 	if (dev_id == RTE_COMPRESS_MAX_DEVS) {
 		COMPRESSDEV_LOG(ERR, "Reached maximum number of comp devices");
@@ -430,32 +429,38 @@ rte_compressdev_configure(uint8_t dev_id, struct rte_compressdev_config *config)
 {
 	struct rte_compressdev *dev;
 	int diag;
-
+	COMPRESSDEV_LOG(ERR, "%d", __LINE__);
 	if (!rte_compressdev_is_valid_dev(dev_id)) {
 		COMPRESSDEV_LOG(ERR, "Invalid dev_id=%" PRIu8, dev_id);
 		return -EINVAL;
 	}
+	COMPRESSDEV_LOG(ERR, "%d", __LINE__);
 
 	dev = &rte_comp_devices[dev_id];
+	COMPRESSDEV_LOG(ERR, "%d", __LINE__);
 
 	if (dev->data->dev_started) {
 		COMPRESSDEV_LOG(ERR,
 		    "device %d must be stopped to allow configuration", dev_id);
 		return -EBUSY;
 	}
+	COMPRESSDEV_LOG(ERR, "%d", __LINE__);
 
 	if (dev->dev_ops->dev_configure == NULL)
 		return -ENOTSUP;
+	COMPRESSDEV_LOG(ERR, "%d", __LINE__);
 
 	/* Setup new number of queue pairs and reconfigure device. */
 	diag = rte_compressdev_queue_pairs_config(dev, config->nb_queue_pairs,
 			config->socket_id);
+	COMPRESSDEV_LOG(ERR, "%d", __LINE__);
 	if (diag != 0) {
 		COMPRESSDEV_LOG(ERR,
 			"dev%d rte_comp_dev_queue_pairs_config = %d",
 				dev_id, diag);
 		return diag;
 	}
+	COMPRESSDEV_LOG(ERR, "%d %u %u", __LINE__, dev_id, dev->data->dev_id);
 
 	return dev->dev_ops->dev_configure(dev, config);
 }
@@ -687,6 +692,7 @@ rte_compressdev_private_xform_create(uint8_t dev_id,
 {
 	struct rte_compressdev *dev;
 	int ret;
+	COMPRESSDEV_LOG(ERR, "%p %u", xform, xform->type);
 
 	dev = rte_compressdev_get_dev(dev_id);
 

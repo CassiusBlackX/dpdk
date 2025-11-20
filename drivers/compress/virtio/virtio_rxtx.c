@@ -3,7 +3,8 @@
  */
 #include <rte_compressdev.h>
 
-#include "virtqueue.h"
+#include "virtio_logs_comp.h"
+#include "virtqueue_comp.h"
 #include "virtio_ring.h"
 #include "virtio_compdev.h"
 #include "virtio_comp_algs.h"
@@ -61,8 +62,10 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 		desc_idx = (uint16_t)uep->id;
 		cop = (struct rte_comp_op *)
 				vq->vq_descx[desc_idx].comp_op;
+		VIRTIO_COMP_TX_LOG_ERR("%s %d %u %u", __FUNCTION__, __LINE__, used_idx, desc_idx);
+		VIRTIO_COMP_TX_LOG_ERR("%s %d %u %u %u", __FUNCTION__, __LINE__, cop->consumed, cop->produced, cop->status);
 		if (unlikely(cop == NULL)) {
-			VIRTIO_CRYPTO_RX_LOG_DBG("vring descriptor with no "
+			VIRTIO_COMP_RX_LOG_DBG("vring descriptor with no "
 					"mbuf cookie at %u",
 					vq->vq_used_cons_idx);
 			break;
@@ -71,6 +74,7 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 		op_cookie = (struct virtio_comp_op_cookie *)
 						vq->vq_descx[desc_idx].cookie;
 		inhdr = &(op_cookie->inhdr);
+		VIRTIO_COMP_TX_LOG_ERR("%s %d %u %u %u", __FUNCTION__, __LINE__, inhdr->status, inhdr->consumed, inhdr->produced);
 		switch (inhdr->status) {
 		case VIRTIO_COMP_OK:
 			cop->status = RTE_COMP_OP_STATUS_SUCCESS;
@@ -94,6 +98,10 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 		default:
 			break;
 		}
+
+		cop->consumed = inhdr->consumed;
+		cop->produced = inhdr->produced;
+		VIRTIO_COMP_TX_LOG_ERR("%s %d %u %u", __FUNCTION__, __LINE__, inhdr->consumed, inhdr->produced);
 
 		vq->packets_received_total++;
 
@@ -129,8 +137,9 @@ virtqueue_dequeue_burst_rx_packed(struct virtqueue *vq,
 
 		cop = (struct rte_comp_op *)
 				vq->vq_descx[used_idx].comp_op;
+		VIRTIO_COMP_TX_LOG_ERR("%s %d %u %u %u", __FUNCTION__, __LINE__, cop->consumed, cop->produced, cop->status);
 		if (unlikely(cop == NULL)) {
-			VIRTIO_CRYPTO_RX_LOG_DBG("vring descriptor with no "
+			VIRTIO_COMP_RX_LOG_DBG("vring descriptor with no "
 					"mbuf cookie at %u",
 					vq->vq_used_cons_idx);
 			break;
@@ -166,16 +175,16 @@ virtqueue_dequeue_burst_rx_packed(struct virtqueue *vq,
 		vq->packets_received_total++;
 
 		/* TODO: similar operation for comp, sym/asym -> stateless/stateful ? */
-		// if (cop->asym->rsa.op_type == RTE_CRYPTO_ASYM_OP_SIGN)
+		// if (cop->asym->rsa.op_type == RTE_COMP_ASYM_OP_SIGN)
 		// 	memcpy(cop->asym->rsa.sign.data, op_cookie->sign,
 		// 			cop->asym->rsa.sign.length);
-		// else if (cop->asym->rsa.op_type == RTE_CRYPTO_ASYM_OP_VERIFY)
+		// else if (cop->asym->rsa.op_type == RTE_COMP_ASYM_OP_VERIFY)
 		// 	memcpy(cop->asym->rsa.message.data, op_cookie->message,
 		// 			cop->asym->rsa.message.length);
-		// else if (cop->asym->rsa.op_type == RTE_CRYPTO_ASYM_OP_ENCRYPT)
+		// else if (cop->asym->rsa.op_type == RTE_COMP_ASYM_OP_ENCRYPT)
 		// 	memcpy(cop->asym->rsa.cipher.data, op_cookie->cipher,
 		// 			cop->asym->rsa.cipher.length);
-		// else if (cop->asym->rsa.op_type == RTE_CRYPTO_ASYM_OP_DECRYPT)
+		// else if (cop->asym->rsa.op_type == RTE_COMP_ASYM_OP_DECRYPT)
 		// 	memcpy(cop->asym->rsa.message.data, op_cookie->message,
 		// 			cop->asym->rsa.message.length);
 
@@ -217,6 +226,7 @@ virtqueue_comp_sym_pkt_header_arrange(
 		req_data->header.opcode = VIRTIO_COMP_STATELESS_DECOMPRESS;
 
 	req_data->u.stateless_req.para.src_data_len = cop->src.length + cop->src.offset;
+	req_data->u.stateless_req.para.dst_data_len = 2 * req_data->u.stateless_req.para.src_data_len;
 
 	// TODO: check request validity
 
@@ -261,7 +271,7 @@ virtqueue_comp_stateless_enqueue_xmit_split(
 	dxp = &txvq->vq_descx[head_idx];
 
 	if (rte_mempool_get(txvq->mpool, &dxp->cookie)) {
-		VIRTIO_CRYPTO_TX_LOG_ERR("can not get cookie");
+		VIRTIO_COMP_TX_LOG_ERR("can not get cookie");
 		return -EFAULT;
 	}
 	comp_op_cookie = dxp->cookie;
@@ -280,9 +290,9 @@ virtqueue_comp_stateless_enqueue_xmit_split(
 	/* point to indirect vring entry */
 	desc = (struct vring_desc *)
 		((uint8_t *)op_data_req + indirect_vring_addr_offset);
-	for (idx = 0; idx < (NUM_ENTRY_VIRTIO_CRYPTO_OP - 1); idx++)
+	for (idx = 0; idx < (NUM_ENTRY_VIRTIO_COMP_OP - 1); idx++)
 		desc[idx].next = idx + 1;
-	desc[NUM_ENTRY_VIRTIO_CRYPTO_OP - 1].next = VQ_RING_DESC_CHAIN_END;
+	desc[NUM_ENTRY_VIRTIO_COMP_OP - 1].next = VQ_RING_DESC_CHAIN_END;
 
 	idx = 0;
 
@@ -293,6 +303,7 @@ virtqueue_comp_stateless_enqueue_xmit_split(
 
 	src_len = cop->src.length + cop->src.offset;
 	/* indirect vring: src data */
+	VIRTIO_COMP_TX_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, src_len);
 	desc[idx].addr = rte_pktmbuf_iova_offset(cop->m_src, 0);
 	desc[idx].len = src_len;
 	desc[idx++].flags = VRING_DESC_F_NEXT;
@@ -312,9 +323,9 @@ virtqueue_comp_stateless_enqueue_xmit_split(
 
 	/* indirect vring: digest result */
 	// para = &(session->ctrl.hdr.u.sym_create_session.u.chain.para);
-	// if (para->hash_mode == VIRTIO_CRYPTO_SYM_HASH_MODE_PLAIN)
+	// if (para->hash_mode == VIRTIO_COMP_SYM_HASH_MODE_PLAIN)
 	// 	hash_result_len = para->u.hash_param.hash_result_len;
-	// if (para->hash_mode == VIRTIO_CRYPTO_SYM_HASH_MODE_AUTH)
+	// if (para->hash_mode == VIRTIO_COMP_SYM_HASH_MODE_AUTH)
 	// 	hash_result_len = para->u.mac_param.hash_result_len;
 	// if (hash_result_len > 0) {
 	// 	desc[idx].addr = sym_op->auth.digest.phys_addr;
@@ -347,6 +358,7 @@ virtqueue_comp_stateless_enqueue_xmit_split(
 	txvq->vq_free_cnt = (uint16_t)(txvq->vq_free_cnt - needed);
 	vq_update_avail_ring(txvq, head_idx);
 
+	VIRTIO_COMP_TX_LOG_ERR("update avail %p", txvq);
 	return 0;
 }
 
@@ -364,7 +376,7 @@ virtqueue_comp_stateless_enqueue_xmit_packed(
 	struct vring_packed_desc *desc;
 	uint64_t op_data_req_phys_addr;
 	uint16_t req_data_len = sizeof(struct virtio_comp_op_data_req);
-	struct virtio_comp_session *session =cop->private_xform;
+	struct virtio_comp_session *session = cop->private_xform;
 	struct virtio_comp_op_data_req *op_data_req;
 	uint32_t hash_result_len = 0;
 	struct virtio_comp_op_cookie *comp_op_cookie;
@@ -386,7 +398,7 @@ virtqueue_comp_stateless_enqueue_xmit_packed(
 	dxp = &txvq->vq_descx[head_idx];
 
 	if (rte_mempool_get(txvq->mpool, &dxp->cookie)) {
-		VIRTIO_CRYPTO_TX_LOG_ERR("can not get cookie");
+		VIRTIO_COMP_TX_LOG_ERR("can not get cookie");
 		return -EFAULT;
 	}
 	comp_op_cookie = dxp->cookie;
@@ -396,7 +408,7 @@ virtqueue_comp_stateless_enqueue_xmit_packed(
 	if (virtqueue_comp_sym_pkt_header_arrange(cop, op_data_req, session))
 		return -EFAULT;
 
-	/* status is initialized to VIRTIO_CRYPTO_ERR */
+	/* status is initialized to VIRTIO_COMP_ERR */
 	((struct virtio_comp_inhdr *)
 		((uint8_t *)op_data_req + req_data_len))->status =
 		VIRTIO_COMP_ERR;
@@ -424,14 +436,14 @@ virtqueue_comp_stateless_enqueue_xmit_packed(
 	} else {
 		desc[idx].addr = rte_pktmbuf_iova_offset(cop->m_src, 0);
 	}
-	desc[idx].len = (sym_op->cipher.data.offset + sym_op->cipher.data.length);
+	desc[idx].len = (cop->src.offset + cop->src.length);
 	desc[idx++].flags = VRING_DESC_F_WRITE | VRING_DESC_F_NEXT;
 
 	// /* packed vring: digest result */
 	// para = &(session->ctrl.hdr.u.sym_create_session.u.chain.para);
-	// if (para->hash_mode == VIRTIO_CRYPTO_SYM_HASH_MODE_PLAIN)
+	// if (para->hash_mode == VIRTIO_COMP_SYM_HASH_MODE_PLAIN)
 	// 	hash_result_len = para->u.hash_param.hash_result_len;
-	// if (para->hash_mode == VIRTIO_CRYPTO_SYM_HASH_MODE_AUTH)
+	// if (para->hash_mode == VIRTIO_COMP_SYM_HASH_MODE_AUTH)
 	// 	hash_result_len = para->u.mac_param.hash_result_len;
 	// if (hash_result_len > 0) {
 	// 	desc[idx].addr = sym_op->auth.digest.phys_addr;
@@ -488,7 +500,7 @@ virtio_comp_vring_start(struct virtqueue *vq)
 	PMD_INIT_FUNC_TRACE();
 
 	if (ring_mem == NULL) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR("virtqueue ring memory is NULL");
+		VIRTIO_COMP_INIT_LOG_ERR("virtqueue ring memory is NULL");
 		return -EINVAL;
 	}
 
@@ -498,7 +510,7 @@ virtio_comp_vring_start(struct virtqueue *vq)
 	 * to share with the backend
 	 */
 	if (VTPCI_OPS(hw)->setup_queue(hw, vq) < 0) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR("setup_queue failed");
+		VIRTIO_COMP_INIT_LOG_ERR("setup_queue failed");
 		return -EINVAL;
 	}
 
@@ -530,6 +542,10 @@ virtio_comp_dataq_start(struct rte_compressdev *dev)
 
 	/* Start data vring. */
 	for (i = 0; i < dev->data->nb_queue_pairs; i++) {
+		VIRTIO_COMP_TX_LOG_ERR("vring starting %p", dev->data);
+		VIRTIO_COMP_TX_LOG_ERR("vring starting %p", dev->data->queue_pairs);
+		VIRTIO_COMP_TX_LOG_ERR("vring starting %p", dev->data->queue_pairs[i]);
+
 		virtio_comp_vring_start(dev->data->queue_pairs[i]);
 		VIRTQUEUE_DUMP((struct virtqueue *)dev->data->queue_pairs[i]);
 	}
@@ -560,7 +576,8 @@ virtio_comp_pkt_rx_burst(void *tx_queue, struct rte_comp_op **rx_pkts,
 		nb_rx = virtqueue_dequeue_burst_rx(txvq, rx_pkts, num);
 	}
 
-	VIRTIO_CRYPTO_RX_LOG_DBG("used:%d dequeue:%d", nb_rx, num);
+	VIRTIO_COMP_RX_LOG_DBG("used:%d dequeue:%d", nb_rx, num);
+	VIRTIO_COMP_RX_LOG_ERR("used:%d dequeue:%d", nb_rx, num);
 
 	return nb_rx;
 }
@@ -576,12 +593,12 @@ virtio_comp_pkt_tx_burst(void *tx_queue, struct rte_comp_op **tx_pkts,
 	if (unlikely(nb_pkts < 1))
 		return nb_pkts;
 	if (unlikely(tx_queue == NULL)) {
-		VIRTIO_CRYPTO_TX_LOG_ERR("tx_queue is NULL");
+		VIRTIO_COMP_TX_LOG_ERR("tx_queue is NULL");
 		return 0;
 	}
 	txvq = tx_queue;
 
-	VIRTIO_CRYPTO_TX_LOG_DBG("%d packets to xmit", nb_pkts);
+	VIRTIO_COMP_TX_LOG_DBG("%d packets to xmit", nb_pkts);
 
 	for (nb_tx = 0; nb_tx < nb_pkts; nb_tx++) {
 		if (tx_pkts[nb_tx]->op_type == RTE_COMP_OP_STATELESS) {
@@ -597,20 +614,20 @@ virtio_comp_pkt_tx_burst(void *tx_queue, struct rte_comp_op **tx_pkts,
 				*/
 				need = txm->nb_segs - txvq->vq_free_cnt;
 				if (unlikely(need > 0)) {
-					VIRTIO_CRYPTO_TX_LOG_DBG("no free tx descryptos to transmit");
+					VIRTIO_COMP_TX_LOG_DBG("no free tx descryptos to transmit");
 					break;
 				}
 			}
 
 			/* enqueue packet buffers */
+			VIRTIO_COMP_TX_LOG_ERR("%s %d", __FUNCTION__, __LINE__);
 			error = virtqueue_comp_stateless_enqueue_xmit(txvq, tx_pkts[nb_tx]);
-			break;
+			VIRTIO_COMP_TX_LOG_ERR("%s %d %d", __FUNCTION__, __LINE__, error);
 		} else if (tx_pkts[nb_tx]->op_type == RTE_COMP_OP_STATEFUL) {
-			VIRTIO_CRYPTO_TX_LOG_ERR("stateful comp op is not supported for now");
+			VIRTIO_COMP_TX_LOG_ERR("stateful comp op is not supported for now");
 			txvq->packets_sent_failed++;
-			continue;
 		} else {
-			VIRTIO_CRYPTO_TX_LOG_ERR("invalid comp op type %u",
+			VIRTIO_COMP_TX_LOG_ERR("invalid comp op type %u",
 				tx_pkts[nb_tx]->op_type);
 			txvq->packets_sent_failed++;
 			break;
@@ -618,13 +635,13 @@ virtio_comp_pkt_tx_burst(void *tx_queue, struct rte_comp_op **tx_pkts,
 
 		if (unlikely(error)) {
 			if (error == ENOSPC)
-				VIRTIO_CRYPTO_TX_LOG_ERR(
+				VIRTIO_COMP_TX_LOG_ERR(
 					"virtqueue_enqueue Free count = 0");
 			else if (error == EMSGSIZE)
-				VIRTIO_CRYPTO_TX_LOG_ERR(
+				VIRTIO_COMP_TX_LOG_ERR(
 					"virtqueue_enqueue Free count < 1");
 			else
-				VIRTIO_CRYPTO_TX_LOG_ERR(
+				VIRTIO_COMP_TX_LOG_ERR(
 					"virtqueue_enqueue error: %d", error);
 			txvq->packets_sent_failed++;
 			break;
@@ -632,11 +649,13 @@ virtio_comp_pkt_tx_burst(void *tx_queue, struct rte_comp_op **tx_pkts,
 
 		txvq->packets_sent_total++;
 	}
+	VIRTIO_COMP_TX_LOG_ERR("to notify %s %d %u", __FUNCTION__, __LINE__, nb_tx);
 
 	if (likely(nb_tx)) {
 		if (vtpci_with_packed_queue(txvq->hw)) {
 			virtqueue_notify(txvq);
-			VIRTIO_CRYPTO_TX_LOG_DBG("Notified backend after xmit");
+			VIRTIO_COMP_TX_LOG_DBG("Notified backend after xmit");
+			VIRTIO_COMP_TX_LOG_ERR("Notified %s %d", __FUNCTION__, __LINE__);
 			return nb_tx;
 		}
 
@@ -644,7 +663,8 @@ virtio_comp_pkt_tx_burst(void *tx_queue, struct rte_comp_op **tx_pkts,
 
 		if (unlikely(virtqueue_kick_prepare(txvq))) {
 			virtqueue_notify(txvq);
-			VIRTIO_CRYPTO_TX_LOG_DBG("Notified backend after xmit");
+			VIRTIO_COMP_TX_LOG_DBG("Notified backend after xmit");
+			VIRTIO_COMP_TX_LOG_ERR("Notified %s %d", __FUNCTION__, __LINE__);
 		}
 	}
 

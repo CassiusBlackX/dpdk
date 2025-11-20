@@ -2,8 +2,8 @@
  * Copyright(c) 2018 HUAWEI TECHNOLOGIES CO., LTD.
  */
 
-#ifndef _VIRTIO_CRYPTODEV_H_
-#define _VIRTIO_CRYPTODEV_H_
+#ifndef _VIRTIO_COMPDEV_H_
+#define _VIRTIO_COMPDEV_H_
 
 #include "virtio_comp.h"
 #include "virtio_pci.h"
@@ -17,22 +17,22 @@
 	1ULL << VIRTIO_RING_F_INDIRECT_DESC      | \
 	1ULL << VIRTIO_F_ORDER_PLATFORM)
 
-#define COMPRESSDEV_NAME_VIRTIO_PMD comp_virtio
+#define COMPDEV_NAME_VIRTIO_PMD comp_virtio
 
-#define NUM_ENTRY_VIRTIO_CRYPTO_OP 7
+#define NUM_ENTRY_VIRTIO_COMP_OP 7
 
-#define VIRTIO_CRYPTO_MAX_MSG_SIZE 512
-#define VIRTIO_CRYPTO_MAX_SIGN_SIZE 1024
+#define VIRTIO_COMP_MAX_MSG_SIZE 512
+#define VIRTIO_COMP_MAX_SIGN_SIZE 1024
 
-#define VIRTIO_CRYPTO_MAX_KEY_SIZE 256
+#define VIRTIO_COMP_MAX_KEY_SIZE 256
 
-#define VIRTIO_CRYPTO_MAX_CTRL_DATA 4096
+#define VIRTIO_COMP_MAX_CTRL_DATA 4096
 
 /* TODO: determine what is needed in op_cookie */
 struct virtio_comp_op_cookie {
 	struct virtio_comp_op_data_req data_req;
 	struct virtio_comp_inhdr inhdr;
-	struct vring_desc desc[NUM_ENTRY_VIRTIO_CRYPTO_OP];
+	struct vring_desc desc[NUM_ENTRY_VIRTIO_COMP_OP];
 };
 
 /*
@@ -77,10 +77,14 @@ struct virtio_comp_priv_xform {
 	uint32_t level;
 };
 
-enum virtio_comp_cmd_id {
-	// TODO: sync with backend
-	VIRTIO_COMP_CMD_STATELESS_CREATE_SESSION = 0,
-};
+// enum virtio_comp_cmd_id {
+// 	// TODO: sync with backend
+// 	VIRTIO_COMP_CMD_STATELESS_CREATE_SESSION = 0,
+// };
 
+// struct virtio_comp_private {
+// 	struct rte_compressdev *cdev;
+// 	struct rte_mempool *xform_pool;
+// };
 
-#endif /* _VIRTIO_CRYPTODEV_H_ */
+#endif /* _VIRTIO_COMPDEV_H_ */

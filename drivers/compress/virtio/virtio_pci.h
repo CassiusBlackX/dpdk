@@ -20,10 +20,10 @@ struct virtqueue;
 
 /* VirtIO PCI vendor/device ID. */
 #define VIRTIO_COMP_PCI_VENDORID 0x1AF4
-#define VIRTIO_COMP_PCI_DEVICEID 0x1055  /* FIXME: a number guessed by cassius, not sure if it is used */
+#define VIRTIO_COMP_PCI_DEVICEID 0x106A
 
 /* VirtIO device IDs. */
-#define VIRTIO_ID_COMPRESS  21 /* so far, virtio does not support for compress dev, modify a random one*/
+#define VIRTIO_ID_COMP  42
 
 /* VirtIO ABI version, this must match exactly. */
 #define VIRTIO_PCI_ABI_VERSION 0

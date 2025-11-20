@@ -2,6 +2,7 @@
  * Copyright(c) 2018 HUAWEI TECHNOLOGIES CO., LTD.
  */
 
+#include "rte_config.h"
 #include <stdint.h>
 
 #ifdef RTE_EXEC_ENV_LINUX
@@ -12,7 +13,7 @@
 #include <rte_io.h>
 
 #include "virtio_pci.h"
-#include "virtqueue.h"
+#include "virtqueue_comp.h"
 
 /*
  * The remaining space is defined by each driver as the per-driver
@@ -32,7 +33,7 @@ check_vq_phys_addr_ok(struct virtqueue *vq)
 	 */
 	if ((vq->vq_ring_mem + vq->vq_ring_size - 1) >>
 			(VIRTIO_PCI_QUEUE_ADDR_SHIFT + 32)) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR("vring address shouldn't be above 16TB!");
+		VIRTIO_COMP_INIT_LOG_ERR("vring address shouldn't be above 16TB!");
 		return 0;
 	}
 
@@ -180,11 +181,11 @@ modern_setup_queue(struct virtio_comp_hw *hw, struct virtqueue *vq)
 
 	rte_write16(1, &hw->common_cfg->queue_enable);
 
-	VIRTIO_CRYPTO_INIT_LOG_DBG("queue %u addresses:", vq->vq_queue_index);
-	VIRTIO_CRYPTO_INIT_LOG_DBG("\t desc_addr: %" PRIx64, desc_addr);
-	VIRTIO_CRYPTO_INIT_LOG_DBG("\t aval_addr: %" PRIx64, avail_addr);
-	VIRTIO_CRYPTO_INIT_LOG_DBG("\t used_addr: %" PRIx64, used_addr);
-	VIRTIO_CRYPTO_INIT_LOG_DBG("\t notify addr: %p (notify offset: %u)",
+	VIRTIO_COMP_INIT_LOG_DBG("queue %u addresses:", vq->vq_queue_index);
+	VIRTIO_COMP_INIT_LOG_DBG("\t desc_addr: %" PRIx64, desc_addr);
+	VIRTIO_COMP_INIT_LOG_DBG("\t aval_addr: %" PRIx64, avail_addr);
+	VIRTIO_COMP_INIT_LOG_DBG("\t used_addr: %" PRIx64, used_addr);
+	VIRTIO_COMP_INIT_LOG_DBG("\t notify addr: %p (notify offset: %u)",
 		vq->notify_addr, notify_off);
 
 	return 0;
@@ -209,6 +210,7 @@ static void
 modern_notify_queue(struct virtio_comp_hw *hw __rte_unused,
 		struct virtqueue *vq)
 {
+	VIRTIO_COMP_INIT_LOG_ERR("%d %u %p", __LINE__, vq->vq_queue_index, vq->notify_addr);
 	rte_write16(vq->vq_queue_index, vq->notify_addr);
 }
 
@@ -303,18 +305,18 @@ get_cfg_addr(struct rte_pci_device *dev, struct virtio_pci_cap *cap)
 	uint8_t *base;
 
 	if (bar >= PCI_MAX_RESOURCE) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR("invalid bar: %u", bar);
+		VIRTIO_COMP_INIT_LOG_ERR("invalid bar: %u", bar);
 		return NULL;
 	}
 
 	if (offset + length < offset) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR("offset(%u) + length(%u) overflows",
+		VIRTIO_COMP_INIT_LOG_ERR("offset(%u) + length(%u) overflows",
 			offset, length);
 		return NULL;
 	}
 
 	if (offset + length > dev->mem_resource[bar].len) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR(
+		VIRTIO_COMP_INIT_LOG_ERR(
 			"invalid cap: overflows bar space: %u > %" PRIu64,
 			offset + length, dev->mem_resource[bar].len);
 		return NULL;
@@ -322,7 +324,7 @@ get_cfg_addr(struct rte_pci_device *dev, struct virtio_pci_cap *cap)
 
 	base = dev->mem_resource[bar].addr;
 	if (base == NULL) {
-		VIRTIO_CRYPTO_INIT_LOG_ERR("bar %u base addr is NULL", bar);
+		VIRTIO_COMP_INIT_LOG_ERR("bar %u base addr is NULL", bar);
 		return NULL;
 	}
 
@@ -338,7 +340,7 @@ virtio_read_caps(struct rte_pci_device *dev, struct virtio_comp_hw *hw)
 	int ret;
 
 	if (rte_pci_map_device(dev)) {
-		VIRTIO_CRYPTO_INIT_LOG_DBG("failed to map pci device!");
+		VIRTIO_COMP_INIT_LOG_DBG("failed to map pci device!");
 		return -1;
 	}
 
@@ -361,7 +363,7 @@ virtio_read_caps(struct rte_pci_device *dev, struct virtio_comp_hw *hw)
 	while (pos > 0) {
 		if (rte_pci_read_config(dev, &cap, sizeof(cap), pos) != sizeof(cap))
 			break;
-		VIRTIO_CRYPTO_INIT_LOG_DBG(
+		VIRTIO_COMP_INIT_LOG_DBG(
 			"[%2x] cfg type: %u, bar: %u, offset: %04x, len: %u",
 			(unsigned int)pos, cap.cfg_type, cap.bar, cap.offset, cap.length);
 
@@ -373,7 +375,7 @@ virtio_read_caps(struct rte_pci_device *dev, struct virtio_comp_hw *hw)
 			ret = rte_pci_read_config(dev, &hw->notify_off_multiplier,
 					4, pos + sizeof(cap));
 			if (ret != 4)
-				VIRTIO_CRYPTO_INIT_LOG_ERR(
+				VIRTIO_COMP_INIT_LOG_ERR(
 					"failed to read notify_off_multiplier: ret %d", ret);
 			else
 				hw->notify_base = get_cfg_addr(dev, &cap);
@@ -391,16 +393,16 @@ virtio_read_caps(struct rte_pci_device *dev, struct virtio_comp_hw *hw)
 
 	if (hw->common_cfg == NULL || hw->notify_base == NULL ||
 	    hw->dev_cfg == NULL    || hw->isr == NULL) {
-		VIRTIO_CRYPTO_INIT_LOG_INFO("no modern virtio pci device found.");
+		VIRTIO_COMP_INIT_LOG_INFO("no modern virtio pci device found.");
 		return -1;
 	}
 
-	VIRTIO_CRYPTO_INIT_LOG_INFO("found modern virtio pci device.");
+	VIRTIO_COMP_INIT_LOG_INFO("found modern virtio pci device.");
 
-	VIRTIO_CRYPTO_INIT_LOG_DBG("common cfg mapped at: %p", hw->common_cfg);
-	VIRTIO_CRYPTO_INIT_LOG_DBG("device cfg mapped at: %p", hw->dev_cfg);
-	VIRTIO_CRYPTO_INIT_LOG_DBG("isr cfg mapped at: %p", hw->isr);
-	VIRTIO_CRYPTO_INIT_LOG_DBG("notify base: %p, notify off multiplier: %u",
+	VIRTIO_COMP_INIT_LOG_DBG("common cfg mapped at: %p", hw->common_cfg);
+	VIRTIO_COMP_INIT_LOG_DBG("device cfg mapped at: %p", hw->dev_cfg);
+	VIRTIO_COMP_INIT_LOG_DBG("isr cfg mapped at: %p", hw->isr);
+	VIRTIO_COMP_INIT_LOG_DBG("notify base: %p, notify off multiplier: %u",
 		hw->notify_base, hw->notify_off_multiplier);
 
 	return 0;
@@ -423,7 +425,7 @@ vtpci_compdev_init(struct rte_pci_device *dev, struct virtio_comp_hw *hw)
 	 * virtio handling.
 	 */
 	if (virtio_read_caps(dev, hw) == 0) {
-		VIRTIO_CRYPTO_INIT_LOG_INFO("modern virtio pci detected.");
+		VIRTIO_COMP_INIT_LOG_INFO("modern virtio pci detected.");
 		comp_virtio_hw_internal[hw->dev_id].vtpci_ops =
 					&virtio_comp_modern_ops;
 		hw->modern = 1;

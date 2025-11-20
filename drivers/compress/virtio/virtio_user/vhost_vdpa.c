@@ -534,7 +534,7 @@ vhost_vdpa_setup(struct virtio_user_dev *dev)
 	}
 
 	if (ioctl(data->vhostfd, VHOST_VDPA_GET_DEVICE_ID, &did) < 0 ||
-			did != VIRTIO_ID_CRYPTO) {
+			did != VIRTIO_ID_COMP) {
 		PMD_DRV_LOG(ERR, "Invalid vdpa device ID: %u", did);
 		close(data->vhostfd);
 		free(data);
@@ -605,7 +605,7 @@ static int
 vhost_vdpa_update_link_state(struct virtio_user_dev *dev)
 {
 	/* TODO: It is W/A until a cleaner approach to find cpt status */
-	dev->comp_status = VIRTIO_CRYPTO_S_HW_READY;
+	dev->comp_status = VIRTIO_COMP_S_HW_READY;
 	return 0;
 }
 
