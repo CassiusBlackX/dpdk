@@ -2068,7 +2068,7 @@ rte_vhost_crypto_driver_start(const char *path)
 	ret = rte_vhost_driver_get_protocol_features(path, &protocol_features);
 	if (ret)
 		return -1;
-	protocol_features |= (1ULL << VHOST_USER_PROTOCOL_F_CONFIG);
+	//protocol_features |= (1ULL << VHOST_USER_PROTOCOL_F_CONFIG);
 	ret = rte_vhost_driver_set_protocol_features(path, protocol_features);
 	if (ret)
 		return -1;
