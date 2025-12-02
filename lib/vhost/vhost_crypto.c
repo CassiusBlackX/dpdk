@@ -62,7 +62,7 @@ RTE_LOG_REGISTER_SUFFIX(vhost_crypto_logtype, crypto, INFO);
 		(1ULL << VIRTIO_NET_F_CTRL_VQ) |			\
 		(1ULL << VIRTIO_F_VERSION_1) |				\
 		(1ULL << VHOST_USER_F_PROTOCOL_FEATURES) \
-		features |= (1ULL << VHOST_F_LOG_ALL)); 
+		(1ULL << VHOST_F_LOG_ALL)); 
 
 #define IOVA_TO_VVA(t, dev, vq, a, l, p)				\
 	((t)(uintptr_t)vhost_iova_to_vva(dev, vq, a, l, p))
