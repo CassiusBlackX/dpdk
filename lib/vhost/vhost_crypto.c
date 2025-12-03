@@ -2452,6 +2452,15 @@ int vhost_crypto_freeze(int vid) {
     }
 }
 
+static void dump_hex(const void *buf, size_t len) {
+    const uint8_t *p = buf;
+    for (size_t i = 0; i < len; ++i) {
+        if (i % 16 == 0) fprintf(stderr, "%04zx: ", i);
+        fprintf(stderr, "%02x ", p[i]);
+        if (i % 16 == 15 || i == len - 1) fprintf(stderr, "\n");
+    }
+}
+
 /* 把 vcrypto 的状态序列化到 buf；成功返回写入字节数，失败返回负错码 */
 static int
 vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_len)
@@ -2466,11 +2475,12 @@ vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_
     hdr->hdr_len = TOLE16(sizeof(*hdr));
     p += sizeof(*hdr);
 
-    /* DEV_META: 只写 last_session_id */
+    // ---- DEV_META ----
     struct vc_dev_meta_v1 meta = {
         .last_session_id = vcrypto->last_session_id,
     };
     if (end - p < (ptrdiff_t)(sizeof(struct vc_tlv) + sizeof(meta))) return -ENOSPC;
+
     struct vc_tlv *tlv = (struct vc_tlv *)p;
     tlv->type = TOLE16(VC_TLV_DEV_META);
     tlv->rsvd = 0;
@@ -2479,7 +2489,9 @@ vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_
     memcpy(p, &meta, sizeof(meta));
     p += sizeof(meta);
 
-    /* 遍历会话表：用 DPDK 原生迭代器 */
+    fprintf(stderr, "[save_state] DEV_META: last_session_id=%lu\n", meta.last_session_id);
+
+    // ---- SESSION TLVs ----
     uint32_t iter = 0;
     const void *k;
     void *d;
@@ -2490,18 +2502,16 @@ vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_
         uint32_t desc_len, blob_len;
         if (s->meta.kind == VC_SESS_SYM) {
             desc_len = sizeof(s->meta.sym.desc);
-            blob_len = s->meta.sym.b.blob_len;  /* 若不存 key，这里就是 0 */
+            blob_len = s->meta.sym.b.blob_len;
         } else {
             desc_len = sizeof(s->meta.asym.desc);
-            blob_len = s->meta.asym.b.blob_len; /* DER/PEM 等 */
+            blob_len = s->meta.asym.b.blob_len;
         }
 
         struct vc_sess_head_v1 sh = {
             .session_id = TOLE64(s->meta.session_id),
             .kind       = s->meta.kind,
             .flags      = 0,
-            .rsvd0      = 0,
-            .rsvd1      = 0,
         };
 
         uint32_t vlen = (uint32_t)(sizeof(sh) + desc_len + blob_len);
@@ -2513,22 +2523,31 @@ vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_
         tlv->len  = TOLE32(vlen);
         p += sizeof(*tlv);
 
+        uint8_t *tlv_body_start = p;
         memcpy(p, &sh, sizeof(sh)); p += sizeof(sh);
         if (s->meta.kind == VC_SESS_SYM) {
             memcpy(p, &s->meta.sym.desc, desc_len); p += desc_len;
-            if (blob_len) { memcpy(p, s->meta.sym.b.blob, blob_len); p += blob_len; }
+            if (blob_len) memcpy(p, s->meta.sym.b.blob, blob_len); p += blob_len;
         } else {
             memcpy(p, &s->meta.asym.desc, desc_len); p += desc_len;
-            if (blob_len) { memcpy(p, s->meta.asym.b.blob, blob_len); p += blob_len; }
+            if (blob_len) memcpy(p, s->meta.asym.b.blob, blob_len); p += blob_len;
         }
+
+        fprintf(stderr, "[save_state] SESSION: sid=%lu kind=%u desc_len=%u blob_len=%u total=%u\n",
+                s->meta.session_id, s->meta.kind, desc_len, blob_len, vlen);
+        dump_hex(tlv_body_start, vlen);
     }
 
-    uint32_t pay = (uint32_t)((uintptr_t)p - ((uintptr_t)buf + sizeof(*hdr)));
+    uint32_t pay = (uint32_t)((uintptr_t)p - (uintptr_t)buf - sizeof(*hdr));
     hdr->payload_len = TOLE32(pay);
     hdr->crc32 = TOLE32(vc_crc32((uint8_t*)buf + sizeof(*hdr), pay));
+
+    fprintf(stderr, "[save_state] snapshot done. total=%td payload=%u\n",
+            (uintptr_t)p - (uintptr_t)buf, pay);
+    dump_hex(buf, (uintptr_t)p - (uintptr_t)buf);
+
     return (int)((uintptr_t)p - (uintptr_t)buf);
 }
-
 
 
 /* 对外入口：消息层会调用它。签名不变。 */
@@ -2784,6 +2803,9 @@ int vhost_crypto_load_state(int vid, int fd)
         return -EIO;
     }
 
+    fprintf(stderr, "[load_state] raw header hex:\n");
+    dump_hex(&hdr, sizeof(hdr));
+
     if (FROMLE32(hdr.magic) != VC_SNAP_MAGIC) {
         fprintf(stderr, "[load_state] bad magic: 0x%x\n", FROMLE32(hdr.magic));
         return -EINVAL;
@@ -2818,6 +2840,9 @@ int vhost_crypto_load_state(int vid, int fd)
         off += (size_t)rn;
     }
 
+    fprintf(stderr, "[load_state] full TLV region (hex), size=%zu:\n", rest);
+    dump_hex(buf, rest);
+
     const uint8_t *tlv_base = buf + (hdr_len - sizeof(hdr));
     uint32_t crc = vc_crc32(tlv_base, pay_len);
     if (FROMLE32(hdr.crc32) != crc) {
@@ -2850,8 +2875,7 @@ int vhost_crypto_load_state(int vid, int fd)
             const struct vc_dev_meta_v1 *m = (const struct vc_dev_meta_v1 *)q;
             vcrypto->cid = m->cid;
             vcrypto->last_session_id = m->last_session_id;
-            fprintf(stderr, "[load_state] DEV_META: cid=%u, last_sid=%lu\n",
-                    m->cid, m->last_session_id);
+            fprintf(stderr, "[load_state] DEV_META: cid=%u, last_sid=%lu\n", m->cid, m->last_session_id);
 
         } else if (t == VC_TLV_SESSION) {
             const uint8_t *s = q;
@@ -2881,6 +2905,7 @@ int vhost_crypto_load_state(int vid, int fd)
                 const void *blob = s;
                 uint32_t blen = (uint32_t)((q + L) - s);
                 fprintf(stderr, "[load_state] SYM: blob_len=%u\n", blen);
+                dump_hex(blob, blen);
 
                 vs = vc_session_create_sym(vcrypto, sid, D, blob, blen);
                 if (!vs) {
@@ -2900,6 +2925,7 @@ int vhost_crypto_load_state(int vid, int fd)
                 const void *blob = s;
                 uint32_t blen = (uint32_t)((q + L) - s);
                 fprintf(stderr, "[load_state] ASYM: blob_len=%u\n", blen);
+                dump_hex(blob, blen);
 
                 vs = vc_session_create_asym(vcrypto, sid, A, blob, blen);
                 if (!vs) {
@@ -2917,7 +2943,7 @@ int vhost_crypto_load_state(int vid, int fd)
             rte_hash_del_key(vcrypto->session_map, &sid);
             if (rte_hash_add_key_data(vcrypto->session_map, &sid, vs) < 0) {
                 fprintf(stderr, "[load_state] session_map add failed for sid=%lu\n", sid);
-                // 清理略，同原逻辑
+                // 此处可添加资源释放逻辑
                 rte_free(buf);
                 return -ENOMEM;
             }
