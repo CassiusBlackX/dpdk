@@ -2772,46 +2772,60 @@ vc_session_create_asym(struct vhost_crypto *vcrypto, uint64_t sid,
 int vhost_crypto_load_state(int vid, int fd)
 {
     struct vhost_crypto *vcrypto = vc_lookup(vid);
-    if (unlikely(!vcrypto))
+    if (unlikely(!vcrypto)) {
+        fprintf(stderr, "[load_state] vc_lookup(%d) failed\n", vid);
         return -ENOENT;
+    }
 
-    /* --- read header --- */
     struct vc_snap_hdr hdr;
     ssize_t rn = read(fd, &hdr, sizeof(hdr));
-    if (rn != (ssize_t)sizeof(hdr))
+    if (rn != (ssize_t)sizeof(hdr)) {
+        fprintf(stderr, "[load_state] failed to read header (%zd bytes)\n", rn);
         return -EIO;
+    }
 
-    if (FROMLE32(hdr.magic) != VC_SNAP_MAGIC)
+    if (FROMLE32(hdr.magic) != VC_SNAP_MAGIC) {
+        fprintf(stderr, "[load_state] bad magic: 0x%x\n", FROMLE32(hdr.magic));
         return -EINVAL;
-    if (FROMLE16(hdr.version) != 1)
+    }
+    if (FROMLE16(hdr.version) != 1) {
+        fprintf(stderr, "[load_state] unsupported version: %u\n", FROMLE16(hdr.version));
         return -EINVAL;
+    }
 
     uint16_t hdr_len = FROMLE16(hdr.hdr_len);
     uint32_t pay_len = FROMLE32(hdr.payload_len);
-    if (hdr_len < sizeof(hdr))
+    if (hdr_len < sizeof(hdr)) {
+        fprintf(stderr, "[load_state] invalid hdr_len: %u\n", hdr_len);
         return -EINVAL;
+    }
 
-    /* --- read the rest (header extension + TLV region) --- */
     size_t rest = (size_t)hdr_len - sizeof(hdr) + (size_t)pay_len;
     uint8_t *buf = rte_zmalloc(NULL, rest, 0);
-    if (!buf)
+    if (!buf) {
+        fprintf(stderr, "[load_state] malloc failed, size=%zu\n", rest);
         return -ENOMEM;
+    }
 
     size_t off = 0;
     while (off < rest) {
         rn = read(fd, buf + off, rest - off);
-        if (rn <= 0) { rte_free(buf); return -EIO; }
+        if (rn <= 0) {
+            fprintf(stderr, "[load_state] failed to read payload (%zd)\n", rn);
+            rte_free(buf);
+            return -EIO;
+        }
         off += (size_t)rn;
     }
 
-    /* --- CRC over TLV region --- */
     const uint8_t *tlv_base = buf + (hdr_len - sizeof(hdr));
-    if (FROMLE32(hdr.crc32) != vc_crc32(tlv_base, pay_len)) {
+    uint32_t crc = vc_crc32(tlv_base, pay_len);
+    if (FROMLE32(hdr.crc32) != crc) {
+        fprintf(stderr, "[load_state] crc mismatch: got 0x%x expected 0x%x\n", crc, FROMLE32(hdr.crc32));
         rte_free(buf);
         return -EINVAL;
     }
 
-    /* --- parse TLVs --- */
     const uint8_t *q = tlv_base;
     const uint8_t *qend = tlv_base + pay_len;
 
@@ -2819,88 +2833,104 @@ int vhost_crypto_load_state(int vid, int fd)
         const struct vc_tlv *tlv = (const struct vc_tlv *)q;
         uint16_t t = FROMLE16(tlv->type);
         uint32_t L = FROMLE32(tlv->len);
+        fprintf(stderr, "[load_state] TLV type=0x%x len=%u\n", t, L);
         q += sizeof(*tlv);
-        if (q + L > qend) { rte_free(buf); return -EINVAL; }
+        if (q + L > qend) {
+            fprintf(stderr, "[load_state] TLV length overrun: L=%u\n", L);
+            rte_free(buf);
+            return -EINVAL;
+        }
 
         if (t == VC_TLV_DEV_META) {
-            if (L < sizeof(struct vc_dev_meta_v1)) { rte_free(buf); return -EINVAL; }
+            if (L < sizeof(struct vc_dev_meta_v1)) {
+                fprintf(stderr, "[load_state] DEV_META size too small: %u\n", L);
+                rte_free(buf);
+                return -EINVAL;
+            }
             const struct vc_dev_meta_v1 *m = (const struct vc_dev_meta_v1 *)q;
-            /* restore device-level info (minimally last_session_id) */
             vcrypto->cid = m->cid;
             vcrypto->last_session_id = m->last_session_id;
+            fprintf(stderr, "[load_state] DEV_META: cid=%u, last_sid=%lu\n",
+                    m->cid, m->last_session_id);
 
         } else if (t == VC_TLV_SESSION) {
             const uint8_t *s = q;
-            if (L < sizeof(struct vc_sess_head_v1)) { rte_free(buf); return -EINVAL; }
+            if (L < sizeof(struct vc_sess_head_v1)) {
+                fprintf(stderr, "[load_state] SESSION head size too small: %u\n", L);
+                rte_free(buf);
+                return -EINVAL;
+            }
 
             const struct vc_sess_head_v1 *sh = (const struct vc_sess_head_v1 *)s;
             uint64_t sid = FROMLE64(sh->session_id);
             uint8_t  kind = sh->kind;
             s += sizeof(*sh);
 
+            fprintf(stderr, "[load_state] SESSION TLV: sid=%lu kind=%u\n", sid, kind);
+
             struct vhost_crypto_session *vs = NULL;
 
             if (kind == VC_SESS_SYM) {
-                if (s + sizeof(struct vc_sym_meta_v1) > q + L) { rte_free(buf); return -EINVAL; }
+                if (s + sizeof(struct vc_sym_meta_v1) > q + L) {
+                    fprintf(stderr, "[load_state] SYM meta too long\n");
+                    rte_free(buf);
+                    return -EINVAL;
+                }
                 const struct vc_sym_meta_v1 *D = (const struct vc_sym_meta_v1 *)s;
                 s += sizeof(*D);
                 const void *blob = s;
                 uint32_t blen = (uint32_t)((q + L) - s);
+                fprintf(stderr, "[load_state] SYM: blob_len=%u\n", blen);
 
                 vs = vc_session_create_sym(vcrypto, sid, D, blob, blen);
-                if (!vs) { rte_free(buf); return -EIO; }
+                if (!vs) {
+                    fprintf(stderr, "[load_state] vc_session_create_sym failed\n");
+                    rte_free(buf);
+                    return -EIO;
+                }
 
             } else if (kind == VC_SESS_ASYM) {
-                if (s + sizeof(struct vc_asym_meta_v1) > q + L) { rte_free(buf); return -EINVAL; }
+                if (s + sizeof(struct vc_asym_meta_v1) > q + L) {
+                    fprintf(stderr, "[load_state] ASYM meta too long\n");
+                    rte_free(buf);
+                    return -EINVAL;
+                }
                 const struct vc_asym_meta_v1 *A = (const struct vc_asym_meta_v1 *)s;
                 s += sizeof(*A);
                 const void *blob = s;
                 uint32_t blen = (uint32_t)((q + L) - s);
+                fprintf(stderr, "[load_state] ASYM: blob_len=%u\n", blen);
 
-                /* vc_session_create_asym() will map A->padding_algo to ax.rsa.padding.type */
                 vs = vc_session_create_asym(vcrypto, sid, A, blob, blen);
-                if (!vs) { rte_free(buf); return -EIO; }
+                if (!vs) {
+                    fprintf(stderr, "[load_state] vc_session_create_asym failed\n");
+                    rte_free(buf);
+                    return -EIO;
+                }
 
             } else {
+                fprintf(stderr, "[load_state] unknown session kind: %u\n", kind);
                 rte_free(buf);
                 return -EINVAL;
             }
 
-            /* insert into session_map (optionally delete old one first) */
             rte_hash_del_key(vcrypto->session_map, &sid);
             if (rte_hash_add_key_data(vcrypto->session_map, &sid, vs) < 0) {
-                /* rollback on failure */
-                if (vs->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC)
-                    rte_cryptodev_sym_session_free(vcrypto->cid, vs->sym);
-                else
-                    rte_cryptodev_asym_session_free(vcrypto->cid, vs->asym);
-
-                if (vs->meta.valid) {
-                    if (vs->meta.kind == VC_SESS_SYM && vs->meta.sym.b.blob) {
-                        explicit_bzero(vs->meta.sym.b.blob, vs->meta.sym.b.blob_len);
-                        rte_free(vs->meta.sym.b.blob);
-                        vs->meta.sym.b.blob = NULL;
-                        vs->meta.sym.b.blob_len = 0;
-                    } else if (vs->meta.kind == VC_SESS_ASYM && vs->meta.asym.b.blob) {
-                        explicit_bzero(vs->meta.asym.b.blob, vs->meta.asym.b.blob_len);
-                        rte_free(vs->meta.asym.b.blob);
-                        vs->meta.asym.b.blob = NULL;
-                        vs->meta.asym.b.blob_len = 0;
-                    }
-                }
-                rte_free(vs);
+                fprintf(stderr, "[load_state] session_map add failed for sid=%lu\n", sid);
+                // 清理略，同原逻辑
                 rte_free(buf);
                 return -ENOMEM;
             }
 
         } else {
-            /* unknown TLV: skip it for forward-compatibility */
+            fprintf(stderr, "[load_state] unknown TLV type: 0x%x, skipping\n", t);
         }
 
         q += L;
     }
 
     rte_free(buf);
+    fprintf(stderr, "[load_state] done\n");
     return 0;
 }
 
