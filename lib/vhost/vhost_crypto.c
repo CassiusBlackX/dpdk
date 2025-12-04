@@ -22,6 +22,9 @@
 #include <rte_hash_crc.h>
 #include "vhost_crypto_snapshot.h"
 
+#include <fcntl.h>    // for O_CREAT, O_WRONLY, O_TRUNC
+#include <unistd.h>   // for close()
+
 static inline uint16_t TOLE16(uint16_t x){ return rte_cpu_to_le_16(x); }
 static inline uint32_t TOLE32(uint32_t x){ return rte_cpu_to_le_32(x); }
 static inline uint64_t TOLE64(uint64_t x){ return rte_cpu_to_le_64(x); }
@@ -32,6 +35,8 @@ static inline uint64_t FROMLE64(uint64_t x){ return rte_le_to_cpu_64(x); }
 uint32_t vc_crc32(const void *data, uint32_t len) {
     return rte_hash_crc(data, len, 0);
 }
+
+#define VHOST_USER_CRYPTO_TEST 55
 
 #define INHDR_LEN		(sizeof(struct virtio_crypto_inhdr))
 #define IV_OFFSET		(sizeof(struct rte_crypto_op) + \
@@ -927,6 +932,10 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 		break;
 
 	/* ---- migration extensions ---- */
+	case VHOST_USER_CRYPTO_TEST:
+    test_save_load_blob(vid);
+    break;
+
 	case VHOST_USER_CRYPTO_FREEZE:
 		ret = (vhost_crypto_freeze(vid) == 0) ? RTE_VHOST_MSG_RESULT_OK
 											: RTE_VHOST_MSG_RESULT_ERR;
@@ -2432,6 +2441,7 @@ int vhost_crypto_freeze(int vid) {
         uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
         if (cur == 0) {
             VC_LOG_INFO("FREEZE ok; inflight=0");
+			test_save_load_blob(vid);
             return 0;
         }
 
@@ -2550,6 +2560,7 @@ vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_
 }
 
 
+
 /* 对外入口：消息层会调用它。签名不变。 */
 int vhost_crypto_save_state(int vid, int fd)
 {
@@ -2584,7 +2595,6 @@ int vhost_crypto_save_state(int vid, int fd)
     ssize_t wn = write(fd, buf, (size_t)nbytes);
     rte_free(buf);
     if (wn != nbytes) return -EIO;
-
     return 0;
 }
 
@@ -2694,6 +2704,37 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
     return vs;
 }
 
+void test_save_load_blob(int vid)
+{
+    const char *path = "/tmp/snap.bin";
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        perror("open for save");
+        return;
+    }
+
+    if (vhost_crypto_save_state(vid, fd) < 0) {
+        fprintf(stderr, "[test] save_state failed\n");
+        close(fd);
+        return;
+    }
+    close(fd);
+    fprintf(stderr, "[test] save_state written to %s\n", path);
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open for load");
+        return;
+    }
+
+    if (vhost_crypto_load_state(vid, fd) < 0) {
+        fprintf(stderr, "[test] load_state failed\n");
+        close(fd);
+        return;
+    }
+    close(fd);
+    fprintf(stderr, "[test] load_state success\n");
+}
 
 static struct vhost_crypto_session*
 vc_session_create_asym(struct vhost_crypto *vcrypto, uint64_t sid,
@@ -2797,6 +2838,18 @@ int vhost_crypto_load_state(int vid, int fd)
     }
 
     struct vc_snap_hdr hdr;
+
+	uint8_t rawhdr[sizeof(struct vc_snap_hdr)];
+	lseek(fd, 0, SEEK_SET); // 确保从头读
+	ssize_t rn = read(fd, rawhdr, sizeof(rawhdr));
+	fprintf(stderr, "[debug] raw load header (%zd bytes):\n", rn);
+	for (int i = 0; i < rn; ++i) {
+		fprintf(stderr, "%02x ", rawhdr[i]);
+		if ((i+1)%16 == 0) fprintf(stderr, "\n");
+	}
+	fprintf(stderr, "\n");
+	lseek(fd, 0, SEEK_SET); // 再 seek 回去重新读一遍真正逻辑
+	
     ssize_t rn = read(fd, &hdr, sizeof(hdr));
     if (rn != (ssize_t)sizeof(hdr)) {
         fprintf(stderr, "[load_state] failed to read header (%zd bytes)\n", rn);
