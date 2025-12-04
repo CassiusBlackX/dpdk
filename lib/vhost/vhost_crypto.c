@@ -2850,7 +2850,7 @@ int vhost_crypto_load_state(int vid, int fd)
 	fprintf(stderr, "\n");
 	lseek(fd, 0, SEEK_SET); // 再 seek 回去重新读一遍真正逻辑
 	
-    ssize_t rn = read(fd, &hdr, sizeof(hdr));
+    rn = read(fd, &hdr, sizeof(hdr));
     if (rn != (ssize_t)sizeof(hdr)) {
         fprintf(stderr, "[load_state] failed to read header (%zd bytes)\n", rn);
         return -EIO;
