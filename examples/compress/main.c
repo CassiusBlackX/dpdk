@@ -34,7 +34,7 @@ int main(int argc, char **argv)
     struct rte_compressdev_config config = {
         .socket_id = rte_socket_id(),
         .nb_queue_pairs = 1,
-        .max_nb_priv_xforms = 1,
+        .max_nb_priv_xforms = 2,
         .max_nb_streams = 1,
     };
     if (rte_compressdev_configure(dev_id, &config) < 0)
@@ -70,25 +70,74 @@ int main(int argc, char **argv)
     printf("111 %d \n", __LINE__);
 
     // 7. 分配输入输出 mbuf
-    const char *input_str = "111111111111111111";
+    const char *input_str = "123123123123123123";
     printf("111 %d \n", __LINE__);
     uint32_t input_len = strlen(input_str) + 1;
 
     printf("111 %d \n", __LINE__);
-    struct rte_mbuf *src = rte_pktmbuf_alloc(pool);
+    //------------------------//
+
+    struct rte_mbuf *m = rte_pktmbuf_alloc(pool);
+    if (!m) {
+        fprintf(stderr, "Failed to alloc mbuf\n");
+        return -1;
+    }
+
+    uint8_t *mbuf_data = rte_pktmbuf_append(m, input_len);
+    if (!mbuf_data) {
+        fprintf(stderr, "Failed to append data to mbuf\n");
+        rte_pktmbuf_free(m);
+        return -1;
+    }
+    memset(mbuf_data, 0, input_len);
+    memcpy(mbuf_data, input_str, input_len);
+
+    //------------------//
+
+    struct rte_mbuf *m1 = rte_pktmbuf_alloc(pool);
+    if (!m1) {
+        fprintf(stderr, "Failed to alloc mbuf\n");
+        return -1;
+    }
+
+    uint8_t *mbuf_data1 = rte_pktmbuf_append(m1, input_len);
+    if (!mbuf_data1) {
+        fprintf(stderr, "Failed to append data to mbuf\n");
+        rte_pktmbuf_free(m1);
+        return -1;
+    }
+    memset(mbuf_data1, 0, input_len);
+    memcpy(mbuf_data1, input_str, input_len);
+    mbuf_data1[0] = 'a';
+    mbuf_data1[1] = 'a';
+    //------------------//
+
+    struct rte_mbuf *m2 = rte_pktmbuf_alloc(pool);
+    if (!m2) {
+        fprintf(stderr, "Failed to alloc mbuf\n");
+        return -1;
+    }
+
+    uint8_t *mbuf_data2 = rte_pktmbuf_append(m2, input_len);
+    if (!mbuf_data2) {
+        fprintf(stderr, "Failed to append data to mbuf\n");
+        rte_pktmbuf_free(m2);
+        return -1;
+    }
+    memset(mbuf_data2, 0, input_len);
+    // memcpy(mbuf_data2, input_str, input_len);
     printf("111 %d \n", __LINE__);
-    struct rte_mbuf *dst = rte_pktmbuf_alloc(pool);
-    if (!src || !dst)
+    if (!m || !m1 || !m2)
         rte_exit(EXIT_FAILURE, "mbuf alloc failed\n");
     printf("111 %d \n", __LINE__);
 
-    char *src_data = rte_pktmbuf_mtod(src, char *);
-    memcpy(src_data, input_str, input_len);
-    src->data_len = input_len;
-    src->pkt_len = input_len;
+    m->data_len = input_len;
+    m->pkt_len = input_len;
 
-    dst->data_len = SEG_SIZE;
-    dst->pkt_len = SEG_SIZE;
+    m1->data_len = SEG_SIZE;
+    m1->pkt_len = SEG_SIZE;
+    m2->data_len = SEG_SIZE;
+    m2->pkt_len = SEG_SIZE;
     printf("111 %d \n", __LINE__);
 
     // 8. 准备压缩操作
@@ -97,8 +146,8 @@ int main(int argc, char **argv)
         rte_exit(EXIT_FAILURE, "op alloc failed\n");
     printf("111 %d \n", __LINE__);
 
-    op->m_src = src;
-    op->m_dst = dst;
+    op->m_src = m;
+    op->m_dst = m1;
     op->src.offset = 0;
     op->src.length = input_len;
     op->dst.offset = 0;
@@ -113,13 +162,55 @@ int main(int argc, char **argv)
     while (rte_compressdev_dequeue_burst(dev_id, 0, &op, 1) == 0)
         rte_pause();
 
+    printf("Address: %p %p", m1->buf_addr, (void*)m1->buf_iova);
     printf("Compressed length: %u bytes\n", op->produced);
+    for(unsigned int i = 0; i < op->produced; i++)
+    {
+        unsigned char *aaa = rte_pktmbuf_mtod(m1, unsigned char*);
+        printf("%d", aaa[i]);
+    }
     printf("111 %d \n", __LINE__);
+
+    // 10. 解压操作
+    struct rte_comp_xform decompress_xform = {
+        .type = RTE_COMP_DECOMPRESS,
+        .decompress = {
+            .algo = RTE_COMP_ALGO_DEFLATE,
+            .chksum = RTE_COMP_CHECKSUM_NONE,
+            .window_size = 15
+        }
+    };
+    void *decomp_xform = NULL;
+    rte_compressdev_private_xform_create(dev_id, &decompress_xform, &decomp_xform);
+
+    struct rte_mbuf *decomp_out = rte_pktmbuf_alloc(pool);
+    memcpy(decomp_out, input_str, 2);
+    struct rte_comp_op *decomp_op = rte_comp_op_alloc(pool);
+    decomp_op->m_src = m1;
+    decomp_op->m_dst = m2;
+    decomp_op->src.offset = 0;
+    decomp_op->src.length = op->produced;
+    decomp_op->dst.offset = 0;
+    decomp_op->private_xform = decomp_xform;
+    decomp_op->op_type = RTE_COMP_OP_STATELESS;
+    decomp_op->flush_flag = RTE_COMP_FLUSH_FINAL;
+
+    rte_compressdev_enqueue_burst(dev_id, 0, &decomp_op, 1);
+    while (rte_compressdev_dequeue_burst(dev_id, 0, &decomp_op, 1) == 0)
+        rte_pause();
+
+    printf("Decompressed length: %u bytes\n", decomp_op->produced);
+    for(unsigned int i = 0; i < decomp_op->produced; i++)
+    {
+        unsigned char *aaa = rte_pktmbuf_mtod(m2, unsigned char*);
+        printf("%c", aaa[i]);
+    }
 
     // 12. 清理
     rte_compressdev_private_xform_free(dev_id, comp_xform);
-    rte_pktmbuf_free(src);
-    rte_pktmbuf_free(dst);
+    rte_pktmbuf_free(m);
+    rte_pktmbuf_free(m1);
+    rte_pktmbuf_free(m2);
     rte_compressdev_stop(dev_id);
 
     printf("Done.\n");

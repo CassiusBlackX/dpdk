@@ -272,20 +272,22 @@ static int virtio_comp_private_xform_create(struct rte_compressdev *dev,
 	if (xform->type == RTE_COMP_COMPRESS)
 	{
 		ctrl_req->u.stateless_create_session.req.para.op = VIRTIO_COMP_OP_COMPRESS;
+		ctrl_req->u.stateless_create_session.req.para.level = xform->compress.level;
+		ctrl_req->u.stateless_create_session.req.para.window_size = xform->compress.window_size;
+		ctrl_req->u.stateless_create_session.req.para.chksum = xform->compress.chksum;
+		ctrl_req->u.stateless_create_session.req.para.hash_algo = xform->compress.hash_algo;
+		ctrl_req->u.stateless_create_session.req.para.u.deflate.huffman = xform->compress.deflate.huffman;
+		VIRTIO_COMP_DRV_LOG_ERR("%s %d %d %d %d", __FUNCTION__, __LINE__, 
+			ctrl_req->u.stateless_create_session.req.para.level,
+			ctrl_req->u.stateless_create_session.req.para.window_size,
+			ctrl_req->u.stateless_create_session.req.para.u.deflate.huffman);
 	}
 	else {
 		ctrl_req->u.stateless_create_session.req.para.op = VIRTIO_COMP_OP_DECOMPRESS;
+		ctrl_req->u.stateless_create_session.req.para.window_size = xform->decompress.window_size;
+		ctrl_req->u.stateless_create_session.req.para.hash_algo = xform->decompress.hash_algo;
+		ctrl_req->u.stateless_create_session.req.para.chksum = xform->decompress.chksum;
 	}
-	ctrl_req->u.stateless_create_session.req.para.level = xform->compress.level;
-	ctrl_req->u.stateless_create_session.req.para.window_size = xform->compress.window_size;
-	ctrl_req->u.stateless_create_session.req.para.chksum = xform->compress.chksum;
-	ctrl_req->u.stateless_create_session.req.para.hash_algo = xform->compress.hash_algo;
-	ctrl_req->u.stateless_create_session.req.para.u.deflate.huffman = xform->compress.deflate.huffman;
-	VIRTIO_COMP_DRV_LOG_ERR("%s %d %d %d %d", __FUNCTION__, __LINE__, 
-		ctrl_req->u.stateless_create_session.req.para.level,
-		ctrl_req->u.stateless_create_session.req.para.window_size,
-		ctrl_req->u.stateless_create_session.req.para.u.deflate.huffman);
-	
 	input = &ctrl->input;
 	input->status = VIRTIO_COMP_ERR;
 	input->session_id = ~0ULL;

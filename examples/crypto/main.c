@@ -141,6 +141,7 @@ int main(int argc, char **argv)
     
     /* 10) Prepare a plaintext mbuf */
     const char *plaintext = "Hello DPDK Crypto!012"; /* length 20 (not multiple of 16) */
+    const char *plaintext2 = "AAAAA DPDK Crypto!012"; /* length 20 (not multiple of 16) */
     size_t pt_len = strlen(plaintext);
     /* For AES-CBC block cipher we need padding or use exact multiple of 16 for simplicity.
        Here we round up to 16-byte multiple and zero-pad (not a secure padding, demo only). */
@@ -162,7 +163,22 @@ int main(int argc, char **argv)
     memset(mbuf_data, 0, padded_len);
     memcpy(mbuf_data, plaintext, pt_len);
 
-    printf("Plaintext (%zu bytes, padded to %zu): '%s'\n", pt_len, padded_len, plaintext);
+    //------------------//
+
+    struct rte_mbuf *m1 = rte_pktmbuf_alloc(mbuf_pool);
+    if (!m) {
+        fprintf(stderr, "Failed to alloc mbuf\n");
+        return -1;
+    }
+
+    uint8_t *mbuf_data1 = rte_pktmbuf_append(m1, padded_len);
+    if (!mbuf_data1) {
+        fprintf(stderr, "Failed to append data to mbuf\n");
+        rte_pktmbuf_free(m);
+        return -1;
+    }
+    memset(mbuf_data1, 0, padded_len);
+    memcpy(mbuf_data1, plaintext2, pt_len);
 
     /* 11) Allocate crypto_op and attach session */
     struct rte_crypto_op *op = rte_crypto_op_alloc(crypto_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC);
@@ -174,10 +190,8 @@ int main(int argc, char **argv)
 
     /* attach mbuf */
     op->sym->m_src = m;
-    op->sym->m_dst = NULL; /* in-place (many PMDs support in-place) */
-
-    fprintf(stderr, "%p %p\n", session, &session);
-    fprintf(stderr, "%p \n", op->sym->session);
+    op->sym->m_dst = m1; /* in-place (many PMDs support in-place) */
+    
     /* set session (API name may vary as noted) */
     if (rte_crypto_op_attach_sym_session(op, session) != 0) {
         fprintf(stderr, "Failed to attach session to crypto op\n");
@@ -190,17 +204,12 @@ int main(int argc, char **argv)
     fprintf(stderr, "%p %p \n", session, op->sym->session);
 
     /* set cipher transform (offset, length, IV) */
-    fprintf(stderr, "%p \n", op->sym->session);
     op->sym->cipher.data.offset = 0;
-    fprintf(stderr, "%p \n", op->sym->session);
     op->sym->cipher.data.length = padded_len;
-    /* copy IV into op */
-    fprintf(stderr, "%p \n", op->sym->session);
-    // op->sym->xform = &cipher_xform;
-    fprintf(stderr, "%p \n", op->sym->session);
 
     /* 12) Enqueue operation */
     struct rte_crypto_op *ops[1] = { op };
+
     uint16_t enq = rte_cryptodev_enqueue_burst(dev_id, qp_id, ops, 1);
     if (enq != 1) {
         fprintf(stderr, "Failed to enqueue crypto op (enq=%u)\n", enq);
@@ -212,15 +221,18 @@ int main(int argc, char **argv)
     /* 13) Dequeue completed ops (poll loop) */
     struct rte_crypto_op *dequeued[1];
     unsigned tries = 0;
+    uint8_t *out = NULL;
     while (tries < 1000) {
         uint16_t deq = rte_cryptodev_dequeue_burst(dev_id, qp_id, dequeued, 1);
         if (deq == 1) {
             struct rte_crypto_op *rop = dequeued[0];
+            fprintf(stderr, ":::%p %p\n", 
+                rop->sym->m_dst->buf_addr, (void*)rop->sym->m_dst->buf_iova);
             if (rop->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
                 fprintf(stderr, "Crypto op failed (status=%d)\n", rop->status);
             } else {
                 /* result is in m (in-place) */
-                uint8_t *out = rte_pktmbuf_mtod(rop->sym->m_src, uint8_t *);
+                uint8_t *out = rte_pktmbuf_mtod(rop->sym->m_dst, uint8_t *);
                 printf("Encrypted (hex, %zu bytes):\n", padded_len);
                 for (size_t i = 0; i < padded_len; ++i) {
                     printf("%02x", out[i]);
@@ -241,8 +253,88 @@ int main(int argc, char **argv)
         fprintf(stderr, "Timeout waiting for crypto op completion\n");
     }
 
+        /* ------------------------ */
+    /* Now DECRYPT the results  */
+    /* ------------------------ */
+    fprintf(stderr, "%d\n", __LINE__);
+
+    /* 3) Create a crypto op for decrypt */
+    struct rte_crypto_op *dec_op =
+        rte_crypto_op_alloc(crypto_mp, RTE_CRYPTO_OP_TYPE_SYMMETRIC);
+    if (!dec_op) {
+        fprintf(stderr, "Failed to alloc decrypt crypto op\n");
+        return -1;
+    }
+    fprintf(stderr, "%d\n", __LINE__);
+    struct rte_crypto_sym_xform cipher_xform2;
+    memset(&cipher_xform2, 0, sizeof(cipher_xform2));
+
+    cipher_xform2.type = RTE_CRYPTO_SYM_XFORM_CIPHER;
+    cipher_xform2.next = NULL; /* only one transform in this example */
+    cipher_xform2.cipher.algo = RTE_CRYPTO_CIPHER_AES_CBC;
+    cipher_xform2.cipher.op = RTE_CRYPTO_CIPHER_OP_DECRYPT;
+    cipher_xform2.cipher.key.data = (uint8_t *)aes_key;
+    cipher_xform2.cipher.key.length = sizeof(aes_key);
+    cipher_xform2.cipher.iv.offset = 0;
+    cipher_xform2.cipher.iv.length = 16;
+    struct rte_cryptodev_sym_session *session2 = rte_cryptodev_sym_session_create(dev_id, &cipher_xform2, session_pool);
+    fprintf(stderr, "%d\n", __LINE__);
+
+    /* 4) Use the same session (key+IV same). AES-CBC decrypt uses same session. */
+    dec_op->sym->session = session2;
+    dec_op->sym->m_src  = m1;
+    dec_op->sym->m_dst  = m;
+    uint8_t *tmp = rte_pktmbuf_mtod(m, uint8_t *);
+    memset(tmp, 0, padded_len);
+
+    dec_op->sym->cipher.data.offset = 0;
+    dec_op->sym->cipher.data.length = padded_len;
+    fprintf(stderr, "%d\n", __LINE__);
+
+    /* 5) enqueue decrypt op */
+    struct rte_crypto_op *dec_ops[1] = { dec_op };
+    uint16_t enq2 = rte_cryptodev_enqueue_burst(dev_id, qp_id, dec_ops, 1);
+    if (enq2 != 1) {
+        fprintf(stderr, "Decrypt enqueue failed\n");
+        rte_crypto_op_free(dec_op);
+        return -1;
+    }
+    fprintf(stderr, "%d\n", __LINE__);
+
+    /* 6) dequeue decrypt result */
+    struct rte_crypto_op *decq[1];
+    tries = 0;
+    while (tries < 1000) {
+        uint16_t deq2 = rte_cryptodev_dequeue_burst(dev_id, qp_id, decq, 1);
+        if (deq2 == 1) {
+            struct rte_crypto_op *dop = decq[0];
+            if (dop->status != RTE_CRYPTO_OP_STATUS_SUCCESS) {
+                fprintf(stderr, "Decrypt failed! status=%d\n", dop->status);
+            } else {
+                uint8_t *pt = rte_pktmbuf_mtod(dop->sym->m_dst, uint8_t *);
+                printf("\nDecrypted plaintext:\n");
+                for (size_t i = 0; i < padded_len; i++) {
+                    printf("%c", pt[i] ? pt[i] : '.');  
+                }
+                printf("\n");
+            }
+
+            rte_crypto_op_free(dop);
+            break;
+        }
+        tries++;
+        rte_delay_us_block(100);
+    }
+    if (tries >= 1000) {
+        fprintf(stderr, "Timeout on decrypt\n");
+    }
+
+    /* ----- session + device cleanup (you already have) ----- */
+
+
     /* 14) cleanup */
     rte_cryptodev_sym_session_free(dev_id, session); /* may be version dependent */
+    rte_cryptodev_sym_session_free(dev_id, session2); /* may be version dependent */
     rte_cryptodev_stop(dev_id);
     rte_cryptodev_close(dev_id);
 

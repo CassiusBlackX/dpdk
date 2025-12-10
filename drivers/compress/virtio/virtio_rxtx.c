@@ -102,6 +102,8 @@ virtqueue_dequeue_burst_rx(struct virtqueue *vq,
 		cop->consumed = inhdr->consumed;
 		cop->produced = inhdr->produced;
 		VIRTIO_COMP_TX_LOG_ERR("%s %d %u %u", __FUNCTION__, __LINE__, inhdr->consumed, inhdr->produced);
+		VIRTIO_COMP_TX_LOG_ERR("%s %d Guest Physical Address %p %p", __FUNCTION__, __LINE__,
+			(void*)cop->m_dst->buf_iova, (void*)rte_pktmbuf_iova_offset(cop->m_dst, 0));
 
 		vq->packets_received_total++;
 
@@ -263,10 +265,15 @@ virtqueue_comp_stateless_enqueue_xmit_split(
 	if (unlikely(txvq->vq_free_cnt < needed))
 		return -EMSGSIZE;
 	head_idx = txvq->vq_desc_head_idx;
-	if (unlikely(head_idx >= txvq->vq_nentries))
+	if (unlikely(head_idx >= txvq->vq_nentries)) {
+		VIRTIO_COMP_TX_LOG_ERR("%s %d head_idx: %u %u", __FUNCTION__, __LINE__, 
+			head_idx, txvq->vq_nentries);
 		return -EFAULT;
-	if (unlikely(session == NULL))
+	}
+	if (unlikely(session == NULL)) {
+		VIRTIO_COMP_TX_LOG_ERR("%s %d session: %p", __FUNCTION__, __LINE__, session);
 		return -EFAULT;
+	}
 
 	dxp = &txvq->vq_descx[head_idx];
 
@@ -298,6 +305,7 @@ virtqueue_comp_stateless_enqueue_xmit_split(
 
 	/* indirect vring: first part, virtio_comp_op_data_req */
 	desc[idx].addr = indirect_op_data_req_phys_addr;
+	VIRTIO_COMP_TX_LOG_ERR("cookie gpa: %p", (void*)indirect_op_data_req_phys_addr);
 	desc[idx].len = req_data_len;
 	desc[idx++].flags = VRING_DESC_F_NEXT;
 
@@ -311,6 +319,8 @@ virtqueue_comp_stateless_enqueue_xmit_split(
 	/* indirect vring: dst data */
 	if (cop->m_dst) {
 		desc[idx].addr = rte_pktmbuf_iova_offset(cop->m_dst, 0);
+		VIRTIO_COMP_TX_LOG_ERR("cookie gpa: %p", 
+			(void*)desc[idx].addr);
 	} else {
 		desc[idx].addr = rte_pktmbuf_iova_offset(cop->m_src, 0);
 	}
@@ -380,7 +390,6 @@ virtqueue_comp_stateless_enqueue_xmit_packed(
 	struct virtio_comp_op_data_req *op_data_req;
 	uint32_t hash_result_len = 0;
 	struct virtio_comp_op_cookie *comp_op_cookie;
-	struct virtio_crypto_alg_chain_session_para *para;
 	uint16_t flags = VRING_DESC_F_NEXT;
 
 	if (unlikely(cop->m_src->nb_segs != 1))
@@ -577,7 +586,7 @@ virtio_comp_pkt_rx_burst(void *tx_queue, struct rte_comp_op **rx_pkts,
 	}
 
 	VIRTIO_COMP_RX_LOG_DBG("used:%d dequeue:%d", nb_rx, num);
-	VIRTIO_COMP_RX_LOG_ERR("used:%d dequeue:%d", nb_rx, num);
+	// VIRTIO_COMP_RX_LOG_ERR("used:%d dequeue:%d", nb_rx, num);
 
 	return nb_rx;
 }

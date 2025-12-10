@@ -397,6 +397,8 @@ virtqueue_crypto_sym_enqueue_xmit_split(
 
 	/* indirect vring: first part, virtio_crypto_op_data_req */
 	desc[idx].addr = indirect_op_data_req_phys_addr;
+	VIRTIO_CRYPTO_TX_LOG_ERR("cookie gpa: %p", (void*)indirect_op_data_req_phys_addr);
+
 	desc[idx].len = req_data_len;
 	desc[idx++].flags = VRING_DESC_F_NEXT;
 
@@ -439,6 +441,8 @@ virtqueue_crypto_sym_enqueue_xmit_split(
 	/* indirect vring: dst data */
 	if (sym_op->m_dst) {
 		desc[idx].addr = rte_pktmbuf_iova_offset(sym_op->m_dst, 0);
+		VIRTIO_CRYPTO_TX_LOG_ERR("dst gpa: %p", 
+			(void*)desc[idx].addr);
 		desc[idx].len = src_len;
 	} else {
 		desc[idx].addr = rte_pktmbuf_iova_offset(sym_op->m_src, 0);
