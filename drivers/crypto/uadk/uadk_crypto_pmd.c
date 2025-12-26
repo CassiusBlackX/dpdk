@@ -11,6 +11,7 @@
 
 #include <uadk/wd_cipher.h>
 #include <uadk/wd_digest.h>
+#include <uadk/wd_rsa.h>
 #include <uadk/wd_sched.h>
 
 #include "uadk_crypto_pmd_private.h"
@@ -353,6 +354,23 @@ static const struct rte_cryptodev_capabilities uadk_crypto_v2_capabilities[] = {
 			}, }
 		}, }
 	},
+	{       /* RSA */						
+		.op = RTE_CRYPTO_OP_TYPE_ASYMMETRIC,			
+		{.asym = {						
+			.xform_capa = {					
+			.xform_type = RTE_CRYPTO_ASYM_XFORM_RSA,	
+			.op_types = ((1 << RTE_CRYPTO_ASYM_OP_SIGN) |	
+					(1 << RTE_CRYPTO_ASYM_OP_VERIFY) |  
+					(1 << RTE_CRYPTO_ASYM_OP_ENCRYPT) | 
+					(1 << RTE_CRYPTO_ASYM_OP_DECRYPT)), 
+			{.modlen = {					
+				.min = 1,				
+				.max = 1024,				
+				.increment = 1				
+			}, }						
+		}							
+		 }, }							
+	},
 	/* End of capabilities */
 	RTE_CRYPTODEV_END_OF_CAPABILITIES_LIST()
 };
@@ -547,6 +565,12 @@ qp_setup_cleanup:
 
 static unsigned int
 uadk_crypto_sym_session_get_size(struct rte_cryptodev *dev __rte_unused)
+{
+	return sizeof(struct uadk_crypto_session);
+}
+
+static unsigned int
+uadk_crypto_asym_session_get_size(struct rte_cryptodev *dev __rte_unused)
 {
 	return sizeof(struct uadk_crypto_session);
 }
@@ -807,6 +831,95 @@ uninit:
 	return ret;
 }
 
+static int get_rsa_key_bits(const struct rte_crypto_rsa_xform *rsa_xform) {
+	if (!rsa_xform || !rsa_xform->n.data) {
+			return 0;
+	}
+	return rsa_xform->n.length * 8;
+}
+
+static int
+uadk_rsa_session_init(struct uadk_crypto_session *sess,
+		      struct rte_crypto_rsa_xform *rsa_xform)
+{
+	struct wd_rsa_sess_setup setup;
+	int ret;
+	
+	memset(&setup, 0, sizeof(setup));
+	
+	/* 设置RSA参数 */
+	setup.key_bits = get_rsa_key_bits(rsa_xform);
+	setup.is_crt = (rsa_xform->key_type == RTE_RSA_KEY_TYPE_QT) ? 1 : 0;
+	
+	/* 创建UADK RSA会话 */
+	sess->handle_rsa = wd_rsa_alloc_sess(&setup);
+	if (!sess->handle_rsa) {
+		UADK_LOG(ERR, "Failed to allocate RSA session");
+		return -ENOMEM;
+	}
+	
+	/* 设置RSA密钥 */
+	if (rsa_xform->key_type == RTE_RSA_KEY_TYPE_QT) {
+		ret = wd_rsa_set_crt_prikey_params(sess->handle_rsa,
+					(struct wd_dtb *)&rsa_xform->qt.dQ,
+					(struct wd_dtb *)&rsa_xform->qt.dP,
+					(struct wd_dtb *)&rsa_xform->qt.qInv,
+					(struct wd_dtb *)&rsa_xform->qt.q,
+					(struct wd_dtb *)&rsa_xform->qt.p);
+	} else {
+		ret = wd_rsa_set_prikey_params(sess->handle_rsa,
+					(struct wd_dtb *)&rsa_xform->d,
+					(struct wd_dtb *)&rsa_xform->n);
+	}
+	
+	if (ret) {
+		UADK_LOG(ERR, "Failed to set RSA private key");
+		goto err;
+	}
+	
+	/* 设置公钥 */
+	ret = wd_rsa_set_pubkey_params(sess->handle_rsa,
+				(struct wd_dtb *)&rsa_xform->e,
+				(struct wd_dtb *)&rsa_xform->n);
+	if (ret) {
+		UADK_LOG(ERR, "Failed to set RSA public key");
+		goto err;
+	}
+	
+	/* 保存操作类型和填充信息 */
+	// sess->asym.u.rsa.op_type = rsa_xform->op_type;
+	memcpy(&sess->asym.u.rsa.xform, rsa_xform,
+	       sizeof(struct rte_crypto_rsa_xform));
+	
+	return 0;
+	
+err:
+	if (sess->handle_rsa)
+		wd_rsa_free_sess(sess->handle_rsa);
+	return ret;
+}
+
+static int
+uadk_set_session_akcipher_parameters(struct rte_cryptodev *dev,
+				   struct uadk_crypto_session *sess,
+				   struct rte_crypto_asym_xform *xform)
+{
+	int ret = 0;
+	sess->asym.xform_type = xform->xform_type;
+	
+	switch (xform->xform_type) {
+	case RTE_CRYPTO_ASYM_XFORM_RSA:
+		ret = uadk_rsa_session_init(sess, &xform->rsa);
+		break;
+	default:
+		UADK_LOG(ERR, "Unsupported asymmetric xform type %d",
+			 xform->xform_type);
+		return -ENOTSUP;
+	}
+	
+	return ret;
+}
+
 static int
 uadk_crypto_sym_session_configure(struct rte_cryptodev *dev,
 				  struct rte_crypto_sym_xform *xform,
@@ -863,6 +976,31 @@ uadk_crypto_sym_session_configure(struct rte_cryptodev *dev,
 	return 0;
 }
 
+static int
+uadk_crypto_asym_session_configure(struct rte_cryptodev *dev,
+				  struct rte_crypto_asym_xform *xform,
+				  struct rte_cryptodev_asym_session *session)
+{
+	struct uadk_crypto_session *sess = CRYPTODEV_GET_ASYM_SESS_PRIV(session);
+	int ret;
+
+	if (unlikely(!sess)) {
+		UADK_LOG(ERR, "Session not available");
+		return -EINVAL;
+	}
+
+	if (xform) {
+		ret = uadk_set_session_akcipher_parameters(dev, sess, xform);
+		if (ret != 0) {
+			UADK_LOG(ERR,
+				"Invalid/unsupported cipher parameters");
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
 static void
 uadk_crypto_sym_session_clear(struct rte_cryptodev *dev __rte_unused,
 			      struct rte_cryptodev_sym_session *session)
@@ -883,6 +1021,38 @@ uadk_crypto_sym_session_clear(struct rte_cryptodev *dev __rte_unused,
 		wd_digest_free_sess(sess->handle_digest);
 		sess->handle_digest = 0;
 	}
+
+	if (sess->handle_rsa) {
+		wd_rsa_free_sess(sess->handle_rsa);
+		sess->handle_rsa = 0;
+	}
+}
+
+static void
+uadk_crypto_asym_session_clear(struct rte_cryptodev *dev __rte_unused,
+			      struct rte_cryptodev_asym_session *session)
+{
+	struct uadk_crypto_session *sess = CRYPTODEV_GET_ASYM_SESS_PRIV(session);
+
+	if (unlikely(sess == NULL)) {
+		UADK_LOG(ERR, "Session not available");
+		return;
+	}
+
+	if (sess->handle_cipher) {
+		wd_cipher_free_sess(sess->handle_cipher);
+		sess->handle_cipher = 0;
+	}
+
+	if (sess->handle_digest) {
+		wd_digest_free_sess(sess->handle_digest);
+		sess->handle_digest = 0;
+	}
+
+	if (sess->handle_rsa) {
+		wd_rsa_free_sess(sess->handle_rsa);
+		sess->handle_rsa = 0;
+	}
 }
 
 static struct rte_cryptodev_ops uadk_crypto_pmd_ops = {
@@ -898,6 +1068,9 @@ static struct rte_cryptodev_ops uadk_crypto_pmd_ops = {
 		.sym_session_get_size	= uadk_crypto_sym_session_get_size,
 		.sym_session_configure	= uadk_crypto_sym_session_configure,
 		.sym_session_clear	= uadk_crypto_sym_session_clear,
+		.asym_session_get_size		= uadk_crypto_asym_session_get_size,
+		.asym_session_configure		= uadk_crypto_asym_session_configure,
+		.asym_session_clear		= uadk_crypto_asym_session_clear
 };
 
 static void *uadk_cipher_async_cb(struct wd_cipher_req *req __rte_unused,
@@ -905,6 +1078,7 @@ static void *uadk_cipher_async_cb(struct wd_cipher_req *req __rte_unused,
 {
 	struct rte_crypto_op *op = req->cb_param;
 
+	UADK_LOG(ERR, "%s %d %u", __FUNCTION__, __LINE__, op->status);
 	if (op->status == RTE_CRYPTO_OP_STATUS_NOT_PROCESSED)
 		op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
 
@@ -917,6 +1091,7 @@ uadk_process_cipher_op(struct rte_crypto_op *op,
 		       struct rte_mbuf *msrc, struct rte_mbuf *mdst,
 		       bool async)
 {
+	UADK_LOG(ERR, "%s %d %u", __FUNCTION__, __LINE__, op->status);
 	uint32_t off = op->sym->cipher.data.offset;
 	struct wd_cipher_req *req = &sess->cipher.req;
 	int ret;
@@ -929,6 +1104,7 @@ uadk_process_cipher_op(struct rte_crypto_op *op,
 	req->iv = rte_crypto_op_ctod_offset(op, uint8_t *, sess->iv.offset);
 	req->cb = uadk_cipher_async_cb;
 	req->cb_param = op;
+	UADK_LOG(ERR, "%s %d %u", __FUNCTION__, __LINE__, op->status);
 
 	if (sess->cipher.direction == RTE_CRYPTO_CIPHER_OP_ENCRYPT)
 		req->op_type = WD_CIPHER_ENCRYPTION;
@@ -941,9 +1117,11 @@ uadk_process_cipher_op(struct rte_crypto_op *op,
 		else
 			ret = wd_do_cipher_sync(sess->handle_cipher, req);
 	} while (ret == -WD_EBUSY);
+	UADK_LOG(ERR, "%s %d %u", __FUNCTION__, __LINE__, op->status);
 
 	if (ret)
 		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+	UADK_LOG(ERR, "%s %d %u", __FUNCTION__, __LINE__, op->status);
 }
 
 static void *uadk_digest_async_cb(void *param)
@@ -996,55 +1174,162 @@ uadk_process_auth_op(struct uadk_qp *qp, struct rte_crypto_op *op,
 		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
 }
 
+static void uadk_rsa_async_cb(void *cb_param)
+{
+	struct wd_rsa_req *req = (struct wd_rsa_req *)(cb_param);
+	struct rte_crypto_op *op = req->cb_param;
+
+	if (op->status == RTE_CRYPTO_OP_STATUS_NOT_PROCESSED)
+		op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
+
+	return;
+}
+
+static void uadk_process_rsa_op(struct rte_crypto_op *op,
+				struct uadk_crypto_session *sess, bool async)
+{
+	struct rte_crypto_asym_op *asym_op = op->asym;
+	struct wd_rsa_req *req = &sess->asym.u.rsa.req;
+	int ret;
+
+	// 初始化请求
+	memset(req, 0, sizeof(*req));
+
+	// 设置RSA操作参数
+	switch (op->asym->rsa.op_type) {
+	//TODO: WD_RSA_GENKEY
+	case RTE_CRYPTO_ASYM_OP_SIGN:
+		req->src = asym_op->rsa.message.data;
+		req->src_bytes = asym_op->rsa.message.length;
+		req->dst = asym_op->rsa.sign.data;
+		req->dst_bytes = asym_op->rsa.sign.length;
+		req->op_type = WD_RSA_SIGN;
+		break;
+	case RTE_CRYPTO_ASYM_OP_VERIFY:
+		req->src = asym_op->rsa.message.data;
+		req->src_bytes = asym_op->rsa.message.length;
+		req->dst = asym_op->rsa.sign.data;
+		req->dst_bytes = asym_op->rsa.sign.length;
+		req->op_type = WD_RSA_VERIFY;
+		break;
+	default:
+		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+		return;
+	}
+
+	// TODO:设置填充类型
+	switch (sess->asym.u.rsa.xform.padding.type) {
+	case RTE_CRYPTO_RSA_PADDING_NONE:
+		break;
+	default:
+		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+		return;
+	}
+
+	// 设置回调函数
+	req->cb = uadk_rsa_async_cb;
+	req->cb_param = op;
+
+	// 提交到UADK
+	do {
+		if (async)
+			ret = wd_do_rsa_async(sess->handle_cipher, req);
+		else
+			ret = wd_do_rsa_sync(sess->handle_cipher, req);
+	} while (ret == -WD_EBUSY);
+
+	if (ret)
+		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+}
+
+static void uadk_crypto_sym_op_enqueue(struct uadk_qp *qp, 
+	struct rte_crypto_op *op, int idx)
+{
+	struct uadk_crypto_session *sess = NULL;
+	struct rte_mbuf *msrc, *mdst;
+
+	op->status = RTE_CRYPTO_OP_STATUS_NOT_PROCESSED;
+	msrc = op->sym->m_src;
+	mdst = op->sym->m_dst ? op->sym->m_dst : op->sym->m_src;
+
+	if (op->sess_type == RTE_CRYPTO_OP_WITH_SESSION) {
+		if (likely(op->sym->session != NULL))
+			sess = CRYPTODEV_GET_SYM_SESS_PRIV(
+				op->sym->session);
+	}
+
+	if (!sess) {
+		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+		return;
+	}
+
+	switch (sess->chain_order) {
+	case UADK_CHAIN_ONLY_CIPHER:
+		uadk_process_cipher_op(op, sess, msrc, mdst, true);
+		break;
+	case UADK_CHAIN_ONLY_AUTH:
+		uadk_process_auth_op(qp, op, sess, msrc, mdst, true, idx);
+		break;
+	case UADK_CHAIN_CIPHER_AUTH:
+		uadk_process_cipher_op(op, sess, msrc, mdst, false);
+		uadk_process_auth_op(qp, op, sess, mdst, mdst, true, idx);
+		break;
+	case UADK_CHAIN_AUTH_CIPHER:
+		uadk_process_auth_op(qp, op, sess, msrc, mdst, false, idx);
+		uadk_process_cipher_op(op, sess, msrc, mdst, true);
+		break;
+	default:
+		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+		break;
+	}
+}
+
+static void uadk_crypto_asym_op_enqueue(struct rte_crypto_op *op)
+{
+	struct uadk_crypto_session *sess = NULL;
+	op->status = RTE_CRYPTO_OP_STATUS_NOT_PROCESSED;
+
+	// struct rte_mbuf *msrc, *mdst;
+	// msrc = op->asym->m_src;
+	// mdst = op->asym->m_dst ? op->asym->m_dst : op->asym->m_src;
+
+	if (op->sess_type == RTE_CRYPTO_OP_WITH_SESSION) {
+		if (likely(op->asym->session != NULL))
+			sess = CRYPTODEV_GET_ASYM_SESS_PRIV(
+				op->asym->session);
+	}
+
+	if (!sess) {
+		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+		return;
+	}
+
+	uadk_process_rsa_op(op, sess, true);
+}
+
 static uint16_t
 uadk_crypto_enqueue_burst(void *queue_pair, struct rte_crypto_op **ops,
 			  uint16_t nb_ops)
 {
 	struct uadk_qp *qp = queue_pair;
-	struct rte_mbuf *msrc, *mdst;
 	struct rte_crypto_op *op;
 	uint16_t enqd = 0;
 	int i, ret;
 
 	for (i = 0; i < nb_ops; i++) {
-		struct uadk_crypto_session *sess = NULL;
-
 		op = ops[i];
-		op->status = RTE_CRYPTO_OP_STATUS_NOT_PROCESSED;
-		msrc = op->sym->m_src;
-		mdst = op->sym->m_dst ? op->sym->m_dst : op->sym->m_src;
-
-		if (op->sess_type == RTE_CRYPTO_OP_WITH_SESSION) {
-			if (likely(op->sym->session != NULL))
-				sess = CRYPTODEV_GET_SYM_SESS_PRIV(
-					op->sym->session);
-		}
-
-		if (!sess) {
-			op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
-			continue;
-		}
-
-		switch (sess->chain_order) {
-		case UADK_CHAIN_ONLY_CIPHER:
-			uadk_process_cipher_op(op, sess, msrc, mdst, true);
+		UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, op->type);
+		switch (op->type)
+		{
+		case RTE_CRYPTO_OP_TYPE_SYMMETRIC:
+			uadk_crypto_sym_op_enqueue(qp, op, i);
 			break;
-		case UADK_CHAIN_ONLY_AUTH:
-			uadk_process_auth_op(qp, op, sess, msrc, mdst, true, i);
-			break;
-		case UADK_CHAIN_CIPHER_AUTH:
-			uadk_process_cipher_op(op, sess, msrc, mdst, false);
-			uadk_process_auth_op(qp, op, sess, mdst, mdst, true, i);
-			break;
-		case UADK_CHAIN_AUTH_CIPHER:
-			uadk_process_auth_op(qp, op, sess, msrc, mdst, false, i);
-			uadk_process_cipher_op(op, sess, msrc, mdst, true);
+		case RTE_CRYPTO_OP_TYPE_ASYMMETRIC:
+			uadk_crypto_asym_op_enqueue(op);
 			break;
 		default:
-			op->status = RTE_CRYPTO_OP_STATUS_ERROR;
 			break;
 		}
-
 		if (op->status != RTE_CRYPTO_OP_STATUS_ERROR) {
 			ret = rte_ring_enqueue(qp->processed_pkts, (void *)op);
 			if (ret < 0)

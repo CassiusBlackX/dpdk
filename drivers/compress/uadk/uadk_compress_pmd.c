@@ -55,7 +55,7 @@ uadk_compress_pmd_config(struct rte_compressdev *dev,
 	free(ctx_set_num);
 
 	if (ret) {
-		UADK_LOG(ERR, "failed to do comp init2!");
+		UADK_LOG(ERR, "failed to do comp init2! %d", ret);
 		return ret;
 	}
 

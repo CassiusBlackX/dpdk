@@ -1,0 +1,5 @@
+export WD_RSA_CTX_NUM="sync:2@0,async:4@0" 
+export WD_DH_CTX_NUM="sync:2@0,async:4@0" 
+export WD_CIPHER_CTX_NUM="sync:2@2,async:4@2" 
+export WD_DIGEST_CTX_NUM="sync:2@2,async:4@2" 
+export WD_COMP_CTX_NUM="sync_comp:2@2,sync_decomp:2@2,async_comp:4@2,async_decomp:4@2" 

@@ -39,6 +39,8 @@ struct __rte_cache_aligned uadk_crypto_session {
 	handle_t handle_digest;
 	enum uadk_chain_order chain_order;
 
+	handle_t handle_rsa;
+
 	/* IV parameters */
 	struct {
 		uint16_t length;
@@ -57,6 +59,16 @@ struct __rte_cache_aligned uadk_crypto_session {
 		enum rte_crypto_auth_operation operation;
 		uint16_t digest_length;
 	} auth;
+
+	struct {
+		enum rte_crypto_asym_xform_type xform_type;
+		union {
+			struct {
+				struct wd_rsa_req req;
+				struct rte_crypto_rsa_xform xform;
+			} rsa;
+		} u;
+	} asym;
 };
 
 enum uadk_crypto_version {
