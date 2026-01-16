@@ -35,7 +35,6 @@ uadk_compress_pmd_config(struct rte_compressdev *dev,
 	struct wd_ctx_params cparams = {0};
 	struct wd_ctx_nums *ctx_set_num;
 	int ret;
-
 	if (priv->init)
 		return 0;
 

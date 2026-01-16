@@ -20,15 +20,15 @@ int main(int argc, char **argv)
     uint16_t nb_devs = rte_compressdev_count();
     if (nb_devs == 0)
         rte_exit(EXIT_FAILURE, "No compressdev devices found\n");
-    printf("111/n");
 
     printf("Found %u compressdev devices\n", nb_devs);
     // 3. 创建 mbuf 内存池
+    fprintf(stderr, "%s %d\n", __FUNCTION__, __LINE__);
     struct rte_mempool *pool = rte_pktmbuf_pool_create("mbuf_pool",
-        8, 0, 0, 1024, rte_socket_id());
+        8, 0, 0, 1024, -1);
     if (pool == NULL)
         rte_exit(EXIT_FAILURE, "Cannot create mempool\n");
-    printf("111/n");
+    fprintf(stderr, "%s %d\n", __FUNCTION__, __LINE__);
 
     // 4. 配置第一个压缩设备
     uint16_t dev_id = 0;
@@ -38,6 +38,7 @@ int main(int argc, char **argv)
         .max_nb_priv_xforms = 2,
         .max_nb_streams = 1,
     };
+    fprintf(stderr, "%s %d\n", __FUNCTION__, __LINE__);
     if (rte_compressdev_configure(dev_id, &config) < 0)
         rte_exit(EXIT_FAILURE, "Device config failed\n");
     printf("Compressdev %u configured\n", dev_id);

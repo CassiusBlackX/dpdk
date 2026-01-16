@@ -79,6 +79,7 @@ enum uadk_crypto_version {
 struct __rte_cache_aligned uadk_crypto_priv {
 	bool cipher_init;
 	bool auth_init;
+	bool rsa_init;
 	enum uadk_crypto_version version;
 	unsigned int max_nb_qpairs;
 	unsigned int nb_qpairs;

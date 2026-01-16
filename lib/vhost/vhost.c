@@ -720,7 +720,6 @@ vhost_new_device(struct vhost_backend_ops *ops)
 	}
 
 	vhost_devices[i] = dev;
-	VHOST_CONFIG_LOG("device", ERR, "%s %d feature:%p %lu", __FUNCTION__, __LINE__, dev, dev->features);
 	pthread_mutex_unlock(&vhost_dev_lock);
 
 	dev->vid = i;
