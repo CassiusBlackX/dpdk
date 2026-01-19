@@ -1107,6 +1107,12 @@ vhost_crypto_check_cipher_request(struct virtio_crypto_cipher_data_req *req)
 		(req->para.dst_data_len >= req->para.src_data_len) &&
 		(req->para.dst_data_len <= RTE_MBUF_DEFAULT_BUF_SIZE)))
 		return VIRTIO_CRYPTO_OK;
+
+	if (likely((req->para.iv_len <= VHOST_CRYPTO_MAX_IV_LEN) &&
+		(req->para.src_data_len <= 32768) &&
+		(req->para.dst_data_len >= req->para.src_data_len) &&
+		(req->para.dst_data_len <= 32768)))
+		return VIRTIO_CRYPTO_OK;
 	return VIRTIO_CRYPTO_BADMSG;
 }
 

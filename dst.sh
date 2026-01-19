@@ -14,10 +14,10 @@ rm -f "$SOCK"
 ./build/examples/dpdk-vhost_crypto \
   -l 240-247 \
   -n 4 \
-  --file-prefix=dpdk2 \
+  --file-prefix=dpdk3 \
   --socket-mem 0,0,0,1024 \
   --vdev "crypto_uadk" \
   -- \
-  --socket-file 2,"$SOCK" \
+  --socket-file 241,"$SOCK" \
   --zero-copy
 '
