@@ -11,6 +11,8 @@ all_examples = [
         'bbdev_app',
         'bond',
         'cmdline',
+        'compress',
+        'crypto',
         'distributor',
         'dma',
         'ethtool',

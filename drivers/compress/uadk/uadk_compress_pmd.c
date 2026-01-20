@@ -35,7 +35,6 @@ uadk_compress_pmd_config(struct rte_compressdev *dev,
 	struct wd_ctx_params cparams = {0};
 	struct wd_ctx_nums *ctx_set_num;
 	int ret;
-
 	if (priv->init)
 		return 0;
 
@@ -55,7 +54,7 @@ uadk_compress_pmd_config(struct rte_compressdev *dev,
 	free(ctx_set_num);
 
 	if (ret) {
-		UADK_LOG(ERR, "failed to do comp init2!");
+		UADK_LOG(ERR, "failed to do comp init2! %d", ret);
 		return ret;
 	}
 

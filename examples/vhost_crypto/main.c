@@ -62,6 +62,27 @@ struct vhost_crypto_options {
 	bool asymmetric_crypto;
 } options;
 
+/* copied from lib/vhost/vhost_crypto.c */
+struct vhost_crypto_writeback_data {
+	uint8_t *src;
+	uint8_t *dst;
+	uint64_t len;
+	struct vhost_crypto_writeback_data *next;
+};
+
+struct vhost_crypto_data_req {
+	struct vring_desc *head;
+	struct virtio_net *dev;
+	struct virtio_crypto_inhdr *inhdr;
+	struct vhost_virtqueue *vq;
+	struct vhost_crypto_writeback_data *wb;
+	struct rte_mempool *wb_pool;
+	uint16_t desc_idx;
+	uint16_t len;
+	uint16_t zero_copy;
+};
+/* copied from lib/vhost/vhost_crypto.c */
+
 enum {
 #define OPT_CONFIG          "config"
 	OPT_CONFIG_NUM = 256,
@@ -608,7 +629,7 @@ main(int argc, char *argv[])
 		snprintf(name, 127, "COPPOOL_%u", lo->lcore_id);
 		info->cop_pool = rte_crypto_op_pool_create(name,
 				cop_type, NB_MEMPOOL_OBJS,
-				NB_CACHE_OBJS, VHOST_CRYPTO_MAX_IV_LEN,
+				NB_CACHE_OBJS, VHOST_CRYPTO_MAX_IV_LEN + sizeof(struct vhost_crypto_data_req),
 				rte_lcore_to_socket_id(lo->lcore_id));
 
 		if (!info->cop_pool) {

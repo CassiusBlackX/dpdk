@@ -601,6 +601,62 @@ tlv_decode(uint8_t *tlv, uint8_t type, uint8_t **data, size_t *data_len)
     return tlen;
 }
 
+static int
+virtio_crypto_asym_rsa_public_der_to_xform(uint8_t *der, size_t der_len,
+		struct rte_crypto_asym_xform *xform)
+{
+	uint8_t *n = NULL, *e = NULL, *tlv;
+	size_t nlen, elen;
+	int len;
+
+	RTE_SET_USED(der_len);
+
+	if (der[0] != 0x30)
+		return -EINVAL;
+
+
+	if (der[1] == 0x82)
+		tlv = &der[4];
+	else if (der[1] == 0x81)
+		tlv = &der[3];
+	else if (der[1] < 0x80)
+		tlv = &der[2];
+	else
+		return -EINVAL;
+
+	len = tlv_decode(tlv, 0x02, &n, &nlen);
+	if (len < 0)
+		return len;
+
+	tlv = tlv + len;
+	len = tlv_decode(tlv, 0x02, &e, &elen);
+	if (len < 0)
+		return len;
+
+	xform->xform_type = RTE_CRYPTO_ASYM_XFORM_RSA;
+	xform->rsa.key_type = RTE_RSA_KEY_TYPE_EXP;
+	xform->rsa.n.data = n;
+	xform->rsa.n.length = nlen;
+	xform->rsa.e.data = e;
+	xform->rsa.e.length = elen;
+
+	xform->rsa.d.data = NULL;
+	xform->rsa.d.length = 0;
+	xform->rsa.qt.p.data = NULL;
+	xform->rsa.qt.p.length = 0;
+	xform->rsa.qt.q.data = NULL;
+	xform->rsa.qt.q.length = 0;
+	xform->rsa.qt.dP.data = NULL;
+	xform->rsa.qt.dP.length = 0;
+	xform->rsa.qt.dQ.data = NULL;
+	xform->rsa.qt.dQ.length = 0;
+	xform->rsa.qt.qInv.data = NULL;
+	xform->rsa.qt.qInv.length = 0;
+
+	RTE_ASSERT(tlv + len == der + der_len);
+	return 0;
+}
+
 
 static int
 virtio_crypto_asym_rsa_der_to_xform(uint8_t *der, size_t der_len,
@@ -688,29 +744,46 @@ virtio_crypto_asym_rsa_der_to_xform(uint8_t *der, size_t der_len,
 	return 0;
 }
 
-/* 把快照里的 RSA 描述转成 DPDK 的 xform */
-static inline int
-rsa_param_transform(const VhostUserCryptoAsymSessionParam *A,
-                    struct rte_crypto_asym_xform *ax)
+static int
+rsa_param_transform(struct rte_crypto_asym_xform *xform,
+		VhostUserCryptoAsymSessionParam *param)
 {
-    /* 默认 PKCS#1 v1.5；再按 A->padding_algo 覆盖 */
-    ax->rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5;
+	int ret;
 
-    switch (A->u.rsa.padding_algo) {
-    case VIRTIO_CRYPTO_RSA_RAW_PADDING:
-        ax->rsa.padding.type = RTE_CRYPTO_RSA_PADDING_NONE;
-        break;
-#ifdef RTE_CRYPTO_RSA_PADDING_PSS
-    case VIRTIO_CRYPTO_RSA_PSS_PADDING:
-        ax->rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PSS;
-        break;
-#endif
-    case VIRTIO_CRYPTO_RSA_PKCS1_PADDING:
-    default:
-        ax->rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5;
-        break;
-    }
-    return 0;
+
+	switch (param->key_type) {
+	case VIRTIO_CRYPTO_AKCIPHER_KEY_TYPE_PUBLIC:
+		xform->rsa.key_type = RTE_RSA_KEY_TYPE_EXP;
+		ret = virtio_crypto_asym_rsa_public_der_to_xform(param->key_buf, param->key_len, xform);
+	break;
+	case VIRTIO_CRYPTO_AKCIPHER_KEY_TYPE_PRIVATE:
+		xform->rsa.key_type = RTE_RSA_KEY_TYPE_QT;
+		ret = virtio_crypto_asym_rsa_der_to_xform(param->key_buf, param->key_len, xform);
+	break;
+	default:
+		VC_LOG_ERR("Unknown rsa key type");
+		return -EINVAL;
+	}
+
+	if (ret < 0) {
+		VC_LOG_ERR("failed to parse rsa der");
+		return ret;
+	}
+
+	switch (param->u.rsa.padding_algo) {
+	case VIRTIO_CRYPTO_RSA_RAW_PADDING:
+		xform->rsa.padding.type = RTE_CRYPTO_RSA_PADDING_NONE;
+		break;
+	case VIRTIO_CRYPTO_RSA_PKCS1_PADDING:
+		xform->rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5;
+		break;
+	default:
+		VC_LOG_ERR("Unknown padding type");
+		return -EINVAL;
+	}
+
+	xform->xform_type = RTE_CRYPTO_ASYM_XFORM_RSA;
+	return 0;
 }
 
 static void
@@ -1304,6 +1377,12 @@ vhost_crypto_check_cipher_request(struct virtio_crypto_cipher_data_req *req)
 		(req->para.dst_data_len >= req->para.src_data_len) &&
 		(req->para.dst_data_len <= RTE_MBUF_DEFAULT_BUF_SIZE)))
 		return VIRTIO_CRYPTO_OK;
+
+	if (likely((req->para.iv_len <= VHOST_CRYPTO_MAX_IV_LEN) &&
+		(req->para.src_data_len <= 32768) &&
+		(req->para.dst_data_len >= req->para.src_data_len) &&
+		(req->para.dst_data_len <= 32768)))
+		return VIRTIO_CRYPTO_OK;
 	return VIRTIO_CRYPTO_BADMSG;
 }
 
@@ -1658,7 +1737,6 @@ prepare_asym_rsa_op(struct vhost_crypto *vcrypto, struct rte_crypto_op *op,
 	struct vhost_crypto_desc *desc = head;
 	uint8_t ret = VIRTIO_CRYPTO_ERR;
 	uint16_t wlen = 0;
-
 	/* prepare */
 	switch (vcrypto->option) {
 	case RTE_VHOST_CRYPTO_ZERO_COPY_DISABLE:
@@ -1944,7 +2022,8 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 			goto error_exit;
 		}
 
-		vc_req_out = rte_cryptodev_asym_session_get_user_data(asym_session);
+		// vc_req_out = rte_cryptodev_asym_session_get_user_data(asym_session);
+		vc_req_out = rte_crypto_op_ctod_offset(op, uint8_t *, IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
 		rte_memcpy(vc_req_out, vc_req, sizeof(struct vhost_crypto_data_req));
 		vc_req_out->wb = NULL;
 
@@ -1992,7 +2071,8 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
 		m_dst = op->sym->m_dst;
 		vc_req = rte_mbuf_to_priv(m_src);
 	} else if (op->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
-		vc_req = rte_cryptodev_asym_session_get_user_data(op->asym->session);
+		// vc_req = rte_cryptodev_asym_session_get_user_data(op->asym->session);
+		vc_req = rte_crypto_op_ctod_offset(op, uint8_t *, IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
 	} else {
 		VC_LOG_ERR("Invalid crypto op type");
 		return NULL;
@@ -2007,8 +2087,6 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
 
 	if (old_vq && (vq != old_vq))
 		return vq;
-	VC_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, op->status);
-	VC_LOG_ERR("%s %d %u", __FUNCTION__, __LINE__, vc_req->zero_copy);
 
 	if (unlikely(op->status != RTE_CRYPTO_OP_STATUS_SUCCESS))
 		vc_req->inhdr->status = VIRTIO_CRYPTO_ERR;
@@ -2020,7 +2098,6 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
 	desc_idx = vq->avail->ring[used_idx];
 	vq->used->ring[desc_idx].id = vq->avail->ring[desc_idx];
 	vq->used->ring[desc_idx].len = vc_req->len;
-	VC_LOG_ERR("%s %d %u %u", __FUNCTION__, __LINE__, desc_idx, used_idx);
 
 	if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
 		rte_mempool_put(m_src->pool, (void *)m_src);

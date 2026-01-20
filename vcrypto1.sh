@@ -7,7 +7,6 @@ WD_CIPHER_CTX_NUM="sync:2@2,async:4@2" \
 WD_DIGEST_CTX_NUM="sync:2@2,async:4@2" \
 bash -c '
 rm -f /tmp/vhost_crypto1.sock
-rm -f /tmp/vhost_crypto2.sock
-./build/examples/dpdk-vhost_crypto -l 1-3 -n 4 --file-prefix=dpdk1 --vdev "crypto_uadk" -- --socket-file 2,/tmp/vhost_crypto1.sock --socket-file 3,/tmp/vhost_crypto2.sock  --zero-copy
+./build/examples/dpdk-vhost_crypto -l 1-3 -n 4 --file-prefix=dpdk1 --vdev "crypto_uadk" -- --socket-file 2,/tmp/vhost_crypto1.sock  --zero-copy
 '
 
