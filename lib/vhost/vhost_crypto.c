@@ -22,6 +22,7 @@
 #include <rte_hash_crc.h>
 #include "vhost_crypto_snapshot.h"
 
+#include <rte_errno.h>
 #include <fcntl.h>    // for O_CREAT, O_WRONLY, O_TRUNC
 #include <unistd.h>   // for close()
 
@@ -60,6 +61,8 @@ RTE_LOG_REGISTER_SUFFIX(vhost_crypto_logtype, crypto, INFO);
 #else
 #define VC_LOG_DBG(...)
 #endif
+
+static void test_save_load_blob(int vid);
 
 #define VIRTIO_CRYPTO_FEATURES ((1ULL << VIRTIO_F_NOTIFY_ON_EMPTY) |	\
 		(1ULL << VIRTIO_RING_F_INDIRECT_DESC) |			\
@@ -2680,20 +2683,58 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
                       const struct vc_sym_meta_v1 *D,
                       const void *blob, uint32_t blob_len)
 {
+    /* 0) 将 D(快照里的 meta) 解释为 DPDK 可用的 enum：禁止直接强转 */
+    enum rte_crypto_cipher_algorithm dpdk_cipher_algo = 0;
+    enum rte_crypto_auth_algorithm   dpdk_auth_algo   = 0;
+
+    /* 你的工程里大概率已经有 virtio->dpdk 的映射函数；这里必须用它 */
+    if (cipher_algo_transform(D->algo_cipher, &dpdk_cipher_algo) < 0) {
+        VC_LOG_ERR("restore: unsupported cipher algo (virtio/id=%u) sid=%" PRIu64
+                   " key_len=%u iv_len=%u",
+                   (unsigned)D->algo_cipher, (uint64_t)sid,
+                   (unsigned)D->key_len, (unsigned)D->iv_len);
+        return NULL;
+    }
+
+    const bool need_auth = (D->algo_auth && D->tag_len);
+    if (need_auth) {
+        if (auth_algo_transform(D->algo_auth, &dpdk_auth_algo) < 0) {
+            VC_LOG_ERR("restore: unsupported auth algo (virtio/id=%u) sid=%" PRIu64
+                       " tag_len=%u",
+                       (unsigned)D->algo_auth, (uint64_t)sid,
+                       (unsigned)D->tag_len);
+            return NULL;
+        }
+    }
+
     /* 1) 从 blob 切分 key | auth_key（当前不保存会话级 IV 模板） */
     const uint8_t *p = (const uint8_t *)blob;
     const uint8_t *key = NULL, *auth_key = NULL;
     uint16_t key_len = D->key_len, auth_key_len = 0;
 
     if (key_len) {
-        if (blob_len < key_len)
+        if (blob_len < key_len) {
+            VC_LOG_ERR("restore: blob too small for cipher key sid=%" PRIu64
+                       " blob_len=%u key_len=%u",
+                       (uint64_t)sid, (unsigned)blob_len, (unsigned)key_len);
             return NULL;
+        }
         key = p;
         p += key_len;
     }
+
     if (blob_len > key_len) {
         auth_key_len = (uint16_t)(blob_len - key_len);
         auth_key = p;
+    }
+
+    /* 若 meta 表示需要 auth，但 blob 没带 auth_key，也直接判失败更清晰 */
+    if (need_auth && auth_key_len == 0) {
+        VC_LOG_ERR("restore: meta requires auth but no auth_key in blob sid=%" PRIu64
+                   " algo_auth=%u tag_len=%u blob_len=%u key_len=%u",
+                   (uint64_t)sid, (unsigned)D->algo_auth, (unsigned)D->tag_len,
+                   (unsigned)blob_len, (unsigned)key_len);
+        return NULL;
     }
 
     /* 2) 为 DPDK xform 准备“可写”密钥副本，避免 const-cast */
@@ -2702,47 +2743,79 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
 
     if (key_len) {
         cipher_key_copy = dup_bytes_dpdk(key, key_len);
-        if (!cipher_key_copy)
+        if (!cipher_key_copy) {
+            VC_LOG_ERR("restore: dup cipher key failed sid=%" PRIu64, (uint64_t)sid);
             return NULL;
+        }
     }
+
     if (auth_key_len) {
         auth_key_copy = dup_bytes_dpdk(auth_key, auth_key_len);
         if (!auth_key_copy) {
+            VC_LOG_ERR("restore: dup auth key failed sid=%" PRIu64, (uint64_t)sid);
             secure_free(cipher_key_copy, key_len);
             return NULL;
         }
     }
 
     /* 3) 构造 xform：若存在 auth，则 AUTH->CIPHER 链式，否则纯 CIPHER */
-    struct rte_crypto_sym_xform xform1; memset(&xform1, 0, sizeof(xform1));
-    struct rte_crypto_sym_xform xform2; memset(&xform2, 0, sizeof(xform2));
+    struct rte_crypto_sym_xform xform1;
+    struct rte_crypto_sym_xform xform2;
+    memset(&xform1, 0, sizeof(xform1));
+    memset(&xform2, 0, sizeof(xform2));
     struct rte_crypto_sym_xform *head = NULL;
 
-    if (D->algo_auth && D->tag_len && auth_key_len) {
+    if (need_auth && auth_key_len) {
         xform2.type                 = RTE_CRYPTO_SYM_XFORM_AUTH;
         xform2.next                 = &xform1;
-        xform2.auth.algo            = (enum rte_crypto_auth_algorithm)D->algo_auth;
-        xform2.auth.op              = RTE_CRYPTO_AUTH_OP_GENERATE; /* 生成 tag 的常见方向 */
+
+        /* 关键：使用映射后的 DPDK enum，而不是 (enum) 强转 */
+        xform2.auth.algo            = dpdk_auth_algo;
+
+        /*
+         * 注意：这里仍然是你原来的默认方向。严格来说应该跟 D 的 op 对齐；
+         * 先把 enum 映射修对，迁移先跑通；之后再补 op 的精确恢复。
+         */
+        xform2.auth.op              = RTE_CRYPTO_AUTH_OP_GENERATE;
         xform2.auth.digest_length   = D->tag_len;
-        xform2.auth.key.data        = auth_key_copy;               /* 可写副本 */
+        xform2.auth.key.data        = auth_key_copy;
         xform2.auth.key.length      = auth_key_len;
         head = &xform2;
     }
 
     xform1.type                    = RTE_CRYPTO_SYM_XFORM_CIPHER;
     xform1.next                    = NULL;
-    xform1.cipher.algo             = (enum rte_crypto_cipher_algorithm)D->algo_cipher;
-    xform1.cipher.op               = RTE_CRYPTO_CIPHER_OP_ENCRYPT; /* 与 D->op 对应时可再做映射 */
+
+    /* 关键：使用映射后的 DPDK enum，而不是 (enum) 强转 */
+    xform1.cipher.algo             = dpdk_cipher_algo;
+
+    /*
+     * 同上：严格应与 D 的 op 对齐（encrypt/decrypt）。先保留你原来的默认。
+     */
+    xform1.cipher.op               = RTE_CRYPTO_CIPHER_OP_ENCRYPT;
     xform1.cipher.iv.length        = D->iv_len;
-    xform1.cipher.key.data         = cipher_key_copy;              /* 可写副本 */
+    xform1.cipher.key.data         = cipher_key_copy;
     xform1.cipher.key.length       = key_len;
 
-    if (!head) head = &xform1;
+    if (!head) {
+        head = &xform1;
+    }
 
     /* 4) 创建 cryptodev 会话 */
     struct rte_cryptodev_sym_session *sess =
         rte_cryptodev_sym_session_create(vcrypto->cid, head, vcrypto->sess_pool);
+
     if (!sess) {
+        /* 打印 errno 会更好定位（不同 PMD 会给出不同错误） */
+        VC_LOG_ERR("restore: rte_cryptodev_sym_session_create failed sid=%" PRIu64
+                   " cipher(virtio=%u->dpdk=%d) auth(virtio=%u->dpdk=%d need_auth=%d)"
+                   " key_len=%u iv_len=%u tag_len=%u auth_key_len=%u rte_errno=%d",
+                   (uint64_t)sid,
+                   (unsigned)D->algo_cipher, (int)dpdk_cipher_algo,
+                   (unsigned)D->algo_auth,   (int)dpdk_auth_algo, (int)need_auth,
+                   (unsigned)key_len, (unsigned)D->iv_len, (unsigned)D->tag_len,
+                   (unsigned)auth_key_len, rte_errno);
+
         secure_free(cipher_key_copy, key_len);
         secure_free(auth_key_copy,   auth_key_len);
         return NULL;
@@ -2755,6 +2828,7 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
     /* 5) 分配 vhost 会话并回填 meta（供后续 save 复原） */
     struct vhost_crypto_session *vs = rte_zmalloc(NULL, sizeof(*vs), 0);
     if (!vs) {
+        VC_LOG_ERR("restore: alloc vhost_crypto_session failed sid=%" PRIu64, (uint64_t)sid);
         rte_cryptodev_sym_session_free(vcrypto->cid, sess);
         return NULL;
     }
@@ -2770,6 +2844,8 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
     if (blob_len) {
         vs->meta.sym.b.blob = rte_zmalloc(NULL, blob_len, 0);
         if (!vs->meta.sym.b.blob) {
+            VC_LOG_ERR("restore: alloc meta blob failed sid=%" PRIu64 " blob_len=%u",
+                       (uint64_t)sid, (unsigned)blob_len);
             rte_cryptodev_sym_session_free(vcrypto->cid, sess);
             rte_free(vs);
             return NULL;
