@@ -2678,6 +2678,21 @@ vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_
     return (int)((uintptr_t)p - (uintptr_t)buf);
 }
 
+static int read_full(int fd, void *buf, size_t len)
+{
+    uint8_t *p = (uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        if (n == 0) return -EIO;   /* EOF before we got enough */
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
 
 
 static int write_full(int fd, const void *buf, size_t len)
@@ -3041,24 +3056,11 @@ int vhost_crypto_load_state(int vid, int fd)
     }
 
     struct vc_snap_hdr hdr;
-    ssize_t rn = read(fd, &hdr, sizeof(hdr));
-
-    if (rn <= 0) {
-        fprintf(stderr, "[load_state] failed to read header (%zd bytes)\n", rn);
-        return -EIO;
-    }
-
-    /* Always dump whatever we got for debugging */
-    fprintf(stderr, "[load_state] header bytes (rn=%zd):\n", rn);
-    dump_hex(&hdr, rn);
-
-    /* For real parsing, header must be complete */
-    if (rn != (ssize_t)sizeof(hdr)) {
-        fprintf(stderr,
-                "[load_state] short header, expect=%zu got=%zd\n",
-                sizeof(hdr), rn);
-        return -EIO;
-    }
+	int rc = read_full(fd, &hdr, sizeof(hdr));
+	if (rc) {
+		fprintf(stderr, "[load_state] failed to read header (%d)\n", rc);
+		return rc;
+	}
 
     /* Now interpret the header */
     if (FROMLE32(hdr.magic) != VC_SNAP_MAGIC) {
@@ -3083,22 +3085,27 @@ int vhost_crypto_load_state(int vid, int fd)
 
     /* rest = (header-extension) + payload(TLVs) */
     size_t rest = (size_t)hdr_len - sizeof(hdr) + (size_t)pay_len;
-    uint8_t *buf = rte_zmalloc(NULL, rest, 0);
+    
+	/* size cap: must match/save-side cap_max (or choose your own) */
+	const size_t rest_max = 32 * 1024 * 1024;  /* 32MB */
+	if (rest == 0 || rest > rest_max) {
+		fprintf(stderr, "[load_state] invalid rest size: %zu (hdr_len=%u pay_len=%u)\n",
+				rest, hdr_len, pay_len);
+		return -EINVAL;
+	}
+	
+	uint8_t *buf = rte_zmalloc(NULL, rest, 0);
     if (!buf) {
         fprintf(stderr, "[load_state] malloc failed, size=%zu\n", rest);
         return -ENOMEM;
     }
 
-    size_t off = 0;
-    while (off < rest) {
-        rn = read(fd, buf + off, rest - off);
-        if (rn <= 0) {
-            fprintf(stderr, "[load_state] failed to read payload (%zd)\n", rn);
-            rte_free(buf);
-            return -EIO;
-        }
-        off += (size_t)rn;
-    }
+    rc = read_full(fd, buf, rest);
+	if (rc) {
+		fprintf(stderr, "[load_state] failed to read payload (%d)\n", rc);
+		rte_free(buf);
+		return rc;
+	}
 
     fprintf(stderr, "[load_state] full TLV region (hex), size=%zu:\n", rest);
     dump_hex(buf, rest);
@@ -3225,15 +3232,24 @@ int vhost_crypto_load_state(int vid, int fd)
                 return -EINVAL;
             }
 
-            rte_hash_del_key(vcrypto->session_map, &sid);
-            if (rte_hash_add_key_data(vcrypto->session_map, &sid, vs) < 0) {
-                fprintf(stderr,
-                        "[load_state] session_map add failed for sid=%lu\n",
-                        sid);
-                /* TODO: free vs on failure if needed */
-                rte_free(buf);
-                return -ENOMEM;
-            }
+            int drc = rte_hash_del_key(vcrypto->session_map, &sid);
+	if (drc < 0 && drc != -ENOENT) {
+		fprintf(stderr,
+				"[load_state] session_map del failed sid=%lu rc=%d\n",
+				sid, drc);
+		/* TODO: destroy/free vs if needed */
+		rte_free(buf);
+		return drc; /* keep真实错误码，别吞 */
+	}
+	int arc = rte_hash_add_key_data(vcrypto->session_map, &sid, vs);
+	if (arc < 0) {
+		fprintf(stderr,
+				"[load_state] session_map add failed sid=%lu rc=%d\n",
+				sid, arc);
+		/* TODO: destroy/free vs if needed */
+		rte_free(buf);
+		return arc; /* keep真实错误码，便于定位 */
+	}
 
         } else {
             fprintf(stderr,
