@@ -979,14 +979,30 @@ vhost_user_set_vring_addr(struct virtio_net **pdev,
 {
 	struct virtio_net *dev = *pdev;
 	struct vhost_virtqueue *vq;
+	uint32_t idx;
 	struct vhost_vring_addr *addr = &ctx->msg.payload.addr;
 	bool access_ok;
 
 	if (dev->mem == NULL)
 		return RTE_VHOST_MSG_RESULT_ERR;
 
-	/* addr->index refers to the queue index. The txq 1, rxq is 0. */
-	vq = dev->virtqueue[ctx->msg.payload.addr.index];
+	idx = addr->index;
+    if (idx >= dev->nr_vring) {
+        VHOST_CONFIG_LOG(dev->ifname, ERR,
+            "SET_VRING_ADDR invalid index=%u (nr_vring=%u)",
+            idx, dev->nr_vring);
+        return RTE_VHOST_MSG_RESULT_ERR;
+    }
+
+    vq = dev->virtqueue[idx];
+    if (vq == NULL) {
+        VHOST_CONFIG_LOG(dev->ifname, ERR,
+            "SET_VRING_ADDR vq is NULL (index=%u, nr_vring=%u)",
+            idx, dev->nr_vring);
+        return RTE_VHOST_MSG_RESULT_ERR;
+    }
+
+ 
 
 	/*
 	 * Rings addresses should not be interpreted as long as the ring is not
@@ -1049,11 +1065,6 @@ vhost_user_set_vring_base(struct virtio_net **pdev,
 	}
 
 	VHOST_CONFIG_LOG(dev->ifname, INFO,
-		"vring base idx:%u last_used_idx:%u last_avail_idx:%u.",
-		ctx->msg.payload.state.index, vq->last_used_idx, vq->last_avail_idx);
-
-		
-	VHOST_CONFIG_LOG(dev->ifname, ERR,
 		"vring base idx:%u last_used_idx:%u last_avail_idx:%u.",
 		ctx->msg.payload.state.index, vq->last_used_idx, vq->last_avail_idx);
 

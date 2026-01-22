@@ -1019,13 +1019,51 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 
 	case VHOST_USER_CRYPTO_SAVE: {
 		int fd = (ctx->fd_num > 0) ? ctx->fds[0] : -1;
-		if (fd < 0) { ret = RTE_VHOST_MSG_RESULT_ERR; break; }
-		int rc = vhost_crypto_save_state(vid, fd);
-		close(fd);
+		ctx->fds[0] = -1;
 		ctx->fd_num = 0;
+
+		if (fd < 0) {
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* 关键：SAVE 必须在 freeze 之后进行，否则导出状态不一致 */
+		struct virtio_net *dev = get_device(vid);
+		struct vhost_crypto *vcrypto = dev ? dev->extern_data : NULL;
+		if (!dev || !vcrypto) {
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		if (__atomic_load_n(&vcrypto->frozen, __ATOMIC_ACQUIRE) == 0) {
+			VC_LOG_ERR("SAVE called without FREEZE (vid=%d)", vid);
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* 保险：哪怕 freeze 已经做过，也再确认一下 quiescent */
+		if (__atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE) != 0) {
+			VC_LOG_ERR("SAVE while inflight!=0 (vid=%d inflight=%u)",
+					vid, __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE));
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		int rc = vhost_crypto_save_state(vid, fd);
+
+		/* 建议：写完后 flush 一下，减少目的端读到半截的概率 */
+		if (rc == 0) {
+			(void)fsync(fd);
+		}
+
+		close(fd);
 		ret = (rc == 0) ? RTE_VHOST_MSG_RESULT_OK : RTE_VHOST_MSG_RESULT_ERR;
 		break;
 	}
+
 
 	case VHOST_USER_CRYPTO_LOAD: {
 		int fd = (ctx->fd_num > 0) ? ctx->fds[0] : -1;
@@ -2521,8 +2559,7 @@ int vhost_crypto_freeze(int vid) {
         uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
         if (cur == 0) {
             VC_LOG_INFO("FREEZE ok; inflight=0");
-			test_save_load_blob(vid);
-            return 0;
+		    break; /* quiescent state reached */
         }
 
         /* 打印进度日志（只在 inflight 变化时输出） */
@@ -2540,6 +2577,8 @@ int vhost_crypto_freeze(int vid) {
         /* 小延迟防止忙等 */
         rte_delay_us_block(10);
     }
+
+	return 0;
 }
 
 static void dump_hex(const void *buf, size_t len) {
@@ -2641,15 +2680,27 @@ vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_
 
 
 
-/* 对外入口：消息层会调用它。签名不变。 */
+static int write_full(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        if (n == 0) return -EIO;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
 int vhost_crypto_save_state(int vid, int fd)
 {
-    /* 用你工程里的设备查找函数把 vid → vcrypto
-       名字可能是 vc_lookup(vid) / vhost_crypto_from_vid(vid)……按你项目替换 */
     struct vhost_crypto *vcrypto = vc_lookup(vid);
     if (!vcrypto) return -ENOENT;
 
-    /* 从 256KB 起步，不够就翻倍重试，最多 32MB（可按需调整） */
     size_t cap = 256 * 1024;
     const size_t cap_max = 32 * 1024 * 1024;
     void *buf = NULL;
@@ -2663,7 +2714,7 @@ int vhost_crypto_save_state(int vid, int fd)
         nbytes = vhost_crypto_save_state_mem(vcrypto, buf, cap);
         if (nbytes == -ENOSPC) {
             if (cap >= cap_max) { rte_free(buf); return -ENOSPC; }
-            cap <<= 1;   /* 扩容重试 */
+            cap <<= 1;
             continue;
         }
         break;
@@ -2671,11 +2722,9 @@ int vhost_crypto_save_state(int vid, int fd)
 
     if (nbytes < 0) { rte_free(buf); return nbytes; }
 
-    /* 一次性写到 fd */
-    ssize_t wn = write(fd, buf, (size_t)nbytes);
+    int rc = write_full(fd, buf, (size_t)nbytes);
     rte_free(buf);
-    if (wn != nbytes) return -EIO;
-    return 0;
+    return rc;
 }
 
 static struct vhost_crypto_session*
@@ -3208,5 +3257,3 @@ int vhost_crypto_thaw(int vid) {
     vcrypto->frozen = 0;
     return 0;
 }
-
-
