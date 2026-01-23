@@ -2696,10 +2696,16 @@ vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_
         memcpy(p, &sh, sizeof(sh)); p += sizeof(sh);
         if (s->meta.kind == VC_SESS_SYM) {
             memcpy(p, &s->meta.sym.desc, desc_len); p += desc_len;
-            if (blob_len) memcpy(p, s->meta.sym.b.blob, blob_len); p += blob_len;
+            if (blob_len) {
+				memcpy(p, s->meta.sym.b.blob, blob_len);
+			}
+			p += blob_len;
         } else {
             memcpy(p, &s->meta.asym.desc, desc_len); p += desc_len;
-            if (blob_len) memcpy(p, s->meta.asym.b.blob, blob_len); p += blob_len;
+            if (blob_len) {
+				memcpy(p, s->meta.asym.b.blob, blob_len);
+			}
+			p += blob_len;
         }
 
         fprintf(stderr, "[save_state] SESSION: sid=%lu kind=%u desc_len=%u blob_len=%u total=%u\n",
@@ -2815,7 +2821,7 @@ vc_session_destroy(struct vhost_crypto *vcrypto, struct vhost_crypto_session *vs
     }
 
     /* 3) free container */
-    rte_free(vs);d
+    rte_free(vs);
 }
 
 
