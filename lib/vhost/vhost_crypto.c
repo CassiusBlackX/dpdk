@@ -1897,12 +1897,6 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 	vc_req->dev = vcrypto->dev;          /* IOVA_TO_VVA 等还会用到 */
     vc_req->vq  = vq;
 
-	    /* 冻结：直接走统一错误出口写回 ERR，不入队、不改 inflight */
-    if (__atomic_load_n(&vcrypto->frozen, __ATOMIC_ACQUIRE)) {
-        VC_LOG_DBG("frozen, reject new request");
-        err = VIRTIO_CRYPTO_ERR;
-        goto error_exit;
-    }
 
 	if (unlikely((head->flags & VRING_DESC_F_INDIRECT) == 0)) {
         VC_LOG_ERR("Invalid descriptor");
@@ -2403,6 +2397,10 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 		VC_LOG_ERR("Cannot find required data, is it initialized?");
 		return 0;
 	}
+	/* ✅ FREEZE 语义：冻结时不抓取新 descriptor（纯 backpressure，不改 vring 索引） */
+	if (unlikely(__atomic_load_n(&vcrypto->frozen, __ATOMIC_ACQUIRE))) {
+		return 0;
+	}
 
 	vq = dev->virtqueue[qid];
 
@@ -2538,6 +2536,46 @@ rte_vhost_crypto_finalize_requests(struct rte_crypto_op **ops,
 	return nb_ops - left;
 }
 
+/* --- inflight accounting helpers (called by the worker) --- */
+void vhost_crypto_inflight_add(int vid, uint32_t n)
+{
+    if (n == 0) {
+        return;
+    }
+
+    struct virtio_net *dev = get_device(vid);
+    if (!dev || !dev->extern_data) {
+        return;
+    }
+
+    struct vhost_crypto *vcrypto = dev->extern_data;
+    __atomic_fetch_add(&vcrypto->inflight, n, __ATOMIC_ACQ_REL);
+}
+
+void vhost_crypto_inflight_sub(int vid, uint32_t n)
+{
+    if (n == 0) {
+        return;
+    }
+
+    struct virtio_net *dev = get_device(vid);
+    if (!dev || !dev->extern_data) {
+        return;
+    }
+
+    struct vhost_crypto *vcrypto = dev->extern_data;
+
+    /* clamp-to-zero to avoid underflow if counters ever get skewed */
+    uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
+    while (1) {
+        uint32_t next = (cur > n) ? (cur - n) : 0;
+        if (__atomic_compare_exchange_n(&vcrypto->inflight, &cur, next,
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            break;
+        }
+        /* cur is updated by compare_exchange on failure */
+    }
+}
 
 
 int vhost_crypto_freeze(int vid) {
@@ -2570,9 +2608,10 @@ int vhost_crypto_freeze(int vid) {
 
         /* 超时退出 */
         if (rte_get_timer_cycles() > deadline) {
-            VC_LOG_ERR("FREEZE timeout; inflight still=%u", cur);
-            return -EBUSY;
-        }
+			VC_LOG_ERR("FREEZE timeout; inflight still=%u", cur);
+			__atomic_store_n(&vcrypto->frozen, 0, __ATOMIC_RELEASE); /* 回滚服务 */
+			return -EBUSY;
+		}
 
         /* 小延迟防止忙等 */
         rte_delay_us_block(10);
@@ -2606,6 +2645,7 @@ vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_
 
     // ---- DEV_META ----
     struct vc_dev_meta_v1 meta = {
+		.cid= vcrypto->cid,          /* for validation/debug */
         .last_session_id = vcrypto->last_session_id,
     };
     if (end - p < (ptrdiff_t)(sizeof(struct vc_tlv) + sizeof(meta))) return -ENOSPC;
@@ -2741,6 +2781,43 @@ int vhost_crypto_save_state(int vid, int fd)
     rte_free(buf);
     return rc;
 }
+
+static inline void
+vc_session_destroy(struct vhost_crypto *vcrypto, struct vhost_crypto_session *vs)
+{
+    if (!vs) return;
+
+    /* 1) free meta blob (wiping) */
+    if (vs->meta.valid) {
+        if (vs->meta.kind == VC_SESS_SYM) {
+            secure_free(vs->meta.sym.b.blob, vs->meta.sym.b.blob_len);
+            vs->meta.sym.b.blob = NULL;
+            vs->meta.sym.b.blob_len = 0;
+        } else if (vs->meta.kind == VC_SESS_ASYM) {
+            secure_free(vs->meta.asym.b.blob, vs->meta.asym.b.blob_len);
+            vs->meta.asym.b.blob = NULL;
+            vs->meta.asym.b.blob_len = 0;
+        }
+        vs->meta.valid = false;
+    }
+
+    /* 2) free dpdk session */
+    if (vs->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+        if (vs->sym) {
+            rte_cryptodev_sym_session_free(vcrypto->cid, vs->sym);
+            vs->sym = NULL;
+        }
+    } else if (vs->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+        if (vs->asym) {
+            rte_cryptodev_asym_session_free(vcrypto->cid, vs->asym);
+            vs->asym = NULL;
+        }
+    }
+
+    /* 3) free container */
+    rte_free(vs);d
+}
+
 
 static struct vhost_crypto_session*
 vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
@@ -3046,7 +3123,6 @@ vc_session_create_asym(struct vhost_crypto *vcrypto, uint64_t sid,
 
 
 /* Load: read header + payload from fd and rebuild backend state */
-/* Load: read header + payload from fd and rebuild backend state */
 int vhost_crypto_load_state(int vid, int fd)
 {
     struct vhost_crypto *vcrypto = vc_lookup(vid);
@@ -3144,14 +3220,29 @@ int vhost_crypto_load_state(int vid, int fd)
                 return -EINVAL;
             }
 
-            const struct vc_dev_meta_v1 *m =
-                (const struct vc_dev_meta_v1 *)q;
-            vcrypto->cid             = m->cid;
-            vcrypto->last_session_id = m->last_session_id;
+            const struct vc_dev_meta_v1 *m = (const struct vc_dev_meta_v1 *)q;
 
-            fprintf(stderr,
-                    "[load_state] DEV_META: cid=%u, last_sid=%lu\n",
-                    m->cid, m->last_session_id);
+			uint32_t snap_cid  = FROMLE32(m->cid);
+			uint64_t snap_last = FROMLE64(m->last_session_id);
+
+			if (snap_cid != vcrypto->cid) {
+				fprintf(stderr,
+						"[load_state] WARN: snapshot cid=%u != local cid=%u (keep local)\n",
+						snap_cid, vcrypto->cid);
+			}
+
+			vcrypto->last_session_id = snap_last;
+
+			fprintf(stderr,
+					"[load_state] DEV_META: snapshot_cid=%u, local_cid=%u, last_sid=%lu\n",
+					snap_cid, vcrypto->cid, (unsigned long)snap_last);
+
+
+			vcrypto->last_session_id = m->last_session_id;
+
+			fprintf(stderr,
+					"[load_state] DEV_META: snapshot_cid=%u, local_cid=%u, last_sid=%lu\n",
+					m->cid, vcrypto->cid, m->last_session_id);
 
         } else if (t == VC_TLV_SESSION) {
 
@@ -3233,23 +3324,30 @@ int vhost_crypto_load_state(int vid, int fd)
             }
 
             int drc = rte_hash_del_key(vcrypto->session_map, &sid);
-	if (drc < 0 && drc != -ENOENT) {
-		fprintf(stderr,
-				"[load_state] session_map del failed sid=%lu rc=%d\n",
-				sid, drc);
-		/* TODO: destroy/free vs if needed */
-		rte_free(buf);
-		return drc; /* keep真实错误码，别吞 */
-	}
-	int arc = rte_hash_add_key_data(vcrypto->session_map, &sid, vs);
-	if (arc < 0) {
-		fprintf(stderr,
-				"[load_state] session_map add failed sid=%lu rc=%d\n",
-				sid, arc);
-		/* TODO: destroy/free vs if needed */
-		rte_free(buf);
-		return arc; /* keep真实错误码，便于定位 */
-	}
+			if (drc < 0 && drc != -ENOENT) {
+				fprintf(stderr,
+						"[load_state] session_map del failed sid=%lu rc=%d\n",
+						sid, drc);
+
+				/* ✅ avoid leaking the just-created session */
+				vc_session_destroy(vcrypto, vs);
+
+				rte_free(buf);
+				return drc; /* keep real errno */
+			}
+
+			int arc = rte_hash_add_key_data(vcrypto->session_map, &sid, vs);
+			if (arc < 0) {
+				fprintf(stderr,
+						"[load_state] session_map add failed sid=%lu rc=%d\n",
+						sid, arc);
+
+				/* ✅ avoid leaking the just-created session */
+				vc_session_destroy(vcrypto, vs);
+
+				rte_free(buf);
+				return arc; /* keep real errno */
+			}
 
         } else {
             fprintf(stderr,
@@ -3266,10 +3364,12 @@ int vhost_crypto_load_state(int vid, int fd)
 
 
 /* Thaw: resume processing */
-int vhost_crypto_thaw(int vid) {
+int vhost_crypto_thaw(int vid)
+{
     struct virtio_net *dev = get_device(vid);
     if (!dev || !dev->extern_data) return -ENOENT;
     struct vhost_crypto *vcrypto = dev->extern_data;
-    vcrypto->frozen = 0;
+
+    __atomic_store_n(&vcrypto->frozen, 0, __ATOMIC_RELEASE);
     return 0;
 }

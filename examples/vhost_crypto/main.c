@@ -34,6 +34,9 @@
 #define MAX_NB_SOCKETS			(4)
 #define MAX_NB_WORKER_CORES		(16)
 
+extern void vhost_crypto_inflight_add(int vid, uint32_t n);
+extern void vhost_crypto_inflight_sub(int vid, uint32_t n);
+
 struct lcore_option {
 	uint32_t lcore_id;
 	char *socket_files[MAX_NB_SOCKETS];
@@ -428,79 +431,71 @@ vhost_crypto_worker(void *arg)
     }
 
     while (1) {
-        for (i = 0; i < info->nb_vids; i++) {
-            if (unlikely(info->initialized[i] == 0))
-                continue;
+        for (j = 0; j < NB_VIRTIO_QUEUES; j++) {
 
-            for (j = 0; j < NB_VIRTIO_QUEUES; j++) {
-                /* 0) 当前在途容量：避免无符号下溢 */
-                uint32_t room = (info->nb_inflight_ops >= NB_CRYPTO_DESCRIPTORS)
-                                ? 0u
-                                : (NB_CRYPTO_DESCRIPTORS - info->nb_inflight_ops);
-                to_fetch = RTE_MIN(burst_size, room);
-                if (to_fetch == 0)
-                    continue;
+			/* A) 尽量 fetch + enqueue（但失败/为 0 不能阻止后面的 drain） */
+			uint32_t room = (info->nb_inflight_ops >= NB_CRYPTO_DESCRIPTORS)
+							? 0u
+							: (NB_CRYPTO_DESCRIPTORS - info->nb_inflight_ops);
+			to_fetch = RTE_MIN(burst_size, room);
 
-                /* 1) fetch：只抓活，不计 inflight */
-                uint16_t fetched = rte_vhost_crypto_fetch_requests(  // ← 用内层 uint16_t，不再遮蔽
-                        info->vids[i], j, ops[j], (uint16_t)to_fetch);
-                if (unlikely(fetched == 0))
-                    continue;
+			if (to_fetch != 0) {
+				uint16_t fetched = rte_vhost_crypto_fetch_requests(
+						info->vids[i], j, ops[j], (uint16_t)to_fetch);
 
-                /* 2) enqueue：仅以 enq 计“真正在途” */
-                uint16_t enq = rte_cryptodev_enqueue_burst(info->cid, info->qid, ops[j], fetched);
-                info->nb_inflight_ops += enq;
+				if (likely(fetched != 0)) {
+					uint16_t enq = rte_cryptodev_enqueue_burst(
+							info->cid, info->qid, ops[j], fetched);
 
-                /* 节流打印：100ms 一次 */
-                static __thread uint64_t last_log_tsc;
-                uint64_t now_tsc = rte_rdtsc();
-                if (enq && now_tsc - last_log_tsc > rte_get_tsc_hz() / 10) {
-                    RTE_LOG(INFO, USER1, "[Lcore %u] inflight += %u → %u\n",
-                            lcore_id, enq, info->nb_inflight_ops);
-                    last_log_tsc = now_tsc;
-                }
+					info->nb_inflight_ops += enq;
 
-                /* 未入队的尾巴直接回收 */
-                if (enq < fetched) {
-                    for (uint16_t k2 = enq; k2 < fetched; k2++)
-                        rte_crypto_op_free(ops[j][k2]);
-                }
+					/* enq < fetched：把没入硬件队列的 op 释放掉 */
+					if (enq < fetched) {
+						for (uint16_t k2 = enq; k2 < fetched; k2++) {
+							rte_crypto_op_free(ops[j][k2]);
+						}
+					}
 
-                /* 3) 只为 enq 个已入队的 op 做补充分配 */
-                if (enq) {
-                    if (unlikely(rte_crypto_op_bulk_alloc(info->cop_pool, cop_type, ops[j], enq) < enq)) {
-                        RTE_LOG(ERR, USER1, "Failed realloc\n");
-                        ret = -1;
-                        goto exit;
-                    }
-                }
+					/* 补回被 enqueue 消耗掉的 op，供下一轮 fetch 使用 */
+					if (enq) {
+						rte_crypto_op_bulk_alloc(info->cop_pool, cop_type, ops[j], enq);
+					}
+				}
+				/* 注意：fetched==0 这里不再 continue，让后面 drain 仍能执行 */
+			}
 
-                /* 4) dequeue + finalize：按完成数 deq 回落在途 */
-                uint16_t deq = rte_cryptodev_dequeue_burst(
-                        info->cid, info->qid, ops_deq[j],
-                        RTE_MIN(burst_size, (uint32_t)info->nb_inflight_ops)); // ← 强转，避免隐式宽窄
+			/* B) dequeue + finalize（关键：不依赖 fetched/to_fetch，FREEZE 后也必须继续清在途） */
+			if (info->nb_inflight_ops) {
+				uint16_t want = RTE_MIN(burst_size, (uint32_t)info->nb_inflight_ops);
+				uint16_t deq = rte_cryptodev_dequeue_burst(
+						info->cid, info->qid, ops_deq[j], want);
 
-                nb_callfds = 0;
-                deq = rte_vhost_crypto_finalize_requests(ops_deq[j], deq, callfds, &nb_callfds);
+				nb_callfds = 0;
+				deq = rte_vhost_crypto_finalize_requests(
+						ops_deq[j], deq, callfds, &nb_callfds);
 
-                info->nb_inflight_ops -= deq;
+				info->nb_inflight_ops -= deq;
 
-                if (deq && now_tsc - last_log_tsc > rte_get_tsc_hz() / 10) {
-                    RTE_LOG(INFO, USER1, "[Lcore %u] inflight -= %u → %u\n",
-                            lcore_id, deq, info->nb_inflight_ops);
-                    last_log_tsc = now_tsc;
-                }
+				/* 你原来的 inflight 日志如果在这里打印最合理 */
+				/* 例如按时间节流打印 */
+				uint64_t now_tsc = rte_rdtsc();
+				static uint64_t last_log_tsc;
+				if (deq && (now_tsc - last_log_tsc > rte_get_tsc_hz() / 10)) {
+					RTE_LOG(INFO, USER1, "[Lcore %u] inflight -= %u → %u\n",
+							lcore_id, deq, info->nb_inflight_ops);
+					last_log_tsc = now_tsc;
+				}
 
-                if (!options.guest_polling) {
-                    for (k = 0; k < nb_callfds; k++)
-                        eventfd_write(callfds[k], (eventfd_t)1);
-                }
+				if (!options.guest_polling) {
+					for (k = 0; k < nb_callfds; k++)
+						eventfd_write(callfds[k], (eventfd_t)1);
+				}
 
-                if (deq) {
-                    rte_mempool_put_bulk(info->cop_pool, (void **)ops_deq[j], deq);
-                }
-            }
-        }
+				if (deq) {
+					rte_mempool_put_bulk(info->cop_pool, (void **)ops_deq[j], deq);
+				}
+			}
+		}
     }
 
 exit:
