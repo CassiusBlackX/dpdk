@@ -387,6 +387,7 @@ destroy_device(int vid)
 	} while (info->nb_inflight_ops);
 
 	info->initialized[j] = 0;
+	info->vids[j] = -1;
 
 	rte_wmb();
 
@@ -405,102 +406,124 @@ vhost_crypto_worker(void *arg)
 {
     struct rte_crypto_op *ops[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
     struct rte_crypto_op *ops_deq[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
+
     struct vhost_crypto_info *info = arg;
+
+    /* per (socket, vq) inflight counters (do NOT mix different vids) */
+    uint32_t nb_inflight_ops[MAX_NB_SOCKETS][NB_VIRTIO_QUEUES] = {0};
+
     uint16_t nb_callfds;
     int callfds[VIRTIO_CRYPTO_MAX_NUM_BURST_VQS];
-    uint32_t lcore_id = rte_lcore_id();
-    uint32_t burst_size = MAX_PKT_BURST;
-    enum rte_crypto_op_type cop_type;
-    uint32_t i, j, k;
-    uint32_t to_fetch;              // ← 保留 to_fetch
-    // uint32_t fetched;            // ← 删掉外层 fetched，避免遮蔽
+
+    const uint32_t lcore_id = rte_lcore_id();
+    const uint32_t burst_size = MAX_PKT_BURST;
+
+    enum rte_crypto_op_type cop_type =
+        options.asymmetric_crypto ? RTE_CRYPTO_OP_TYPE_ASYMMETRIC
+                                  : RTE_CRYPTO_OP_TYPE_SYMMETRIC;
 
     int ret = 0;
 
     RTE_LOG(INFO, USER1, "Processing on Core %u started\n", lcore_id);
 
-    cop_type = options.asymmetric_crypto ? RTE_CRYPTO_OP_TYPE_ASYMMETRIC
-                                         : RTE_CRYPTO_OP_TYPE_SYMMETRIC;
-
-    for (i = 0; i < NB_VIRTIO_QUEUES; i++) {
-        if (rte_crypto_op_bulk_alloc(info->cop_pool, cop_type, ops[i], burst_size) < burst_size) {
-            RTE_LOG(ERR, USER1, "Failed to alloc cops\n");
-            ret = -1;
-            goto exit;
+    /* allocate a batch of ops for each vq */
+    for (uint32_t vq = 0; vq < NB_VIRTIO_QUEUES; vq++) {
+        if (rte_crypto_op_bulk_alloc(info->cop_pool, cop_type,
+                                     ops[vq], burst_size) < burst_size) {
+            RTE_LOG(ERR, USER1, "Failed to alloc crypto ops\n");
+            return -ENOMEM;
         }
     }
 
     while (1) {
-        for (j = 0; j < NB_VIRTIO_QUEUES; j++) {
 
-			/* A) 尽量 fetch + enqueue（但失败/为 0 不能阻止后面的 drain） */
-			uint32_t room = (info->nb_inflight_ops >= NB_CRYPTO_DESCRIPTORS)
-							? 0u
-							: (NB_CRYPTO_DESCRIPTORS - info->nb_inflight_ops);
-			to_fetch = RTE_MIN(burst_size, room);
+        /* iterate all possible sockets; only handle initialized ones */
+        for (uint32_t sock = 0; sock < MAX_NB_SOCKETS; sock++) {
 
-			if (to_fetch != 0) {
-				uint16_t fetched = rte_vhost_crypto_fetch_requests(
-						info->vids[i], j, ops[j], (uint16_t)to_fetch);
+            if (unlikely(info->initialized[sock] == 0)) {
+                continue;
+            }
 
-				if (likely(fetched != 0)) {
-					uint16_t enq = rte_cryptodev_enqueue_burst(
-							info->cid, info->qid, ops[j], fetched);
+            int vid = info->vids[sock];
+            if (unlikely(vid < 0)) {
+                continue;
+            }
 
-					info->nb_inflight_ops += enq;
+            for (uint32_t vq = 0; vq < NB_VIRTIO_QUEUES; vq++) {
 
-					/* enq < fetched：把没入硬件队列的 op 释放掉 */
-					if (enq < fetched) {
-						for (uint16_t k2 = enq; k2 < fetched; k2++) {
-							rte_crypto_op_free(ops[j][k2]);
-						}
-					}
+                /* A) fetch + enqueue (best-effort) */
+                uint32_t infl = nb_inflight_ops[sock][vq];
+                uint32_t room = (infl >= NB_CRYPTO_DESCRIPTORS)
+                                  ? 0u
+                                  : (NB_CRYPTO_DESCRIPTORS - infl);
 
-					/* 补回被 enqueue 消耗掉的 op，供下一轮 fetch 使用 */
-					if (enq) {
-						rte_crypto_op_bulk_alloc(info->cop_pool, cop_type, ops[j], enq);
-					}
-				}
-				/* 注意：fetched==0 这里不再 continue，让后面 drain 仍能执行 */
-			}
+                uint32_t to_fetch = RTE_MIN(burst_size, room);
 
-			/* B) dequeue + finalize（关键：不依赖 fetched/to_fetch，FREEZE 后也必须继续清在途） */
-			if (info->nb_inflight_ops) {
-				uint16_t want = RTE_MIN(burst_size, (uint32_t)info->nb_inflight_ops);
-				uint16_t deq = rte_cryptodev_dequeue_burst(
-						info->cid, info->qid, ops_deq[j], want);
+                if (to_fetch != 0) {
+                    uint16_t fetched = rte_vhost_crypto_fetch_requests(
+                        vid, (uint16_t)vq, ops[vq], (uint16_t)to_fetch);
 
-				nb_callfds = 0;
-				deq = rte_vhost_crypto_finalize_requests(
-						ops_deq[j], deq, callfds, &nb_callfds);
+                    if (likely(fetched != 0)) {
 
-				info->nb_inflight_ops -= deq;
+                        uint16_t enq = rte_cryptodev_enqueue_burst(
+                            info->cid, info->qid, ops[vq], fetched);
 
-				/* 你原来的 inflight 日志如果在这里打印最合理 */
-				/* 例如按时间节流打印 */
-				uint64_t now_tsc = rte_rdtsc();
-				static uint64_t last_log_tsc;
-				if (deq && (now_tsc - last_log_tsc > rte_get_tsc_hz() / 10)) {
-					RTE_LOG(INFO, USER1, "[Lcore %u] inflight -= %u → %u\n",
-							lcore_id, deq, info->nb_inflight_ops);
-					last_log_tsc = now_tsc;
-				}
+                        /* only enqueued ones become inflight */
+                        if (enq) {
+                            nb_inflight_ops[sock][vq] += enq;
+                            vhost_crypto_inflight_add(vid, enq);
+                        }
 
-				if (!options.guest_polling) {
-					for (k = 0; k < nb_callfds; k++)
-						eventfd_write(callfds[k], (eventfd_t)1);
-				}
+                        /* enq < fetched: free the not-enqueued ops */
+                        if (unlikely(enq < fetched)) {
+                            for (uint16_t x = enq; x < fetched; x++) {
+                                rte_crypto_op_free(ops[vq][x]);
+                            }
+                        }
 
-				if (deq) {
-					rte_mempool_put_bulk(info->cop_pool, (void **)ops_deq[j], deq);
-				}
-			}
-		}
+                        /* replenish ops for next loop */
+                        if (enq) {
+                            rte_crypto_op_bulk_alloc(info->cop_pool, cop_type,
+                                                     ops[vq], enq);
+                        }
+                    }
+                    /* fetched==0: do nothing, but MUST still run drain below */
+                }
+
+                /* B) dequeue + finalize (must run even if FREEZE stops fetch) */
+                uint32_t cur_infl = nb_inflight_ops[sock][vq];
+                if (cur_infl) {
+
+                    uint16_t want = (uint16_t)RTE_MIN(burst_size, cur_infl);
+
+                    uint16_t deq = rte_cryptodev_dequeue_burst(
+                        info->cid, info->qid, ops_deq[vq], want);
+
+                    nb_callfds = 0;
+                    deq = rte_vhost_crypto_finalize_requests(
+                        ops_deq[vq], deq, callfds, &nb_callfds);
+
+                    if (deq) {
+                        nb_inflight_ops[sock][vq] -= deq;
+                        vhost_crypto_inflight_sub(vid, deq);
+
+                        if (!options.guest_polling) {
+                            for (uint16_t k = 0; k < nb_callfds; k++) {
+                                eventfd_write(callfds[k], (eventfd_t)1);
+                            }
+                        }
+
+                        rte_mempool_put_bulk(info->cop_pool,
+                                             (void **)ops_deq[vq], deq);
+                    }
+                }
+            }
+        }
     }
 
-exit:
     return ret;
 }
+
 
 static void
 free_resource(void)
@@ -563,6 +586,13 @@ main(int argc, char *argv[])
 			ret = -ENOMEM;
 			goto error_exit;
 		}
+
+		/* IMPORTANT: avoid default 0 -> vid 0 */
+		for (j = 0; j < MAX_NB_SOCKETS; j++) {
+			info->vids[j] = -1;
+			info->initialized[j] = 0;
+		}
+		info->nb_inflight_ops = 0;
 
 		info->cid = lo->cid;
 		info->qid = lo->qid;
