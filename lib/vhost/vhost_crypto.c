@@ -311,6 +311,7 @@ struct __rte_cache_aligned vhost_crypto {
 
 	uint8_t option;
 	_Atomic unsigned int inflight;  /* ++ on submit, -- on completion */
+	_Atomic unsigned int inflight_corrupt;
     volatile int frozen;            /* 1 => reject new submissions */
 };
 
@@ -2120,8 +2121,27 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
 	vq = vc_req->vq;
 	used_idx = vc_req->desc_idx;
 
-	if (old_vq && (vq != old_vq))
+	/* vring pointers may be temporarily invalid during migration/reconnect */
+	if (unlikely(vq == NULL || vq->avail == NULL || vq->used == NULL ||
+			used_idx >= vq->size || rte_rwlock_read_trylock(&vq->access_lock) != 0)) {
+		/* Cannot safely write back to vring: mark request failed but avoid deref */
+		vc_req->inhdr->status = VIRTIO_CRYPTO_ERR;
+		goto out_recycle;
+	}
+
+	vhost_user_iotlb_rd_lock(vq);
+	if (unlikely(!vq->access_ok)) {
+		vhost_user_iotlb_rd_unlock(vq);
+		rte_rwlock_read_unlock(&vq->access_lock);
+		vc_req->inhdr->status = VIRTIO_CRYPTO_ERR;
+		goto out_recycle;
+	}
+	vhost_user_iotlb_rd_unlock(vq);
+
+	if (old_vq && (vq != old_vq)) {
+		rte_rwlock_read_unlock(&vq->access_lock);
 		return vq;
+	}
 
 	if (unlikely(op->status != RTE_CRYPTO_OP_STATUS_SUCCESS))
 		vc_req->inhdr->status = VIRTIO_CRYPTO_ERR;
@@ -2133,6 +2153,8 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
 	desc_idx = vq->avail->ring[used_idx];
 	vq->used->ring[desc_idx].id = vq->avail->ring[desc_idx];
 	vq->used->ring[desc_idx].len = vc_req->len;
+	
+	rte_rwlock_read_unlock(&vq->access_lock);
 
 	if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
 		rte_mempool_put(m_src->pool, (void *)m_src);
@@ -2141,6 +2163,14 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
 	}
 
 	return vq;
+
+out_recycle:
+	if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+		rte_mempool_put(m_src->pool, (void *)m_src);
+		if (m_dst)
+			rte_mempool_put(m_dst->pool, (void *)m_dst);
+	}
+	return NULL;
 }
 
 static __rte_always_inline uint16_t
@@ -2565,15 +2595,25 @@ void vhost_crypto_inflight_sub(int vid, uint32_t n)
 
     struct vhost_crypto *vcrypto = dev->extern_data;
 
-    /* clamp-to-zero to avoid underflow if counters ever get skewed */
     uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
     while (1) {
-        uint32_t next = (cur > n) ? (cur - n) : 0;
+        if (unlikely(cur < n)) {
+            VC_LOG_ERR("inflight underflow vid=%d cur=%u sub=%u (BUG)", vid, cur, n);
+            __atomic_store_n(&vcrypto->inflight_corrupt, 1, __ATOMIC_RELEASE);
+            /* Avoid wrap-around; keep system running but mark state as unsafe */
+            if (__atomic_compare_exchange_n(&vcrypto->inflight, &cur, 0,
+                                            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                break;
+            }
+            continue;
+        }
+
+        uint32_t next = cur - n;
         if (__atomic_compare_exchange_n(&vcrypto->inflight, &cur, next,
                                         false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
             break;
         }
-        /* cur is updated by compare_exchange on failure */
+		/* cur updated on failure */
     }
 }
 
@@ -2584,6 +2624,10 @@ int vhost_crypto_freeze(int vid) {
         return -ENOENT;
     struct vhost_crypto *vcrypto = dev->extern_data;
 
+    if (unlikely(__atomic_load_n(&vcrypto->inflight_corrupt, __ATOMIC_ACQUIRE))) {
+        VC_LOG_ERR("FREEZE refused: inflight accounting corrupt (vid=%d)", vid);
+        return -EIO;
+    }	
     /* Step 1: 设置冻结位，阻断新请求进入 */
     __atomic_store_n(&vcrypto->frozen, 1, __ATOMIC_RELEASE);
 

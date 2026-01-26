@@ -418,11 +418,15 @@ vhost_crypto_worker(void *arg)
     /* per (socket, vq) inflight counters (do NOT mix different vids) */
     uint32_t nb_inflight_ops[MAX_NB_SOCKETS][NB_VIRTIO_QUEUES] = {0};
 
+	int last_vid[MAX_NB_SOCKETS];
     uint16_t nb_callfds;
     int callfds[VIRTIO_CRYPTO_MAX_NUM_BURST_VQS];
 
     const uint32_t lcore_id = rte_lcore_id();
     const uint32_t burst_size = MAX_PKT_BURST;
+	for (uint32_t s = 0; s < MAX_NB_SOCKETS; s++) {
+    	last_vid[s] = -2;
+    }
 
     enum rte_crypto_op_type cop_type =
         options.asymmetric_crypto ? RTE_CRYPTO_OP_TYPE_ASYMMETRIC
@@ -454,7 +458,13 @@ vhost_crypto_worker(void *arg)
             if (unlikely(vid < 0)) {
                 continue;
             }
-
+            if (unlikely(vid != last_vid[sock])) {
+                /* vid changed due to reconnect/migration rollback: do not mix inflight counters */
+                for (uint32_t q = 0; q < NB_VIRTIO_QUEUES; q++) {
+                    nb_inflight_ops[sock][q] = 0;
+                }
+                last_vid[sock] = vid;
+            }
             for (uint32_t vq = 0; vq < NB_VIRTIO_QUEUES; vq++) {
 
                 /* A) fetch + enqueue (best-effort) */
@@ -504,23 +514,36 @@ vhost_crypto_worker(void *arg)
 
                     uint16_t deq = rte_cryptodev_dequeue_burst(
                         info->cid, info->qid, ops_deq[vq], want);
+                    if (likely(deq)) {
+                        nb_callfds = 0;
+                        uint16_t fin = rte_vhost_crypto_finalize_requests(
+                            ops_deq[vq], deq, callfds, &nb_callfds);
 
-                    nb_callfds = 0;
-                    deq = rte_vhost_crypto_finalize_requests(
-                        ops_deq[vq], deq, callfds, &nb_callfds);
+                        /*
+                         * Migration/reconnect window may temporarily invalidate vrings.
+                         * In that case finalize may return less than deq; we still MUST
+                         * reclaim ops and decrement inflight, otherwise FREEZE semantics
+                         * become unreliable.
+                         */
+                        uint16_t done = deq;
+                        if (unlikely(fin != deq)) {
+                            nb_callfds = 0; /* do not notify guest on failed writeback */
+                        } else {
+                            done = fin;
+                        }
 
-                    if (deq) {
-                        nb_inflight_ops[sock][vq] -= deq;
-                        vhost_crypto_inflight_sub(vid, deq);
+                        nb_inflight_ops[sock][vq] -= done;
+                        vhost_crypto_inflight_sub(vid, done);
 
                         if (!options.guest_polling) {
                             for (uint16_t k = 0; k < nb_callfds; k++) {
-                                eventfd_write(callfds[k], (eventfd_t)1);
+                                if (callfds[k] >= 0)
+                                    eventfd_write(callfds[k], (eventfd_t)1);
                             }
                         }
 
                         rte_mempool_put_bulk(info->cop_pool,
-                                             (void **)ops_deq[vq], deq);
+                                             (void **)ops_deq[vq], done);
                     }
                 }
             }
