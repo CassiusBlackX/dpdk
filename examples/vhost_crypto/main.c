@@ -36,6 +36,7 @@
 
 extern void vhost_crypto_inflight_add(int vid, uint32_t n);
 extern void vhost_crypto_inflight_sub(int vid, uint32_t n);
+extern int vhost_crypto_freeze(int vid);
 
 struct lcore_option {
 	uint32_t lcore_id;
@@ -360,41 +361,46 @@ new_device(int vid)
 	return 0;
 }
 
+/* main.c */
 static void
 destroy_device(int vid)
 {
-	struct vhost_crypto_info *info = NULL;
-	uint32_t i, j;
+    struct vhost_crypto_info *info = NULL;
+    uint32_t i, j;
 
-	for (i = 0; i < options.nb_los; i++) {
-		for (j = 0; j < options.los[i].nb_sockets; j++) {
-			if (options.infos[i]->vids[j] == vid) {
-				info = options.infos[i];
-				break;
-			}
-		}
-		if (info)
-			break;
-	}
+    for (i = 0; i < options.nb_los; i++) {
+        for (j = 0; j < options.los[i].nb_sockets; j++) {
+            if (options.infos[i]->vids[j] == vid) {
+                info = options.infos[i];
+                break;
+            }
+        }
+        if (info)
+            break;
+    }
 
-	if (!info) {
-		RTE_LOG(ERR, USER1, "Cannot find socket file from list\n");
-		return;
-	}
+    if (!info) {
+        RTE_LOG(ERR, USER1, "Cannot find socket file from list\n");
+        return;
+    }
 
-	do {
+    /* 1) Freeze + drain: stop fetch and wait inflight==0 */
+    if (vhost_crypto_freeze(vid) < 0) {
+        RTE_LOG(ERR, USER1, "FREEZE failed for vid=%d, skip free to avoid UAF\n", vid);
+        return;
+    }
 
-	} while (info->nb_inflight_ops);
+    /* 2) Publish "device removed" to workers */
+    info->initialized[j] = 0;
+    info->vids[j] = -1;
+    rte_wmb();
 
-	info->initialized[j] = 0;
-	info->vids[j] = -1;
+    /* 3) Now it is safe to free vhost crypto device */
+    rte_vhost_crypto_free(vid);
 
-	rte_wmb();
-
-	rte_vhost_crypto_free(vid);
-
-	RTE_LOG(INFO, USER1, "Vhost Crypto Device %i Removed\n", vid);
+    RTE_LOG(INFO, USER1, "Vhost Crypto Device %i Removed\n", vid);
 }
+
 
 static const struct rte_vhost_device_ops virtio_crypto_device_ops = {
 	.new_connection =  new_device,
