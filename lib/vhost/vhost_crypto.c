@@ -1931,6 +1931,7 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 	vc_req->desc_idx = desc_idx;
 	vc_req->dev = vcrypto->dev;          /* IOVA_TO_VVA 等还会用到 */
     vc_req->vq  = vq;
+	vc_req->vcrypto = vcrypto;           /* 新增：用于 completion 时做 inflight-- */
 
 
 	if (unlikely((head->flags & VRING_DESC_F_INDIRECT) == 0)) {
@@ -2236,6 +2237,25 @@ vhost_crypto_complete_one_vm_requests(struct rte_crypto_op **ops,
 
 	*(volatile uint16_t *)&vq->used->idx += processed;
 	vq->last_used_idx += processed;
+	/* inflight accounting: only decrement AFTER used->idx is updated */
+	if (likely(processed != 0)) {
+		struct rte_mbuf *m_src = ops[0]->sym ? ops[0]->sym->m_src : NULL;
+		struct vhost_crypto_data_req *vc_req = m_src ? rte_mbuf_to_priv(m_src) : NULL;
+		struct vhost_crypto *vcrypto = vc_req ? vc_req->vcrypto : NULL;
+
+		if (likely(vcrypto)) {
+			uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
+			if (unlikely(cur < processed)) {
+				VC_LOG_ERR("inflight underflow cur=%u sub=%u (BUG)", cur, processed);
+				__atomic_store_n(&vcrypto->inflight_corrupt, 1, __ATOMIC_RELEASE);
+				__atomic_store_n(&vcrypto->inflight, 0, __ATOMIC_RELEASE);
+			} else {
+				__atomic_fetch_sub(&vcrypto->inflight, processed, __ATOMIC_ACQ_REL);
+			}
+		} else {
+			VC_LOG_ERR("inflight sub skipped: missing vcrypto in op priv (BUG)");
+		}
+	}
 
 	return processed;
 }
@@ -2566,7 +2586,10 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 	}
 
 	vq->last_avail_idx += i;
-
+	/* inflight accounting: ops fetched => now owned by backend until completion */
+	if (likely(i != 0)) {
+		__atomic_fetch_add(&vcrypto->inflight, i, __ATOMIC_ACQ_REL);
+	}
 out_unlock:
 	vhost_user_iotlb_rd_unlock(vq);
 	rte_rwlock_read_unlock(&vq->access_lock);
@@ -3336,13 +3359,6 @@ int vhost_crypto_load_state(int vid, int fd)
 			fprintf(stderr,
 					"[load_state] DEV_META: snapshot_cid=%u, local_cid=%u, last_sid=%lu\n",
 					snap_cid, vcrypto->cid, (unsigned long)snap_last);
-
-
-			vcrypto->last_session_id = m->last_session_id;
-
-			fprintf(stderr,
-					"[load_state] DEV_META: snapshot_cid=%u, local_cid=%u, last_sid=%lu\n",
-					m->cid, vcrypto->cid, m->last_session_id);
 
         } else if (t == VC_TLV_SESSION) {
 
