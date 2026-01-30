@@ -104,6 +104,71 @@ static inline void explicit_bzero_fallback(void *p, size_t n) {
 #define explicit_bzero explicit_bzero_fallback
 #endif
 
+static inline int
+vhost_crypto_device_ready(struct virtio_net *dev, uint32_t qid)
+{
+    if (!dev || !dev->mem || dev->mem->nregions == 0)
+        return 0;
+    if (qid >= dev->nr_vring)
+        return 0;
+
+    struct vhost_virtqueue *vq = dev->virtqueue[qid];
+    if (!vq)
+        return 0;
+
+    /* SET_VRING_ADDR 没生效时，这三个通常是 NULL */
+    if (!vq->desc || !vq->avail || !vq->used)
+        return 0;
+
+    if (!vq->ready || !vq->access_ok)
+        return 0;
+
+    return 1;
+}
+
+/* 只由 worker 线程调用：看到 ready 才 apply，一次成功后清 pending */
+static void
+vhost_crypto_try_apply_pending_in_worker(int vid, struct virtio_net *dev)
+{
+    struct vhost_crypto *vcrypto = dev->extern_data;
+    if (!vcrypto || !vcrypto->pending_load_valid)
+        return;
+
+    if (!vhost_crypto_device_ready(dev, 0))
+        return;
+
+    uint8_t *buf = NULL;
+    size_t len = 0;
+
+    /* swap out pending buffer under lock */
+    rte_spinlock_lock(&vcrypto->pending_lock);
+    if (vcrypto->pending_load_valid) {
+        buf = vcrypto->pending_load_buf;
+        len = vcrypto->pending_load_len;
+        vcrypto->pending_load_buf = NULL;
+        vcrypto->pending_load_len = 0;
+        vcrypto->pending_load_valid = 0;
+    }
+    rte_spinlock_unlock(&vcrypto->pending_lock);
+
+    if (!buf || len == 0)
+        return;
+
+    VC_LOG_INFO("PENDING_LOAD: applying in worker (vid=%d, len=%zu)", vid, len);
+
+    /* 这里调用你拆出来的 from_buf 解析函数 */
+    int rc = vhost_crypto_load_state_from_buf(vid, buf, len);
+    free(buf);
+
+    if (rc == 0) {
+        VC_LOG_INFO("PENDING_LOAD_OK -> THAW (vid=%d)", vid);
+        vhost_crypto_thaw(vid);
+    } else {
+        VC_LOG_ERR("PENDING_LOAD failed (vid=%d rc=%d)", vid, rc);
+        /* 失败时你可以选择把 buf 再塞回 pending 以便重试；debug 阶段先不重试更容易定位 */
+    }
+}
+
 /* duplicate bytes into DPDK heap (zero-inited) */
 static inline uint8_t *
 dup_bytes_dpdk(const void *src, size_t len)
@@ -326,6 +391,11 @@ struct __rte_cache_aligned vhost_crypto {
 	_Atomic unsigned int inflight;  /* ++ on submit, -- on completion */
 	_Atomic unsigned int inflight_corrupt;
     volatile int frozen;            /* 1 => reject new submissions */
+
+	rte_spinlock_t pending_lock;
+    uint8_t *pending_load_buf;
+    size_t pending_load_len;
+    volatile int pending_load_valid;
 };
 
 struct vhost_crypto_writeback_data {
@@ -994,6 +1064,30 @@ vhost_crypto_msg_pre_handler(int vid, void *msg)
     return RTE_VHOST_MSG_RESULT_NOT_HANDLED;
 }
 
+static int
+vhost_crypto_device_ready(struct virtio_net *dev, uint32_t qid)
+{
+    if (!dev || !dev->mem || dev->mem->nregions == 0)
+        return 0;
+
+    if (qid >= dev->nr_vring)
+        return 0;
+
+    struct vhost_virtqueue *vq = dev->virtqueue[qid];
+    if (!vq)
+        return 0;
+
+    /* 这三者为空=SET_VRING_ADDR 还没真正生效 */
+    if (!vq->desc || !vq->avail || !vq->used)
+        return 0;
+
+    /* 这俩通常表示翻译/权限检查通过 */
+    if (!vq->ready || !vq->access_ok)
+        return 0;
+
+    return 1;
+}
+
 static enum rte_vhost_msg_result
 vhost_crypto_msg_post_handler(int vid, void *msg)
 {
@@ -1104,21 +1198,32 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 	case VHOST_USER_CRYPTO_LOAD: {
 		int fd = (ctx->fd_num > 0) ? ctx->fds[0] : -1;
 		if (fd < 0) { ret = RTE_VHOST_MSG_RESULT_ERR; break; }
-		int rc = vhost_crypto_load_state(vid, fd);
+
+		uint8_t *buf = NULL;
+		size_t len = 0;
+		int rc = read_all_from_fd(fd, &buf, &len);  /* 你实现：循环 read + realloc */
 		close(fd);
 		ctx->fd_num = 0;
 
-		if (rc == 0) {
-			VC_LOG_INFO("LOAD_OK vid=%d -> auto THAW", vid);
-			(void)vhost_crypto_thaw(vid);
+		if (rc < 0 || !buf || len == 0) {
+			free(buf);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
 		}
 
-		if (rc == 0) {
-			VC_LOG_INFO("LOAD_OK vid=%d -> auto THAW", vid);
-			(void)vhost_crypto_thaw(vid);
-		}
-		ret = (rc == 0) ? RTE_VHOST_MSG_RESULT_OK : RTE_VHOST_MSG_RESULT_ERR;
-				break;
+		struct vhost_crypto *vcrypto = dev->extern_data;
+		rte_spinlock_lock(&vcrypto->pending_lock);
+		free(vcrypto->pending_load_buf);
+		vcrypto->pending_load_buf = buf;
+		vcrypto->pending_load_len = len;
+		vcrypto->pending_load_valid = 1;
+		rte_spinlock_unlock(&vcrypto->pending_lock);
+
+		VC_LOG_INFO("CRYPTO_LOAD received: buffered pending state (vid=%d len=%zu)", vid, len);
+
+		/* 不要在这里 thaw！交给 worker 在 device ready 时做 */
+		ret = RTE_VHOST_MSG_RESULT_OK;
+		break;
 	}
 
 
