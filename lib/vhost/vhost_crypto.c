@@ -2431,6 +2431,12 @@ rte_vhost_crypto_create(int vid, uint8_t cryptodev_id,
 	vcrypto->dev = dev;
 	vcrypto->option = RTE_VHOST_CRYPTO_ZERO_COPY_DISABLE;
 
+	/* pending-load init (for deferred CRYPTO_LOAD) */
+	rte_spinlock_init(&vcrypto->pending_lock);
+	vcrypto->pending_load_buf = NULL;
+	vcrypto->pending_load_len = 0;
+	vcrypto->pending_load_valid = 0;
+
 	snprintf(name, 127, "HASH_VHOST_CRYPT_%u", (uint32_t)vid);
 	params.name = name;
 	params.entries = VHOST_CRYPTO_SESSION_MAP_ENTRIES;
