@@ -979,34 +979,21 @@ vhost_crypto_msg_pre_handler(int vid, void *msg)
 {
     struct vhu_msg_context *ctx = msg;
 
-    /* 只拦标准前端请求 */
+    /* 只在 GET_VRING_BASE 前做 freeze，其他消息完全不干预 */
     if (ctx->msg.request.frontend == VHOST_USER_GET_VRING_BASE) {
-
-        /*
-         * 关键：在前端 stop vring / get_base 之前，先把后端 quiesce。
-         * 这样 worker 还有机会把已完成的请求 finalize 回 used ring，
-         * 避免出现 fin=0 导致 guest 永远等不到完成。
-         */
         int ret = vhost_crypto_freeze(vid);
-
-        /*
-         * 你现在的 freeze 里有 3 秒超时并回滚 frozen。
-         * 对迁移来说，这个太激进：一旦 -EBUSY 很容易让迁移被判失败。
-         * 最简单的实验方式：这里如果 ret == -EBUSY，就继续等（阻塞这条 vhost-user 消息）。
-         */
         while (ret == -EBUSY) {
             rte_delay_us_block(100);
             ret = vhost_crypto_freeze(vid);
         }
-
         if (ret < 0) {
-            return RTE_VHOST_MSG_RESULT_ERR;
+            return RTE_VHOST_MSG_RESULT_ERR; /* 这会让 vhost-user 层认为失败 */
         }
+        return RTE_VHOST_MSG_RESULT_NOT_HANDLED; /* 关键：让原 handler 继续处理 GET_VRING_BASE */
     }
 
-    return RTE_VHOST_MSG_RESULT_OK; /* 继续走原本的 vhost_user_get_vring_base */
+    return RTE_VHOST_MSG_RESULT_NOT_HANDLED;
 }
-
 
 static enum rte_vhost_msg_result
 vhost_crypto_msg_post_handler(int vid, void *msg)
@@ -2329,7 +2316,7 @@ rte_vhost_crypto_create(int vid, uint8_t cryptodev_id,
 	}
 
 	dev->extern_data = vcrypto;
-	dev->extern_ops.pre_msg_handle = dev->extern_data = vcrypto;;
+	dev->extern_ops.pre_msg_handle = vhost_crypto_msg_pre_handler;;
 	dev->extern_ops.post_msg_handle = vhost_crypto_msg_post_handler;
 
 	return 0;
