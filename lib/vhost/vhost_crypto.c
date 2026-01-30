@@ -1041,7 +1041,16 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 		if (vhost_crypto_close_sess(vcrypto, ctx->msg.payload.u64))
 			ret = RTE_VHOST_MSG_RESULT_ERR;
 		break;
-
+	
+	case VHOST_USER_SET_STATUS: 
+		uint8_t st = (uint8_t)ctx->msg.payload.u64;
+		/* DRIVER_OK 置位：允许数据面开始工作；迁移恢复后也会走到这里 */
+		if (st & VIRTIO_DEVICE_STATUS_DRIVER_OK) {
+			(void)vhost_crypto_thaw(vid);
+		}
+		ret = RTE_VHOST_MSG_RESULT_NOT_HANDLED; /* 让原生 handler 继续处理 */
+		break;
+	
 	/* ---- migration extensions ---- */
 	case VHOST_USER_CRYPTO_TEST:
     test_save_load_blob(vid);
@@ -1106,9 +1115,16 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 		int rc = vhost_crypto_load_state(vid, fd);
 		close(fd);
 		ctx->fd_num = 0;
+
+		if (rc == 0) {
+			VC_LOG_INFO("LOAD_OK vid=%d -> auto THAW", vid);
+			(void)vhost_crypto_thaw(vid);
+		}
+
 		ret = (rc == 0) ? RTE_VHOST_MSG_RESULT_OK : RTE_VHOST_MSG_RESULT_ERR;
 		break;
 	}
+
 
 	case VHOST_USER_CRYPTO_THAW:
 		ret = (vhost_crypto_thaw(vid) == 0) ? RTE_VHOST_MSG_RESULT_OK
@@ -2472,6 +2488,18 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 		return 0;
 	}
 
+	/* 设备未进入 DRIVER_OK 时，不允许数据面抓取 */
+	if (unlikely(!(dev->status & VIRTIO_DEVICE_STATUS_DRIVER_OK)))
+		return 0;
+
+	vq = dev->virtqueue[qid];
+	if (unlikely(vq == NULL))
+		return 0;
+
+	/* vring 未 ready/access_ok，不允许抓取 */
+	if (unlikely(!vq->ready || !vq->access_ok))
+		return 0;
+		
 	if (unlikely(qid >= VHOST_MAX_QUEUE_PAIRS)) {
 		VC_LOG_ERR("Invalid qid %u", qid);
 		return 0;
@@ -3486,6 +3514,9 @@ int vhost_crypto_thaw(int vid)
     if (!dev || !dev->extern_data) return -ENOENT;
     struct vhost_crypto *vcrypto = dev->extern_data;
 
-    __atomic_store_n(&vcrypto->frozen, 0, __ATOMIC_RELEASE);
+    int old = __atomic_exchange_n(&vcrypto->frozen, 0, __ATOMIC_ACQ_REL);
+    VC_LOG_INFO("THAW vid=%d frozen:%d->0 inflight=%u", vid, old,
+                __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE));
     return 0;
 }
+
