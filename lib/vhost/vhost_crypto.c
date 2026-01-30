@@ -990,8 +990,6 @@ vhost_crypto_close_sess(struct vhost_crypto *vcrypto, uint64_t session_id)
 static enum rte_vhost_msg_result
 vhost_crypto_msg_pre_handler(int vid, void *msg)
 {
-        return RTE_VHOST_MSG_RESULT_NOT_HANDLED; /* 关键：让原 handler 继续处理 GET_VRING_BASE */
-    }
 
     return RTE_VHOST_MSG_RESULT_NOT_HANDLED;
 }
