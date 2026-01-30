@@ -2484,10 +2484,6 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 		return 0;
 	}
 
-	/* 设备未进入 DRIVER_OK 时，不允许数据面抓取 */
-	if (unlikely(!(dev->status & VIRTIO_DEVICE_STATUS_DRIVER_OK)))
-		return 0;
-
 	vq = dev->virtqueue[qid];
 	if (unlikely(vq == NULL))
 		return 0;
