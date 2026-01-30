@@ -25,6 +25,19 @@
 #include <rte_errno.h>
 #include <fcntl.h>    // for O_CREAT, O_WRONLY, O_TRUNC
 #include <unistd.h>   // for close()
+#include <rte_cycles.h>
+
+static inline uint64_t vc_ts_ms(void)
+{
+    uint64_t hz = rte_get_timer_hz();
+    uint64_t cyc = rte_get_timer_cycles();
+    return hz ? (cyc * 1000 / hz) : 0;
+}
+
+#define VCLOG(level, fmt, ...) \
+    RTE_LOG(level, USER1, "[VC][%llu ms] " fmt "\n", \
+            (unsigned long long)vc_ts_ms(), ##__VA_ARGS__)
+
 
 static inline uint16_t TOLE16(uint16_t x){ return rte_cpu_to_le_16(x); }
 static inline uint32_t TOLE32(uint32_t x){ return rte_cpu_to_le_32(x); }
@@ -1001,6 +1014,8 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 	struct virtio_net *dev = get_device(vid);
 	struct vhost_crypto *vcrypto;
 	struct vhu_msg_context *ctx = msg;
+	VC_LOG_INFO("TAG_CTRL_POST vid=%d req=%u fd_num=%u",
+            vid, ctx->msg.request.frontend, ctx->fd_num);
 	enum rte_vhost_msg_result ret = RTE_VHOST_MSG_RESULT_OK;
 
 	if (dev == NULL) {
@@ -2220,6 +2235,7 @@ vhost_crypto_complete_one_vm_requests(struct rte_crypto_op **ops,
 	*callfd = vq->callfd;
 
 	*(volatile uint16_t *)&vq->used->idx += processed;
+	vq->last_used_idx += processed;
 
 	return processed;
 }
@@ -2454,7 +2470,12 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 	vq = dev->virtqueue[qid];
 
 	if (unlikely(vq == NULL)) {
-		VC_LOG_ERR("Invalid virtqueue %u", qid);
+		VC_LOG_ERR("TAG_FETCH_INVALID_VQ vid=%d qid=%u flags=0x%x dev=%p vq=%p",
+           vid, qid, dev->flags, dev, vq);
+		   VC_LOG_ERR("TAG_FETCH_INVALID_VQ_MORE vid=%d qid=%u extern=%p frozen=%d inflight=%u",
+           vid, qid, dev->extern_data,
+           dev->extern_data ? ((struct vhost_crypto*)dev->extern_data)->frozen : -1,
+           dev->extern_data ? __atomic_load_n(&((struct vhost_crypto*)dev->extern_data)->inflight, __ATOMIC_ACQUIRE) : 0);
 		return 0;
 	}
 
@@ -2468,7 +2489,7 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 	}
 
 	avail_idx = *((volatile uint16_t *)&vq->avail->idx);
-	start_idx = vq->last_used_idx;
+	start_idx = vq->last_avail_idx;
 	count = avail_idx - start_idx;
 	count = RTE_MIN(count, VHOST_CRYPTO_MAX_BURST_SIZE);
 	count = RTE_MIN(count, nb_ops);
@@ -2544,7 +2565,7 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 
 	}
 
-	vq->last_used_idx += i;
+	vq->last_avail_idx += i;
 
 out_unlock:
 	vhost_user_iotlb_rd_unlock(vq);
@@ -2566,7 +2587,11 @@ rte_vhost_crypto_finalize_requests(struct rte_crypto_op **ops,
 	while (left) {
 		count = vhost_crypto_complete_one_vm_requests(tmp_ops, left,
 				&callfd);
-		if (unlikely(count == 0))
+		if (unlikely(count == 0)) {
+			VC_LOG_ERR("TAG_FINALIZE_STUCK nb_ops=%u left=%u (likely vring not ready / stopped)",
+					nb_ops, left);
+			break;
+		}
 			break;
 
 		tmp_ops = &tmp_ops[count];
@@ -2651,7 +2676,9 @@ int vhost_crypto_freeze(int vid) {
     __atomic_store_n(&vcrypto->frozen, 1, __ATOMIC_RELEASE);
 	VC_LOG_INFO("FREEZE_BEGIN vid=%d ts_ms=%llu",
             vid, (unsigned long long)(rte_get_timer_cycles() * 1000ULL / rte_get_timer_hz()));
-
+	VC_LOG_INFO("TAG_FREEZE_STATE vid=%d frozen=%d inflight=%u",
+            vid, vcrypto->frozen,
+            __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE));
     /* Step 2: 等待所有 inflight 请求完成（有界等待） */
     const uint64_t hz = rte_get_timer_hz();
     const uint64_t start = rte_get_timer_cycles();

@@ -2230,6 +2230,16 @@ vhost_user_get_vring_base(struct virtio_net **pdev,
 	struct vhost_virtqueue *vq = dev->virtqueue[ctx->msg.payload.state.index];
 	uint64_t val;
 
+	/* === VC TAG: GET_VRING_BASE entered === */
+VHOST_CONFIG_LOG(dev->ifname, INFO,
+    "TAG_GVB_ENTER vid=%d vq=%u flags=0x%x vq=%p last_avail=%u last_used=%u",
+    dev->vid,
+    ctx->msg.payload.state.index,
+    dev->flags,
+    vq,
+    vq ? vq->last_avail_idx : 0,
+    vq ? vq->last_used_idx  : 0);
+	
 	/* We have to stop the queue (virtio) if it is running. */
 	vhost_destroy_device_notify(dev);
 
