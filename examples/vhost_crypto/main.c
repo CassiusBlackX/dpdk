@@ -421,46 +421,32 @@ static const struct rte_vhost_device_ops virtio_crypto_device_ops = {
 static int
 vhost_crypto_worker(void *arg)
 {
+    struct rte_crypto_op *ops[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
+    struct rte_crypto_op *ops_deq[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
+
     struct vhost_crypto_info *info = arg;
+
+    /* per (socket, vq) inflight counters (do NOT mix different vids) */
+    uint32_t nb_inflight_ops[MAX_NB_SOCKETS][NB_VIRTIO_QUEUES] = {0};
+    int last_vid[MAX_NB_SOCKETS];
+
+    uint16_t nb_callfds;
+    int callfds[VIRTIO_CRYPTO_MAX_NUM_BURST_VQS];
 
     const uint32_t lcore_id   = rte_lcore_id();
     const uint32_t burst_size = MAX_PKT_BURST;
+
+    for (uint32_t s = 0; s < MAX_NB_SOCKETS; s++) {
+        last_vid[s] = -2;
+    }
 
     enum rte_crypto_op_type cop_type =
         options.asymmetric_crypto ? RTE_CRYPTO_OP_TYPE_ASYMMETRIC
                                   : RTE_CRYPTO_OP_TYPE_SYMMETRIC;
 
+    int ret = 0;
+
     RTE_LOG(INFO, USER1, "Processing on Core %u started\n", lcore_id);
-
-    /* ---- Move big arrays off stack: allocate pointer tables on heap ---- */
-    struct rte_crypto_op *(*ops)[MAX_PKT_BURST + 1] =
-        rte_zmalloc(NULL, sizeof(*ops) * NB_VIRTIO_QUEUES, 0);
-    struct rte_crypto_op *(*ops_deq)[MAX_PKT_BURST + 1] =
-        rte_zmalloc(NULL, sizeof(*ops_deq) * NB_VIRTIO_QUEUES, 0);
-
-    /* pending[sock][vq][i] stores ops that were dequeued but not finalized */
-    struct rte_crypto_op *(*pending)[NB_VIRTIO_QUEUES][MAX_PKT_BURST] =
-        rte_zmalloc(NULL, sizeof(*pending) * MAX_NB_SOCKETS, 0);
-    uint16_t (*pending_cnt)[NB_VIRTIO_QUEUES] =
-        rte_zmalloc(NULL, sizeof(*pending_cnt) * MAX_NB_SOCKETS, 0);
-
-    uint32_t (*nb_inflight_ops)[NB_VIRTIO_QUEUES] =
-        rte_zmalloc(NULL, sizeof(*nb_inflight_ops) * MAX_NB_SOCKETS, 0);
-
-    if (!ops || !ops_deq || !pending || !pending_cnt || !nb_inflight_ops) {
-        RTE_LOG(ERR, USER1,
-                "worker alloc failed (ops=%p ops_deq=%p pending=%p pending_cnt=%p infl=%p)\n",
-                ops, ops_deq, pending, pending_cnt, nb_inflight_ops);
-        return -ENOMEM;
-    }
-
-    int last_vid[MAX_NB_SOCKETS];
-    for (uint32_t s = 0; s < MAX_NB_SOCKETS; s++) {
-        last_vid[s] = -2;
-    }
-
-    int callfds[VIRTIO_CRYPTO_MAX_NUM_BURST_VQS];
-    uint16_t nb_callfds;
 
     /* allocate a batch of ops for each vq */
     for (uint32_t vq = 0; vq < NB_VIRTIO_QUEUES; vq++) {
@@ -480,164 +466,117 @@ vhost_crypto_worker(void *arg)
 
             int vid = info->vids[sock];
             if (unlikely(vid < 0)) {
+                /* 控制面可能刚置 initialized 但 vid 还没写好，稍微退避一下 */
+                rte_delay_us_sleep(50);
                 continue;
             }
 
-            /* vid changed: MUST NOT mix state across vids */
+            /* HARDEN: never pass insane vid into rte_vhost_* */
+            if (unlikely(vid >= RTE_MAX_VHOST_DEVICE)) {
+                rte_delay_us_sleep(50);
+                continue;
+            }
+
             if (unlikely(vid != last_vid[sock])) {
+                /* vid changed due to reconnect/migration rollback: do not mix inflight counters */
                 for (uint32_t q = 0; q < NB_VIRTIO_QUEUES; q++) {
                     nb_inflight_ops[sock][q] = 0;
-                    pending_cnt[sock][q]     = 0;
                 }
                 last_vid[sock] = vid;
             }
 
             for (uint32_t vq = 0; vq < NB_VIRTIO_QUEUES; vq++) {
 
-                /*
-                 * HARD GATE: do NOT touch vring until QEMU told you it's ready.
-                 * You need to maintain info->vq_ready[sock][vq] in your vhost-user
-                 * message handlers: set to 1 after SET_VRING_ENABLE(1) (and got addr/base),
-                 * clear to 0 on disable/reset/destroy.
-                 */
-                /* HARD GATE: do NOT touch vring until it's ready */
-
-				uint16_t last_avail = 0, last_used = 0;
-				if (unlikely(rte_vhost_get_vring_base(vid, (uint16_t)vq,
-													&last_avail, &last_used) < 0)) {
-					/* vring not ready yet (e.g., still in GET_FEATURES / before SET_VRING_*) */
-					pending_cnt[sock][vq] = 0;
-					nb_inflight_ops[sock][vq] = 0;
-					continue;
-				}
-
-
-                /* ---- B0) finalize pending first ---- */
-                if (pending_cnt[sock][vq] > 0) {
-                    uint16_t nb_callfds_p = 0;
-
-                    uint16_t pfin = rte_vhost_crypto_finalize_requests(
-                        pending[sock][vq], pending_cnt[sock][vq],
-                        callfds, &nb_callfds_p);
-
-                    if (pfin > 0) {
-                        nb_inflight_ops[sock][vq] -= pfin;
-                        vhost_crypto_inflight_sub(vid, pfin);
-
-                        if (!options.guest_polling) {
-                            for (uint16_t k = 0; k < nb_callfds_p; k++) {
-                                if (callfds[k] >= 0) {
-                                    eventfd_write(callfds[k], (eventfd_t)1);
-                                }
-                            }
-                        }
-
-                        rte_mempool_put_bulk(info->cop_pool,
-                                             (void **)pending[sock][vq], pfin);
-
-                        uint16_t left = pending_cnt[sock][vq] - pfin;
-                        if (left) {
-                            memmove(&pending[sock][vq][0],
-                                    &pending[sock][vq][pfin],
-                                    left * sizeof(pending[sock][vq][0]));
-                        }
-                        pending_cnt[sock][vq] = left;
-                    }
-
-                    /* still pending -> vring likely unstable, avoid fetch/deq this round */
-                    if (pending_cnt[sock][vq] > 0) {
-                        continue;
-                    }
-                }
-
-                /* ---- A) fetch + enqueue ---- */
+                /* A) fetch + enqueue (best-effort) */
                 uint32_t infl = nb_inflight_ops[sock][vq];
                 uint32_t room = (infl >= NB_CRYPTO_DESCRIPTORS) ? 0u
                               : (NB_CRYPTO_DESCRIPTORS - infl);
                 uint32_t to_fetch = RTE_MIN(burst_size, room);
 
-                if (to_fetch) {
+                if (to_fetch != 0) {
                     uint16_t fetched = rte_vhost_crypto_fetch_requests(
                         vid, (uint16_t)vq, ops[vq], (uint16_t)to_fetch);
 
-                    if (likely(fetched)) {
+                    if (likely(fetched != 0)) {
                         uint16_t enq = rte_cryptodev_enqueue_burst(
                             info->cid, info->qid, ops[vq], fetched);
 
+                        /* only enqueued ones become inflight */
                         if (enq) {
                             nb_inflight_ops[sock][vq] += enq;
                             vhost_crypto_inflight_add(vid, enq);
-
-                            /* replenish only what we enqueued */
-                            rte_crypto_op_bulk_alloc(info->cop_pool, cop_type,
-                                                     ops[vq], enq);
                         }
 
-                        /* free not-enqueued ops */
+                        /* enq < fetched: free the not-enqueued ops */
                         if (unlikely(enq < fetched)) {
                             for (uint16_t x = enq; x < fetched; x++) {
                                 rte_crypto_op_free(ops[vq][x]);
                             }
                         }
-                    }
-                }
 
-                /* ---- C) dequeue + finalize ---- */
-                uint32_t cur_infl = nb_inflight_ops[sock][vq];
-                if (!cur_infl) {
-                    continue;
-                }
-
-                uint16_t want = (uint16_t)RTE_MIN(burst_size, cur_infl);
-                uint16_t deq  = rte_cryptodev_dequeue_burst(
-                    info->cid, info->qid, ops_deq[vq], want);
-
-                if (!deq) {
-                    continue;
-                }
-
-                nb_callfds = 0;
-                uint16_t fin = rte_vhost_crypto_finalize_requests(
-                    ops_deq[vq], deq, callfds, &nb_callfds);
-
-                if (fin) {
-                    nb_inflight_ops[sock][vq] -= fin;
-                    vhost_crypto_inflight_sub(vid, fin);
-
-                    if (!options.guest_polling) {
-                        for (uint16_t k = 0; k < nb_callfds; k++) {
-                            if (callfds[k] >= 0) {
-                                eventfd_write(callfds[k], (eventfd_t)1);
-                            }
+                        /* replenish ops for next loop */
+                        if (enq) {
+                            rte_crypto_op_bulk_alloc(info->cop_pool, cop_type,
+                                                     ops[vq], enq);
                         }
                     }
-
-                    rte_mempool_put_bulk(info->cop_pool,
-                                         (void **)ops_deq[vq], fin);
                 }
 
-                /* tail not finalized -> push into pending (do NOT decrement inflight) */
-                if (unlikely(fin < deq)) {
-                    uint16_t left = deq - fin;
+                /* B) dequeue + finalize */
+                uint32_t cur_infl = nb_inflight_ops[sock][vq];
+                if (cur_infl) {
+                    uint16_t want = (uint16_t)RTE_MIN(burst_size, cur_infl);
+                    uint16_t deq = rte_cryptodev_dequeue_burst(
+                        info->cid, info->qid, ops_deq[vq], want);
 
-                    if (pending_cnt[sock][vq] + left <= MAX_PKT_BURST) {
-                        memcpy(&pending[sock][vq][pending_cnt[sock][vq]],
-                               &ops_deq[vq][fin],
-                               left * sizeof(ops_deq[vq][0]));
-                        pending_cnt[sock][vq] += left;
-                    } else {
-                        /* conservative: keep inflight stuck; don't drop/free these ops */
-                        /* you may add backoff here to avoid busy spin */
-                        /* rte_delay_us_sleep(50); */
+                    if (likely(deq)) {
+                        nb_callfds = 0;
+
+                        VCDBG("VID=%d VQ=%u BEFORE_FINALIZE cur_infl=%u deq=%u nb_inflight_ops[vq]=%u",
+                              vid, (unsigned)vq, cur_infl, (unsigned)deq, nb_inflight_ops[sock][vq]);
+
+                        uint16_t fin = rte_vhost_crypto_finalize_requests(
+                            ops_deq[vq], deq, callfds, &nb_callfds);
+
+                        VCDBG("VID=%d VQ=%u AFTER_FINALIZE deq=%u fin=%u nb_callfds=%u",
+                              vid, (unsigned)vq, (unsigned)deq, (unsigned)fin, (unsigned)nb_callfds);
+
+                        if (unlikely(fin != deq)) {
+                            VCDBG("VID=%d VQ=%u FINALIZE_MISMATCH deq=%u fin=%u",
+                                  vid, (unsigned)vq, (unsigned)deq, (unsigned)fin);
+                        }
+
+                        /* keep original behavior: treat deq as done to avoid inflight stall */
+                        uint16_t done = deq;
+                        if (unlikely(fin != deq)) {
+                            nb_callfds = 0; /* do not notify guest on failed writeback */
+                        } else {
+                            done = fin;
+                        }
+
+                        VCDBG("VID=%d VQ=%u INFLIGHT_SUB done=%u (deq=%u fin=%u) nb_inflight_ops_before=%u",
+                              vid, (unsigned)vq, (unsigned)done, (unsigned)deq, (unsigned)fin,
+                              nb_inflight_ops[sock][vq]);
+
+                        nb_inflight_ops[sock][vq] -= done;
+                        vhost_crypto_inflight_sub(vid, done);
+
+                        if (!options.guest_polling) {
+                            for (uint16_t k = 0; k < nb_callfds; k++) {
+                                if (callfds[k] >= 0)
+                                    eventfd_write(callfds[k], (eventfd_t)1);
+                            }
+                        }
+
+                        rte_mempool_put_bulk(info->cop_pool,
+                                             (void **)ops_deq[vq], done);
                     }
                 }
             }
         }
     }
 
-    /* not reached */
-    /* rte_free(nb_inflight_ops); rte_free(pending_cnt); rte_free(pending); rte_free(ops_deq); rte_free(ops); */
-    /* return 0; */
+    return ret;
 }
 
 
