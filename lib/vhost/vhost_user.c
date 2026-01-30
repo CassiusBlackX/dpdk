@@ -3175,7 +3175,10 @@ vhost_user_msg_handler(int vid, int fd)
 	} else {
 		VHOST_CONFIG_LOG(dev->ifname, DEBUG, "external request %d", request);
 	}
-
+	if (request == VHOST_USER_GET_VRING_BASE) {
+        VHOST_CONFIG_LOG(dev->ifname, INFO,
+                         "GET_VRING_BASE arrived (request=%d)", request);
+    }
 	ret = vhost_user_check_and_alloc_queue_pair(dev, &ctx);
 	if (ret < 0) {
 		VHOST_CONFIG_LOG(dev->ifname, ERR, "failed to alloc queue");

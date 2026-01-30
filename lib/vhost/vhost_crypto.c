@@ -2630,6 +2630,8 @@ int vhost_crypto_freeze(int vid) {
     }	
     /* Step 1: 设置冻结位，阻断新请求进入 */
     __atomic_store_n(&vcrypto->frozen, 1, __ATOMIC_RELEASE);
+	VC_LOG_INFO("FREEZE_BEGIN vid=%d ts_ms=%llu",
+            vid, (unsigned long long)(rte_get_timer_cycles() * 1000ULL / rte_get_timer_hz()));
 
     /* Step 2: 等待所有 inflight 请求完成（有界等待） */
     const uint64_t hz = rte_get_timer_hz();
@@ -2640,13 +2642,15 @@ int vhost_crypto_freeze(int vid) {
     while (1) {
         uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
         if (cur == 0) {
-            VC_LOG_INFO("FREEZE ok; inflight=0");
+            VC_LOG_INFO("FREEZE_OK vid=%d ts_ms=%llu",
+            vid, (unsigned long long)(rte_get_timer_cycles() * 1000ULL / rte_get_timer_hz()));
 		    break; /* quiescent state reached */
         }
 
         /* 打印进度日志（只在 inflight 变化时输出） */
         if (cur != last_inflight) {
-            VC_LOG_INFO("FREEZE draining... inflight=%u", cur);
+            VC_LOG_INFO("FREEZE_DRAIN vid=%d inflight=%u ts_ms=%llu",
+            vid, cur, (unsigned long long)(rte_get_timer_cycles() * 1000ULL / rte_get_timer_hz()));
             last_inflight = cur;
         }
 

@@ -15,8 +15,19 @@
 #include <rte_vhost.h>
 #include <rte_cryptodev.h>
 #include <rte_vhost_crypto.h>
-#include <rte_string_fns.h>
 
+#include <rte_string_fns.h>
+#include <time.h>
+
+static inline uint64_t vc_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+#define VCDBG(fmt, ...) \
+    fprintf(stderr, "[%llu ms] " fmt "\n", (unsigned long long)vc_now_ms(), ##__VA_ARGS__)
 #include <cmdline_rdline.h>
 #include <cmdline_parse.h>
 #include <cmdline_parse_string.h>
@@ -412,7 +423,10 @@ vhost_crypto_worker(void *arg)
 {
     struct rte_crypto_op *ops[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
     struct rte_crypto_op *ops_deq[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
-
+	    /* Pending ops that were dequeued but not finalized (vring temporarily invalid). */
+    struct rte_crypto_op *pending[NB_VIRTIO_QUEUES][MAX_PKT_BURST + 1];
+    uint16_t pending_cnt[NB_VIRTIO_QUEUES] = {0};
+	
     struct vhost_crypto_info *info = arg;
 
     /* per (socket, vq) inflight counters (do NOT mix different vids) */
@@ -506,46 +520,101 @@ vhost_crypto_worker(void *arg)
                     /* fetched==0: do nothing, but MUST still run drain below */
                 }
 
-                /* B) dequeue + finalize (must run even if FREEZE stops fetch) */
+                                /* B) finalize pending + dequeue + finalize */
                 uint32_t cur_infl = nb_inflight_ops[sock][vq];
                 if (cur_infl) {
 
-                    uint16_t want = (uint16_t)RTE_MIN(burst_size, cur_infl);
+                    nb_callfds = 0;
 
-                    uint16_t deq = rte_cryptodev_dequeue_burst(
-                        info->cid, info->qid, ops_deq[vq], want);
-                    if (likely(deq)) {
-                        nb_callfds = 0;
-                        uint16_t fin = rte_vhost_crypto_finalize_requests(
-                            ops_deq[vq], deq, callfds, &nb_callfds);
+                    /* 1) Try finalize pending first */
+                    if (pending_cnt[vq]) {
+                        uint16_t pdeq = pending_cnt[vq];
 
-                        /*
-                         * Migration/reconnect window may temporarily invalidate vrings.
-                         * In that case finalize may return less than deq; we still MUST
-                         * reclaim ops and decrement inflight, otherwise FREEZE semantics
-                         * become unreliable.
-                         */
-                        uint16_t done = deq;
-                        if (unlikely(fin != deq)) {
-                            nb_callfds = 0; /* do not notify guest on failed writeback */
-                        } else {
-                            done = fin;
+                        VCDBG("VID=%d VQ=%u PENDING_BEFORE_FINALIZE pending=%u cur_infl=%u",
+                              vid, (unsigned)vq, (unsigned)pdeq, cur_infl);
+
+                        uint16_t pfin = rte_vhost_crypto_finalize_requests(
+                            pending[vq], pdeq, callfds, &nb_callfds);
+
+                        VCDBG("VID=%d VQ=%u PENDING_AFTER_FINALIZE pdeq=%u pfin=%u nb_callfds=%u",
+                              vid, (unsigned)vq, (unsigned)pdeq, (unsigned)pfin, (unsigned)nb_callfds);
+
+                        /* Only finalized ones are done */
+                        if (pfin) {
+                            nb_inflight_ops[sock][vq] -= pfin;
+                            vhost_crypto_inflight_sub(vid, pfin);
+
+                            /* return finalized ops to mempool */
+                            rte_mempool_put_bulk(info->cop_pool, (void **)pending[vq], pfin);
                         }
 
-                        nb_inflight_ops[sock][vq] -= done;
-                        vhost_crypto_inflight_sub(vid, done);
+                        if (pfin < pdeq) {
+                            /* keep the remaining pending ops for next round */
+                            uint16_t remain = pdeq - pfin;
+                            memmove(&pending[vq][0], &pending[vq][pfin], remain * sizeof(pending[vq][0]));
+                            pending_cnt[vq] = remain;
 
-                        if (!options.guest_polling) {
-                            for (uint16_t k = 0; k < nb_callfds; k++) {
-                                if (callfds[k] >= 0)
-                                    eventfd_write(callfds[k], (eventfd_t)1);
+                            /* If writeback failed, do not notify guest */
+                            nb_callfds = 0;
+                        } else {
+                            pending_cnt[vq] = 0;
+                        }
+                    }
+
+                    /* 2) If there is still inflight and we have room, dequeue new ops */
+                    cur_infl = nb_inflight_ops[sock][vq];
+                    if (cur_infl && pending_cnt[vq] == 0) {
+                        uint16_t want = (uint16_t)RTE_MIN(burst_size, cur_infl);
+
+                        uint16_t deq = rte_cryptodev_dequeue_burst(
+                            info->cid, info->qid, ops_deq[vq], want);
+
+                        if (likely(deq)) {
+                            VCDBG("VID=%d VQ=%u BEFORE_FINALIZE cur_infl=%u deq=%u nb_inflight_ops[vq]=%u",
+                                  vid, (unsigned)vq, cur_infl, (unsigned)deq, nb_inflight_ops[sock][vq]);
+
+                            uint16_t fin = rte_vhost_crypto_finalize_requests(
+                                ops_deq[vq], deq, callfds, &nb_callfds);
+
+                            VCDBG("VID=%d VQ=%u AFTER_FINALIZE deq=%u fin=%u nb_callfds=%u",
+                                  vid, (unsigned)vq, (unsigned)deq, (unsigned)fin, (unsigned)nb_callfds);
+
+                            if (unlikely(fin < deq)) {
+                                VCDBG("VID=%d VQ=%u FINALIZE_PARTIAL: deq=%u fin=%u -> keep %u pending",
+                                      vid, (unsigned)vq, (unsigned)deq, (unsigned)fin, (unsigned)(deq - fin));
+                            }
+
+                            /* 2.1) completed part */
+                            if (fin) {
+                                nb_inflight_ops[sock][vq] -= fin;
+                                vhost_crypto_inflight_sub(vid, fin);
+                                rte_mempool_put_bulk(info->cop_pool, (void **)ops_deq[vq], fin);
+                            }
+
+                            /* 2.2) unfinished part becomes pending (do NOT decrement inflight!) */
+                            if (unlikely(fin < deq)) {
+                                uint16_t remain = deq - fin;
+                                /* copy pointers to pending buffer */
+                                for (uint16_t i = 0; i < remain; i++) {
+                                    pending[vq][i] = ops_deq[vq][fin + i];
+                                }
+                                pending_cnt[vq] = remain;
+
+                                /* IMPORTANT: do not notify guest if writeback failed/partial */
+                                nb_callfds = 0;
+                            }
+
+                            /* notify guest only when we successfully wrote back something */
+                            if (!options.guest_polling && nb_callfds) {
+                                for (uint16_t k = 0; k < nb_callfds; k++) {
+                                    if (callfds[k] >= 0)
+                                        eventfd_write(callfds[k], (eventfd_t)1);
+                                }
                             }
                         }
-
-                        rte_mempool_put_bulk(info->cop_pool,
-                                             (void **)ops_deq[vq], done);
                     }
                 }
+
             }
         }
     }
