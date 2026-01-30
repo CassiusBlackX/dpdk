@@ -695,14 +695,17 @@ out_dev_realloc:
 	if (dev_node == node)
 		return;
 
-	struct vhost_comp *tmp = (struct vhost_comp *)((*pdev)->extern_data);
+	void *extern_data = (*pdev)->extern_data;
+	typeof((*pdev)->extern_ops) extern_ops = (*pdev)->extern_ops;
+
 	dev = rte_realloc_socket(*pdev, sizeof(**pdev), 0, node);
 	if (!dev) {
 		VHOST_CONFIG_LOG((*pdev)->ifname, ERR, "failed to realloc dev on node %d", node);
 		return;
 	}
 	*pdev = dev;
-
+	dev->extern_data = extern_data;
+	dev->extern_ops = extern_ops;
 	VHOST_CONFIG_LOG(dev->ifname, INFO, "reallocated device on node %d", node);
 	vhost_devices[dev->vid] = dev;
 
