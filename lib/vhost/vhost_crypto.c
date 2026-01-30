@@ -990,18 +990,6 @@ vhost_crypto_close_sess(struct vhost_crypto *vcrypto, uint64_t session_id)
 static enum rte_vhost_msg_result
 vhost_crypto_msg_pre_handler(int vid, void *msg)
 {
-    struct vhu_msg_context *ctx = msg;
-
-    /* 只在 GET_VRING_BASE 前做 freeze，其他消息完全不干预 */
-    if (ctx->msg.request.frontend == VHOST_USER_GET_VRING_BASE) {
-        int ret = vhost_crypto_freeze(vid);
-        while (ret == -EBUSY) {
-            rte_delay_us_block(100);
-            ret = vhost_crypto_freeze(vid);
-        }
-        if (ret < 0) {
-            return RTE_VHOST_MSG_RESULT_ERR; /* 这会让 vhost-user 层认为失败 */
-        }
         return RTE_VHOST_MSG_RESULT_NOT_HANDLED; /* 关键：让原 handler 继续处理 GET_VRING_BASE */
     }
 
@@ -1080,8 +1068,14 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 			break;
 		}
 
-		if (__atomic_load_n(&vcrypto->frozen, __ATOMIC_ACQUIRE) == 0) {
-			VC_LOG_ERR("SAVE called without FREEZE (vid=%d)", vid);
+		/* Freeze only when we are actually snapshotting backend state */
+		int fr = vhost_crypto_freeze(vid);
+		while (fr == -EBUSY) {
+			rte_delay_us_block(100);
+			fr = vhost_crypto_freeze(vid);
+		}
+		if (fr < 0) {
+			VC_LOG_ERR("SAVE: freeze failed (vid=%d ret=%d)", vid, fr);
 			close(fd);
 			ret = RTE_VHOST_MSG_RESULT_ERR;
 			break;
@@ -1121,8 +1115,12 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 			(void)vhost_crypto_thaw(vid);
 		}
 
+		if (rc == 0) {
+			VC_LOG_INFO("LOAD_OK vid=%d -> auto THAW", vid);
+			(void)vhost_crypto_thaw(vid);
+		}
 		ret = (rc == 0) ? RTE_VHOST_MSG_RESULT_OK : RTE_VHOST_MSG_RESULT_ERR;
-		break;
+				break;
 	}
 
 
@@ -2499,7 +2497,7 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 	/* vring 未 ready/access_ok，不允许抓取 */
 	if (unlikely(!vq->ready || !vq->access_ok))
 		return 0;
-		
+
 	if (unlikely(qid >= VHOST_MAX_QUEUE_PAIRS)) {
 		VC_LOG_ERR("Invalid qid %u", qid);
 		return 0;
@@ -3511,12 +3509,18 @@ int vhost_crypto_load_state(int vid, int fd)
 int vhost_crypto_thaw(int vid)
 {
     struct virtio_net *dev = get_device(vid);
-    if (!dev || !dev->extern_data) return -ENOENT;
+    if (!dev || !dev->extern_data) {
+        VC_LOG_ERR("THAW vid=%d failed: dev/extern_data missing", vid);
+        return -ENOENT;
+    }
+
     struct vhost_crypto *vcrypto = dev->extern_data;
 
     int old = __atomic_exchange_n(&vcrypto->frozen, 0, __ATOMIC_ACQ_REL);
-    VC_LOG_INFO("THAW vid=%d frozen:%d->0 inflight=%u", vid, old,
-                __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE));
+    uint32_t inflight = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
+
+    VC_LOG_INFO("THAW vid=%d frozen:%d->0 inflight=%u", vid, old, inflight);
     return 0;
 }
+
 

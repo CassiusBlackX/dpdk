@@ -591,10 +591,10 @@ numa_realloc(struct virtio_net **pdev, struct vhost_virtqueue **pvq)
 
 	vq = rte_realloc_socket(*pvq, sizeof(**pvq), 0, node);
 	if (!vq) {
-		VHOST_CONFIG_LOG(dev->ifname, ERR,
-			"failed to realloc virtqueue %d on node %d",
+		VHOST_CONFIG_LOG(dev->ifname, WARNING,
+			"realloc virtqueue %d on node %d failed, keep old queue",
 			(*pvq)->index, node);
-		return;
+		goto out_dev_realloc;
 	}
 	*pvq = vq;
 
