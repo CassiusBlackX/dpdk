@@ -2538,7 +2538,7 @@ error_exit:
 	rte_free(vcrypto);
 
 	return ret;
-
+}
 
 RTE_EXPORT_SYMBOL(rte_vhost_crypto_free)
 int
@@ -3385,11 +3385,23 @@ void test_save_load_blob(int vid)
         return;
     }
 
-    if (vhost_crypto_load_state(vid, fd) < 0) {
-        fprintf(stderr, "[test] load_state failed\n");
-        close(fd);
-        return;
-    }
+	uint8_t *tmp = NULL;
+	size_t tlen = 0;
+
+	if (read_all_from_fd(fd, &tmp, &tlen) < 0) {
+		fprintf(stderr, "[test] read_all_from_fd failed\n");
+		close(fd);
+		return;
+	}
+	close(fd);
+
+	if (vhost_crypto_load_state(vid, tmp, tlen) < 0) {
+		fprintf(stderr, "[test] load_state failed\n");
+		free(tmp);
+		return;
+	}
+	free(tmp);
+
     close(fd);
     fprintf(stderr, "[test] load_state success\n");
 }
@@ -3485,9 +3497,41 @@ vc_session_create_asym(struct vhost_crypto *vcrypto, uint64_t sid,
     return vs;
 }
 
+int vhost_crypto_load_state(int vid, const void *buf, size_t len)
+{
+    int fd = -1;
+#ifdef __linux__
+    fd = memfd_create("vhost-crypto-snap", 0);
+#endif
+    if (fd < 0) {
+        /* fallback: use tmpfile */
+        FILE *fp = tmpfile();
+        if (!fp)
+            return -errno;
+        fd = fileno(fp);
+        /* fp will be closed when process exits; ok for test/debug */
+    }
+
+    if (write_full(fd, buf, len) != 0) {
+        int e = -errno;
+        close(fd);
+        return e;
+    }
+
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        int e = -errno;
+        close(fd);
+        return e;
+    }
+
+    int rc = vhost_crypto_load_state_fd(vid, fd);
+    close(fd);
+    return rc;
+}
+
 
 /* Load: read header + payload from fd and rebuild backend state */
-int vhost_crypto_load_state(int vid, int fd)
+static int vhost_crypto_load_state_fd(int vid, int fd)
 {
     struct vhost_crypto *vcrypto = vc_lookup(vid);
     if (unlikely(!vcrypto)) {
