@@ -13,7 +13,7 @@ struct vhost_crypto_dev;
 int vhost_crypto_freeze(int vid);              /* stop enqueue + drain inflight */
 int vhost_crypto_save_state(int vid, int fd);  /* serialize device/queues/sessions -> fd */
 /* lib/vhost/vhost_crypto_migration.h */
-static int vhost_crypto_load_state_fd(int vid, int fd)(int vid, const void *buf, size_t len);
+int vhost_crypto_load_state(int vid, const void *buf, size_t len);
 
 int vhost_crypto_thaw(int vid);                /* resume workers */
 

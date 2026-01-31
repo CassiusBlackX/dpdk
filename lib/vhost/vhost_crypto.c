@@ -1042,6 +1042,8 @@ read_all_from_fd(int fd, uint8_t **out_buf, size_t *out_len)
     return 0;
 }
 static inline int vhost_crypto_device_ready(struct virtio_net *dev);
+static int vhost_crypto_load_state_fd(int vid, int fd);
+
 static void
 vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
                                     struct vhost_crypto *vcrypto,
