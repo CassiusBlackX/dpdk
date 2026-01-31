@@ -2339,6 +2339,23 @@ vhost_user_set_vring_enable(struct virtio_net **pdev,
 	}
 
 	vq->enabled = enable;
+	if (enable &&
+		!(dev->flags & VIRTIO_DEV_VDPA_CONFIGURED) &&
+		(dev->features & (1ULL << VHOST_USER_F_PROTOCOL_FEATURES))) {
+
+		/* If SET_VRING_ADDR arrived before SET_VRING_ENABLE, we may have skipped
+		* translate_ring_addresses(). Do it now so vq->desc/avail/used and
+		* access_ok/ready become valid.
+		*/
+		if (vq->ring_addrs.desc_user_addr &&
+			vq->ring_addrs.avail_user_addr &&
+			vq->ring_addrs.used_user_addr) {
+
+			vring_invalidate(dev, vq);
+			translate_ring_addresses(&dev, &vq);
+			*pdev = dev;
+		}
+	}
 
 	return RTE_VHOST_MSG_RESULT_OK;
 }
