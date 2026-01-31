@@ -2907,7 +2907,6 @@ rte_vhost_crypto_finalize_requests(struct rte_crypto_op **ops,
 					nb_ops, left);
 			break;
 		}
-			break;
 
 		tmp_ops = &tmp_ops[count];
 		left -= count;
