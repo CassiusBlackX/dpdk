@@ -107,24 +107,58 @@ static inline void explicit_bzero_fallback(void *p, size_t n) {
 static inline int
 vhost_crypto_device_ready(struct virtio_net *dev, uint32_t qid)
 {
-    if (!dev || !dev->mem || dev->mem->nregions == 0)
+    struct vhost_virtqueue *vq;
+
+    /* mem table must be installed */
+    if (dev == NULL || dev->mem == NULL || dev->mem->nregions == 0)
         return 0;
+
+    /* queue index must be valid */
     if (qid >= dev->nr_vring)
         return 0;
 
-    struct vhost_virtqueue *vq = dev->virtqueue[qid];
-    if (!vq)
+    vq = dev->virtqueue[qid];
+    if (vq == NULL)
         return 0;
 
-    /* SET_VRING_ADDR 没生效时，这三个通常是 NULL */
-    if (!vq->desc || !vq->avail || !vq->used)
+    /* vring size must be set (SET_VRING_NUM) */
+    if (vq->size == 0)
         return 0;
 
+    /* addr must be set for split ring (SET_VRING_ADDR) */
+    if (vq->desc == NULL || vq->avail == NULL || vq->used == NULL)
+        return 0;
+
+    /* eventfds must be installed (SET_VRING_KICK/CALL) */
+    if (vq->kickfd < 0 || vq->callfd < 0)
+        return 0;
+
+    /* vhost core already validated access */
     if (!vq->ready || !vq->access_ok)
         return 0;
 
     return 1;
 }
+
+static inline void
+vhost_crypto_dump_ready(struct virtio_net *dev, uint32_t qid)
+{
+    struct vhost_virtqueue *vq = (dev && qid < dev->nr_vring) ? dev->virtqueue[qid] : NULL;
+
+    VC_LOG_INFO("READYCHK: mem=%p nreg=%u vq=%p size=%u desc=%p avail=%p used=%p kick=%d call=%d ready=%d access_ok=%d",
+        dev ? dev->mem : NULL,
+        (dev && dev->mem) ? dev->mem->nregions : 0,
+        vq,
+        vq ? vq->size : 0,
+        vq ? vq->desc : NULL,
+        vq ? vq->avail : NULL,
+        vq ? vq->used : NULL,
+        vq ? vq->kickfd : -1,
+        vq ? vq->callfd : -1,
+        vq ? vq->ready : 0,
+        vq ? vq->access_ok : 0);
+}
+
 
 /* 只由 worker 线程调用：看到 ready 才 apply，一次成功后清 pending */
 static void
@@ -133,7 +167,9 @@ vhost_crypto_try_apply_pending_in_worker(int vid, struct virtio_net *dev)
     struct vhost_crypto *vcrypto = dev->extern_data;
     if (!vcrypto || !vcrypto->pending_load_valid)
         return;
-
+	
+	vhost_crypto_dump_ready(dev, qid);
+	
     if (!vhost_crypto_device_ready(dev, 0))
         return;
 
@@ -1064,29 +1100,44 @@ vhost_crypto_msg_pre_handler(int vid, void *msg)
     return RTE_VHOST_MSG_RESULT_NOT_HANDLED;
 }
 
+
 static int
-vhost_crypto_device_ready(struct virtio_net *dev, uint32_t qid)
+read_all_from_fd(int fd, uint8_t **out_buf, size_t *out_len)
 {
-    if (!dev || !dev->mem || dev->mem->nregions == 0)
-        return 0;
+    size_t cap = 4096;
+    size_t len = 0;
+    uint8_t *buf = malloc(cap);
+    if (!buf)
+        return -ENOMEM;
 
-    if (qid >= dev->nr_vring)
-        return 0;
+    for (;;) {
+        ssize_t n = read(fd, buf + len, cap - len);
+        if (n > 0) {
+            len += (size_t)n;
+            if (len == cap) {
+                cap *= 2;
+                uint8_t *nb = realloc(buf, cap);
+                if (!nb) {
+                    free(buf);
+                    return -ENOMEM;
+                }
+                buf = nb;
+            }
+            continue;
+        }
+        if (n == 0)
+            break; /* EOF */
+        if (errno == EINTR)
+            continue;
+        free(buf);
+        return -errno;
+    }
 
-    struct vhost_virtqueue *vq = dev->virtqueue[qid];
-    if (!vq)
-        return 0;
-
-    /* 这三者为空=SET_VRING_ADDR 还没真正生效 */
-    if (!vq->desc || !vq->avail || !vq->used)
-        return 0;
-
-    /* 这俩通常表示翻译/权限检查通过 */
-    if (!vq->ready || !vq->access_ok)
-        return 0;
-
-    return 1;
+    *out_buf = buf;
+    *out_len = len;
+    return 0;
 }
+
 
 static enum rte_vhost_msg_result
 vhost_crypto_msg_post_handler(int vid, void *msg)
@@ -2594,6 +2645,9 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 		VC_LOG_ERR("Invalid vid %i", vid);
 		return 0;
 	}
+	
+	/* NEW: give worker a chance to apply pending CRYPTO_LOAD once vring/mem is ready */
+	vhost_crypto_try_apply_pending_in_worker(vid, dev);
 
 	vq = dev->virtqueue[qid];
 	if (unlikely(vq == NULL))

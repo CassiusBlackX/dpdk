@@ -15,6 +15,7 @@
 #include <rte_vhost.h>
 #include <rte_cryptodev.h>
 #include <rte_vhost_crypto.h>
+#include <rte_spinlock.h>
 
 #include <rte_string_fns.h>
 #include <time.h>
