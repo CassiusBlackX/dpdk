@@ -1051,13 +1051,14 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
 {
     void *buf = NULL;
     size_t len = 0;
+    int rc;
 
-    if (!vcrypto)
+    if (!vcrypto || !dev)
         return;
 
-    /* 先快速检查：没有 pending 直接返回 */
+    /* 没有 pending 直接返回 */
     rte_spinlock_lock(&vcrypto->pending_lock);
-    if (!vcrypto->pending_load_valid) {
+    if (!vcrypto->pending_load_valid || !vcrypto->pending_load_buf || vcrypto->pending_load_len == 0) {
         rte_spinlock_unlock(&vcrypto->pending_lock);
         return;
     }
@@ -1069,33 +1070,44 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
         return;
     }
 
-    /* ready 了：原子地“取走 pending 并清掉标志” */
-    rte_spinlock_lock(&vcrypto->pending_lock);
-    if (!vcrypto->pending_load_valid) { /* 期间可能被别的线程抢先 apply 了 */
-        rte_spinlock_unlock(&vcrypto->pending_lock);
+    /* 额外安全门：任一队列 access_ok 没开时不 apply（避免在 vring/guest 映射未稳定时落状态） */
+    if (dev->virtqueue[0] && !dev->virtqueue[0]->access_ok) {
+        VC_LOG_INFO("pending LOAD, but access_ok=0 (vid=%d why=%s)", vid, why);
         return;
     }
 
+    /* 取出 pending，但先不要清标志：失败要能回滚 */
+    rte_spinlock_lock(&vcrypto->pending_lock);
+    if (!vcrypto->pending_load_valid || !vcrypto->pending_load_buf || vcrypto->pending_load_len == 0) {
+        rte_spinlock_unlock(&vcrypto->pending_lock);
+        return;
+    }
     buf = vcrypto->pending_load_buf;
     len = vcrypto->pending_load_len;
-    vcrypto->pending_load_buf = NULL;
-    vcrypto->pending_load_len = 0;
-    vcrypto->pending_load_valid = 0;
     rte_spinlock_unlock(&vcrypto->pending_lock);
 
     VC_LOG_INFO("Applying deferred CRYPTO_LOAD now (vid=%d why=%s len=%zu)", vid, why, len);
 
-    int rc = vhost_crypto_load_state(vid, buf, len);
-
-    rte_free(buf);
+    rc = vhost_crypto_load_state(vid, buf, len);
 
     if (rc == 0) {
+        /* 成功：再清 pending + free */
+        rte_spinlock_lock(&vcrypto->pending_lock);
+        if (vcrypto->pending_load_buf == buf && vcrypto->pending_load_len == len) {
+            vcrypto->pending_load_buf = NULL;
+            vcrypto->pending_load_len = 0;
+            vcrypto->pending_load_valid = 0;
+        }
+        rte_spinlock_unlock(&vcrypto->pending_lock);
+
+        rte_free(buf);
         VC_LOG_INFO("Deferred LOAD OK (vid=%d)", vid);
-        /* 这里是否自动 thaw 取决于你的策略；你现在在 SET_STATUS DRIVER_OK 里 thaw 也可以 */
     } else {
-        VC_LOG_ERR("Deferred LOAD failed (vid=%d rc=%d)", vid, rc);
+        /* 失败：不 free、不清 pending，让后续触发点还能再试（你现在 rc=-5 就属于必须保留的情况） */
+        VC_LOG_ERR("Deferred LOAD failed (vid=%d rc=%d) keep pending for retry", vid, rc);
     }
 }
+
 
 
 static enum rte_vhost_msg_result
@@ -1226,7 +1238,7 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 				snprintf(&hex[i * 3], 4, "%02x ", p[i]);
 			}
 			VC_LOG_INFO("CRYPTO_LOAD raw32: %s", hex);
-			
+
 			/* QEMU should send msg.size=8 and payload.u64 = blob_len */
 			if (ctx->msg.size != sizeof(uint64_t)) {
 					VC_LOG_ERR("CRYPTO_LOAD bad msg.size=%u (expect 8) vid=%d",
@@ -2764,10 +2776,34 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 	if (unlikely(vq == NULL))
 		return 0;
 
-	/* access_ok 是安全底线；ready 可能受 DRIVER_OK 时序影响，不能当作数据面硬闸门 */
-	if (unlikely(!vq->access_ok)){
+	if (unlikely(qid >= VHOST_MAX_QUEUE_PAIRS)) {
+		VC_LOG_ERR("Invalid qid %u", qid);
+		return 0;
+	}
+
+	/* 先拿 vcrypto：这是 host 侧结构，不碰 vring/guest 内存，安全 */
+	vcrypto = (struct vhost_crypto *)dev->extern_data;
+	if (unlikely(vcrypto == NULL)) {
+		VC_LOG_ERR("Cannot find required data, is it initialized?");
+		return 0;
+	}
+
+	/* ✅ FREEZE 语义：冻结时不抓取新 descriptor（纯 backpressure，不改 vring 索引） */
+	if (unlikely(__atomic_load_n(&vcrypto->frozen, __ATOMIC_ACQUIRE))) {
+		return 0;
+	}
+
+	/* ✅ 先做一次“前检查式”的 apply 尝试：避免 ready 刚变真但你错过触发点
+	* 重要：vhost_crypto_try_apply_pending_load() 内部也必须先判断 device ready，
+	* 并且在 access_ok 不满足时不能去读 vring/guest 内存。 */
+	if (unlikely(vcrypto->pending_load_buf != NULL)) {
+		vhost_crypto_try_apply_pending_load(vid, dev, vcrypto, "fetch-pre");
+	}
+
+	/* access_ok 是硬门：没开就绝对不要触碰 vring/guest 内存 */
+	if (unlikely(!vq->access_ok)) {
 		static int once;
-		if (!once && (!vq->ready || !vq->access_ok)) {
+		if (!once) {
 			once = 1;
 			VC_LOG_ERR("TAG_FETCH_GATE vid=%d qid=%u status=0x%x ready=%d access_ok=%d",
 					vid, qid, dev->status, vq->ready, vq->access_ok);
@@ -2775,22 +2811,10 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 		return 0;
 	}
 
-	if (unlikely(qid >= VHOST_MAX_QUEUE_PAIRS)) {
-		VC_LOG_ERR("Invalid qid %u", qid);
-		return 0;
+	/* ✅ 再来一次“安全点”的 apply：此时允许做真正的 load/apply（若需要访问 vring/guest 内存） */
+	if (unlikely(vcrypto->pending_load_buf != NULL)) {
+		vhost_crypto_try_apply_pending_load(vid, dev, vcrypto, "fetch-post");
 	}
-
-	vcrypto = (struct vhost_crypto *)dev->extern_data;
-	if (unlikely(vcrypto == NULL)) {
-		VC_LOG_ERR("Cannot find required data, is it initialized?");
-		return 0;
-	}
-	/* ✅ FREEZE 语义：冻结时不抓取新 descriptor（纯 backpressure，不改 vring 索引） */
-	if (unlikely(__atomic_load_n(&vcrypto->frozen, __ATOMIC_ACQUIRE))) {
-		return 0;
-	}
-
-	vq = dev->virtqueue[qid];
 
 	if (unlikely(vq == NULL)) {
 		VC_LOG_ERR("TAG_FETCH_INVALID_VQ vid=%d qid=%u flags=0x%x dev=%p vq=%p",
