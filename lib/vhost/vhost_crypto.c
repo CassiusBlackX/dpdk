@@ -1215,7 +1215,18 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 					ret = RTE_VHOST_MSG_RESULT_ERR;
 					break;
 			}
+			uint8_t *p = (uint8_t *)&ctx->msg;
+			VC_LOG_INFO("CRYPTO_LOAD hdr: vid=%d fd_num=%d size=%u",
+						vid, ctx->fd_num, ctx->msg.size);
 
+			/* hexdump 前 32 字节（含 hdr + u64 payload），避免结构体差异时啥都看不到 */
+			char hex[32 * 3 + 1] = {0};
+			size_t dump_n = 32;
+			for (size_t i = 0; i < dump_n; i++) {
+				snprintf(&hex[i * 3], 4, "%02x ", p[i]);
+			}
+			VC_LOG_INFO("CRYPTO_LOAD raw32: %s", hex);
+			
 			/* QEMU should send msg.size=8 and payload.u64 = blob_len */
 			if (ctx->msg.size != sizeof(uint64_t)) {
 					VC_LOG_ERR("CRYPTO_LOAD bad msg.size=%u (expect 8) vid=%d",
