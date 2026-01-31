@@ -335,7 +335,7 @@ struct __rte_cache_aligned vhost_crypto {
 	rte_spinlock_t pending_lock;
     uint8_t *pending_load_buf;
     size_t pending_load_len;
-    volatile int pending_load_valid;
+    uint8_t pending_load_valid;
 };
 
 struct vhost_crypto_writeback_data {
@@ -825,7 +825,7 @@ vhost_crypto_create_asym_sess(struct vhost_crypto *vcrypto,
     /* 1) 来宾参数 -> DPDK xform（沿用你已有的转换） */
     switch (sess_param->u.asym_sess.algo) {
     case VIRTIO_CRYPTO_AKCIPHER_RSA:
-        ret = rsa_param_transform(&sess_param->u.asym_sess, &xform);
+        ret = rsa_param_transform(&xform, &sess_param->u.asym_sess);
         if (unlikely(ret < 0)) {
             VC_LOG_ERR("Error transform session msg (%i)", ret);
             sess_param->session_id = ret;
@@ -1041,30 +1041,45 @@ read_all_from_fd(int fd, uint8_t **out_buf, size_t *out_len)
     *out_len = len;
     return 0;
 }
-
+static inline int vhost_crypto_device_ready(struct virtio_net *dev);
 static void
 vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
                                     struct vhost_crypto *vcrypto,
                                     const char *why)
 {
+    void *buf = NULL;
+    size_t len = 0;
+
     if (!vcrypto)
         return;
 
-    if (!vcrypto->pending_load_valid)
+    /* 先快速检查：没有 pending 直接返回 */
+    rte_spinlock_lock(&vcrypto->pending_lock);
+    if (!vcrypto->pending_load_valid) {
+        rte_spinlock_unlock(&vcrypto->pending_lock);
         return;
+    }
+    rte_spinlock_unlock(&vcrypto->pending_lock);
 
+    /* 设备未 ready：不动 pending，留待后续触发点再试 */
     if (!vhost_crypto_device_ready(dev)) {
         VC_LOG_INFO("pending LOAD, but device not ready yet (vid=%d why=%s)", vid, why);
         return;
     }
 
-    /* 取出 pending，立刻清掉标志，防止重复 apply */
-    void *buf = vcrypto->pending_load_buf;
-    size_t len = vcrypto->pending_load_len;
+    /* ready 了：原子地“取走 pending 并清掉标志” */
+    rte_spinlock_lock(&vcrypto->pending_lock);
+    if (!vcrypto->pending_load_valid) { /* 期间可能被别的线程抢先 apply 了 */
+        rte_spinlock_unlock(&vcrypto->pending_lock);
+        return;
+    }
 
+    buf = vcrypto->pending_load_buf;
+    len = vcrypto->pending_load_len;
     vcrypto->pending_load_buf = NULL;
     vcrypto->pending_load_len = 0;
     vcrypto->pending_load_valid = 0;
+    rte_spinlock_unlock(&vcrypto->pending_lock);
 
     VC_LOG_INFO("Applying deferred CRYPTO_LOAD now (vid=%d why=%s len=%zu)", vid, why, len);
 
@@ -1073,13 +1088,13 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
     rte_free(buf);
 
     if (rc == 0) {
-        VC_LOG_INFO("Deferred LOAD_OK -> THAW (vid=%d)", vid);
-        vhost_crypto_thaw(vid);
+        VC_LOG_INFO("Deferred LOAD OK (vid=%d)", vid);
+        /* 这里是否自动 thaw 取决于你的策略；你现在在 SET_STATUS DRIVER_OK 里 thaw 也可以 */
     } else {
-        VC_LOG_ERR("Deferred LOAD failed (vid=%d rc=%d) (state kept running frozen?)", vid, rc);
-        /* 如果你希望失败时继续保留 pending 以便重试，这里就别清 valid；但调试阶段建议先 fail-fast */
+        VC_LOG_ERR("Deferred LOAD failed (vid=%d rc=%d)", vid, rc);
     }
 }
+
 
 static enum rte_vhost_msg_result
 vhost_crypto_msg_post_handler(int vid, void *msg)
@@ -1188,16 +1203,55 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 	}
 
 
-	case VHOST_USER_CRYPTO_LOAD:
-		VC_LOG_INFO("CRYPTO_LOAD deferred (vid=%d)", vid);
+	case VHOST_USER_CRYPTO_LOAD: {
+		int fd = (ctx->fd_num > 0) ? ctx->fds[0] : -1;
+		ctx->fds[0] = -1;
+		ctx->fd_num = 0;
 
-		vcrypto->pending_load_buf = rte_malloc(NULL, msg_len, 0);
-		memcpy(vcrypto->pending_load_buf, msg_buf, msg_len);
-		vcrypto->pending_load_len = msg_len;
+		if (fd < 0) {
+			VC_LOG_ERR("CRYPTO_LOAD missing fd (vid=%d)", vid);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		uint8_t *tmp = NULL;
+		size_t len = 0;
+		int rr = read_all_from_fd(fd, &tmp, &len);
+		close(fd);
+
+		if (rr < 0) {
+			VC_LOG_ERR("CRYPTO_LOAD read fd failed (vid=%d rr=%d)", vid, rr);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* 把 malloc 的临时 buf 拷贝进 rte_malloc，后面统一 rte_free */
+		void *buf = rte_malloc(NULL, len, 0);
+		if (!buf) {
+			free(tmp);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+		memcpy(buf, tmp, len);
+		free(tmp);
+
+		/* 覆盖旧的 pending + 写入新 pending：必须加锁，避免 try_apply 撕裂/重复释放 */
+		rte_spinlock_lock(&vcrypto->pending_lock);
+
+		if (vcrypto->pending_load_valid && vcrypto->pending_load_buf) {
+			rte_free(vcrypto->pending_load_buf);
+		}
+
+		vcrypto->pending_load_buf = buf;
+		vcrypto->pending_load_len = len;
 		vcrypto->pending_load_valid = 1;
+
+		rte_spinlock_unlock(&vcrypto->pending_lock);
 
 		ret = RTE_VHOST_MSG_RESULT_OK;
 		break;
+	}
+
 
 
 	case VHOST_USER_CRYPTO_THAW:
@@ -1225,7 +1279,6 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 	case VHOST_USER_SET_VRING_NUM:
 	case VHOST_USER_SET_VRING_BASE:
 	case VHOST_USER_SET_VRING_KICK:
-	case VHOST_USER_SET_STATUS:
 		/* 这些必须让 vhost core 去真正配置队列/内存，我们这里只做“配置后尝试 apply pending” */
 		ret = RTE_VHOST_MSG_RESULT_NOT_HANDLED;
 
@@ -2465,13 +2518,27 @@ rte_vhost_crypto_create(int vid, uint8_t cryptodev_id,
 	return 0;
 
 error_exit:
-	rte_hash_free(vcrypto->session_map);
-	rte_mempool_free(vcrypto->mbuf_pool);
+	/* pending buffer cleanup */
+	rte_spinlock_lock(&vcrypto->pending_lock);
+	if (vcrypto->pending_load_valid && vcrypto->pending_load_buf) {
+		rte_free(vcrypto->pending_load_buf);
+		vcrypto->pending_load_buf = NULL;
+		vcrypto->pending_load_len = 0;
+		vcrypto->pending_load_valid = 0;
+	}
+	rte_spinlock_unlock(&vcrypto->pending_lock);
+
+	if (vcrypto->session_map)
+		rte_hash_free(vcrypto->session_map);
+	if (vcrypto->mbuf_pool)
+		rte_mempool_free(vcrypto->mbuf_pool);
+	if (vcrypto->wb_pool)
+		rte_mempool_free(vcrypto->wb_pool);
 
 	rte_free(vcrypto);
 
 	return ret;
-}
+
 
 RTE_EXPORT_SYMBOL(rte_vhost_crypto_free)
 int
@@ -2490,6 +2557,16 @@ rte_vhost_crypto_free(int vid)
 		VC_LOG_ERR("Cannot find required data, is it initialized?");
 		return -ENOENT;
 	}
+
+	/* free pending load buffer if any */
+	rte_spinlock_lock(&vcrypto->pending_lock);
+	if (vcrypto->pending_load_valid && vcrypto->pending_load_buf) {
+		rte_free(vcrypto->pending_load_buf);
+		vcrypto->pending_load_buf = NULL;
+		vcrypto->pending_load_len = 0;
+		vcrypto->pending_load_valid = 0;
+	}
+	rte_spinlock_unlock(&vcrypto->pending_lock);
 
 	rte_hash_free(vcrypto->session_map);
 	rte_mempool_free(vcrypto->mbuf_pool);
