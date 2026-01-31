@@ -2753,9 +2753,16 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 	if (unlikely(vq == NULL))
 		return 0;
 
-	/* vring 未 ready/access_ok，不允许抓取 */
-	if (unlikely(!vq->ready || !vq->access_ok))
+	/* access_ok 是安全底线；ready 可能受 DRIVER_OK 时序影响，不能当作数据面硬闸门 */
+	if (unlikely(!vq->access_ok)){
+		static int once;
+		if (!once && (!vq->ready || !vq->access_ok)) {
+			once = 1;
+			VC_LOG_ERR("TAG_FETCH_GATE vid=%d qid=%u status=0x%x ready=%d access_ok=%d",
+					vid, qid, dev->status, vq->ready, vq->access_ok);
+		}
 		return 0;
+	}
 
 	if (unlikely(qid >= VHOST_MAX_QUEUE_PAIRS)) {
 		VC_LOG_ERR("Invalid qid %u", qid);
