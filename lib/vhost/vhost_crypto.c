@@ -1064,17 +1064,13 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
     }
     rte_spinlock_unlock(&vcrypto->pending_lock);
 
-    /* 设备未 ready：不动 pending，留待后续触发点再试 */
-    if (!vhost_crypto_device_ready(dev)) {
-        VC_LOG_INFO("pending LOAD, but device not ready yet (vid=%d why=%s)", vid, why);
-        return;
-    }
-
-    /* 额外安全门：任一队列 access_ok 没开时不 apply（避免在 vring/guest 映射未稳定时落状态） */
-    if (dev->virtqueue[0] && !dev->virtqueue[0]->access_ok) {
-        VC_LOG_INFO("pending LOAD, but access_ok=0 (vid=%d why=%s)", vid, why);
-        return;
-    }
+    /* Only require that mem table is present.
+	* Session restore does not need vring translated yet.
+	*/
+	if (!dev->mem || dev->mem->nregions == 0) {
+		VC_LOG_INFO("pending LOAD, but mem table not ready yet (vid=%d why=%s)", vid, why);
+		return;
+	}
 
     /* 取出 pending，但先不要清标志：失败要能回滚 */
     rte_spinlock_lock(&vcrypto->pending_lock);

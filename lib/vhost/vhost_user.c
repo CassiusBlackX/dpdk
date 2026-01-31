@@ -766,9 +766,43 @@ qva_to_vva(struct virtio_net *dev, uint64_t qva, uint64_t *len)
 		}
 	}
 out_error:
-	*len = 0;
+    *len = 0;
 
-	return 0;
+    /* Debug: qva not covered by mem table -> rings can never be translated. */
+    {
+        static uint64_t last_qva;
+        static uint64_t miss_cnt;
+
+        miss_cnt++;
+        if (qva != last_qva || (miss_cnt % 4096 == 1)) {
+            last_qva = qva;
+
+            VHOST_CONFIG_LOG(dev ? dev->ifname : "vhost", ERR,
+                "qva_to_vva: qva=0x%lx not in any region (nregions=%u, requested_len=0x%lx, miss_cnt=%lu)",
+                (unsigned long)qva,
+                (dev && dev->mem) ? dev->mem->nregions : 0,
+                (unsigned long)(len ? *len : 0),
+                (unsigned long)miss_cnt);
+
+            if (dev && dev->mem) {
+                uint32_t j;
+                for (j = 0; j < dev->mem->nregions; j++) {
+                    struct rte_vhost_mem_region *rr = &dev->mem->regions[j];
+                    VHOST_CONFIG_LOG(dev->ifname, ERR,
+                        "  region[%u]: guest_qva=[0x%lx,0x%lx) gpa=0x%lx size=0x%lx host=0x%lx fd=%d",
+                        j,
+                        (unsigned long)rr->guest_user_addr,
+                        (unsigned long)(rr->guest_user_addr + rr->size),
+                        (unsigned long)rr->guest_phys_addr,
+                        (unsigned long)rr->size,
+                        (unsigned long)rr->host_user_addr,
+                        rr->fd);
+                }
+            }
+        }
+    }
+
+    return 0;
 }
 
 
