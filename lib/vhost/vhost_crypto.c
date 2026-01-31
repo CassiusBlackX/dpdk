@@ -104,106 +104,10 @@ static inline void explicit_bzero_fallback(void *p, size_t n) {
 #define explicit_bzero explicit_bzero_fallback
 #endif
 
-static inline int
-vhost_crypto_device_ready(struct virtio_net *dev, uint32_t qid)
-{
-    struct vhost_virtqueue *vq;
-
-    /* mem table must be installed */
-    if (dev == NULL || dev->mem == NULL || dev->mem->nregions == 0)
-        return 0;
-
-    /* queue index must be valid */
-    if (qid >= dev->nr_vring)
-        return 0;
-
-    vq = dev->virtqueue[qid];
-    if (vq == NULL)
-        return 0;
-
-    /* vring size must be set (SET_VRING_NUM) */
-    if (vq->size == 0)
-        return 0;
-
-    /* addr must be set for split ring (SET_VRING_ADDR) */
-    if (vq->desc == NULL || vq->avail == NULL || vq->used == NULL)
-        return 0;
-
-    /* eventfds must be installed (SET_VRING_KICK/CALL) */
-    if (vq->kickfd < 0 || vq->callfd < 0)
-        return 0;
-
-    /* vhost core already validated access */
-    if (!vq->ready || !vq->access_ok)
-        return 0;
-
-    return 1;
-}
-
-static inline void
-vhost_crypto_dump_ready(struct virtio_net *dev, uint32_t qid)
-{
-    struct vhost_virtqueue *vq = (dev && qid < dev->nr_vring) ? dev->virtqueue[qid] : NULL;
-
-    VC_LOG_INFO("READYCHK: mem=%p nreg=%u vq=%p size=%u desc=%p avail=%p used=%p kick=%d call=%d ready=%d access_ok=%d",
-        dev ? dev->mem : NULL,
-        (dev && dev->mem) ? dev->mem->nregions : 0,
-        vq,
-        vq ? vq->size : 0,
-        vq ? vq->desc : NULL,
-        vq ? vq->avail : NULL,
-        vq ? vq->used : NULL,
-        vq ? vq->kickfd : -1,
-        vq ? vq->callfd : -1,
-        vq ? vq->ready : 0,
-        vq ? vq->access_ok : 0);
-}
 
 
-/* 只由 worker 线程调用：看到 ready 才 apply，一次成功后清 pending */
-static void
-vhost_crypto_try_apply_pending_in_worker(int vid, struct virtio_net *dev)
-{
-    struct vhost_crypto *vcrypto = dev->extern_data;
-    if (!vcrypto || !vcrypto->pending_load_valid)
-        return;
-	
-	vhost_crypto_dump_ready(dev, qid);
-	
-    if (!vhost_crypto_device_ready(dev, 0))
-        return;
 
-    uint8_t *buf = NULL;
-    size_t len = 0;
 
-    /* swap out pending buffer under lock */
-    rte_spinlock_lock(&vcrypto->pending_lock);
-    if (vcrypto->pending_load_valid) {
-        buf = vcrypto->pending_load_buf;
-        len = vcrypto->pending_load_len;
-        vcrypto->pending_load_buf = NULL;
-        vcrypto->pending_load_len = 0;
-        vcrypto->pending_load_valid = 0;
-    }
-    rte_spinlock_unlock(&vcrypto->pending_lock);
-
-    if (!buf || len == 0)
-        return;
-
-    VC_LOG_INFO("PENDING_LOAD: applying in worker (vid=%d, len=%zu)", vid, len);
-
-    /* 这里调用你拆出来的 from_buf 解析函数 */
-    int rc = vhost_crypto_load_state_from_buf(vid, buf, len);
-    free(buf);
-
-    if (rc == 0) {
-        VC_LOG_INFO("PENDING_LOAD_OK -> THAW (vid=%d)", vid);
-        vhost_crypto_thaw(vid);
-    } else {
-        VC_LOG_ERR("PENDING_LOAD failed (vid=%d rc=%d)", vid, rc);
-        /* 失败时你可以选择把 buf 再塞回 pending 以便重试；debug 阶段先不重试更容易定位 */
-    }
-}
 
 /* duplicate bytes into DPDK heap (zero-inited) */
 static inline uint8_t *
@@ -1138,6 +1042,44 @@ read_all_from_fd(int fd, uint8_t **out_buf, size_t *out_len)
     return 0;
 }
 
+static void
+vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
+                                    struct vhost_crypto *vcrypto,
+                                    const char *why)
+{
+    if (!vcrypto)
+        return;
+
+    if (!vcrypto->pending_load_valid)
+        return;
+
+    if (!vhost_crypto_device_ready(dev)) {
+        VC_LOG_INFO("pending LOAD, but device not ready yet (vid=%d why=%s)", vid, why);
+        return;
+    }
+
+    /* 取出 pending，立刻清掉标志，防止重复 apply */
+    void *buf = vcrypto->pending_load_buf;
+    size_t len = vcrypto->pending_load_len;
+
+    vcrypto->pending_load_buf = NULL;
+    vcrypto->pending_load_len = 0;
+    vcrypto->pending_load_valid = 0;
+
+    VC_LOG_INFO("Applying deferred CRYPTO_LOAD now (vid=%d why=%s len=%zu)", vid, why, len);
+
+    int rc = vhost_crypto_load_state(vid, buf, len);
+
+    rte_free(buf);
+
+    if (rc == 0) {
+        VC_LOG_INFO("Deferred LOAD_OK -> THAW (vid=%d)", vid);
+        vhost_crypto_thaw(vid);
+    } else {
+        VC_LOG_ERR("Deferred LOAD failed (vid=%d rc=%d) (state kept running frozen?)", vid, rc);
+        /* 如果你希望失败时继续保留 pending 以便重试，这里就别清 valid；但调试阶段建议先 fail-fast */
+    }
+}
 
 static enum rte_vhost_msg_result
 vhost_crypto_msg_post_handler(int vid, void *msg)
@@ -1246,36 +1188,16 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 	}
 
 
-	case VHOST_USER_CRYPTO_LOAD: {
-		int fd = (ctx->fd_num > 0) ? ctx->fds[0] : -1;
-		if (fd < 0) { ret = RTE_VHOST_MSG_RESULT_ERR; break; }
+	case VHOST_USER_CRYPTO_LOAD:
+		VC_LOG_INFO("CRYPTO_LOAD deferred (vid=%d)", vid);
 
-		uint8_t *buf = NULL;
-		size_t len = 0;
-		int rc = read_all_from_fd(fd, &buf, &len);  /* 你实现：循环 read + realloc */
-		close(fd);
-		ctx->fd_num = 0;
-
-		if (rc < 0 || !buf || len == 0) {
-			free(buf);
-			ret = RTE_VHOST_MSG_RESULT_ERR;
-			break;
-		}
-
-		struct vhost_crypto *vcrypto = dev->extern_data;
-		rte_spinlock_lock(&vcrypto->pending_lock);
-		free(vcrypto->pending_load_buf);
-		vcrypto->pending_load_buf = buf;
-		vcrypto->pending_load_len = len;
+		vcrypto->pending_load_buf = rte_malloc(NULL, msg_len, 0);
+		memcpy(vcrypto->pending_load_buf, msg_buf, msg_len);
+		vcrypto->pending_load_len = msg_len;
 		vcrypto->pending_load_valid = 1;
-		rte_spinlock_unlock(&vcrypto->pending_lock);
 
-		VC_LOG_INFO("CRYPTO_LOAD received: buffered pending state (vid=%d len=%zu)", vid, len);
-
-		/* 不要在这里 thaw！交给 worker 在 device ready 时做 */
 		ret = RTE_VHOST_MSG_RESULT_OK;
 		break;
-	}
 
 
 	case VHOST_USER_CRYPTO_THAW:
@@ -1298,6 +1220,17 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 		break;
 	#endif
 
+	case VHOST_USER_SET_MEM_TABLE:
+	case VHOST_USER_SET_VRING_ADDR:
+	case VHOST_USER_SET_VRING_NUM:
+	case VHOST_USER_SET_VRING_BASE:
+	case VHOST_USER_SET_VRING_KICK:
+	case VHOST_USER_SET_STATUS:
+		/* 这些必须让 vhost core 去真正配置队列/内存，我们这里只做“配置后尝试 apply pending” */
+		ret = RTE_VHOST_MSG_RESULT_NOT_HANDLED;
+
+		vhost_crypto_try_apply_pending_load(vid, dev, vcrypto, "cfg-msg-post");
+		break;
 	default:
 		ret = RTE_VHOST_MSG_RESULT_NOT_HANDLED;
 		break;
@@ -2626,6 +2559,54 @@ rte_vhost_crypto_set_zero_copy(int vid, enum rte_vhost_crypto_zero_copy option)
 	return 0;
 }
 
+static inline void
+vhost_crypto_dump_ready(struct virtio_net *dev, uint32_t qid)
+{
+    struct vhost_virtqueue *vq = (dev && qid < dev->nr_vring) ? dev->virtqueue[qid] : NULL;
+
+    VC_LOG_INFO("READYCHK: mem=%p nreg=%u vq=%p size=%u desc=%p avail=%p used=%p kick=%d call=%d ready=%d access_ok=%d",
+        dev ? dev->mem : NULL,
+        (dev && dev->mem) ? dev->mem->nregions : 0,
+        vq,
+        vq ? vq->size : 0,
+        vq ? vq->desc : NULL,
+        vq ? vq->avail : NULL,
+        vq ? vq->used : NULL,
+        vq ? vq->kickfd : -1,
+        vq ? vq->callfd : -1,
+        vq ? vq->ready : 0,
+        vq ? vq->access_ok : 0);
+}
+
+static inline int
+vhost_crypto_device_ready(struct virtio_net *dev)
+{
+    if (!dev || !dev->mem || dev->mem->nregions == 0)
+        return 0;
+
+    if (dev->nr_vring == 0)
+        return 0;
+
+    struct vhost_virtqueue *vq = dev->virtqueue[0];
+    if (!vq)
+        return 0;
+
+    /* SET_VRING_NUM */
+    if (vq->size == 0)
+        return 0;
+
+    /* split ring 必须要有这三个 */
+    if (!vq->desc || !vq->avail || !vq->used)
+        return 0;
+
+    /* mem translation + access */
+    if (!vq->ready || !vq->access_ok)
+        return 0;
+
+    return 1;
+}
+
+
 RTE_EXPORT_SYMBOL(rte_vhost_crypto_fetch_requests)
 uint16_t
 rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
@@ -2646,8 +2627,6 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 		return 0;
 	}
 	
-	/* NEW: give worker a chance to apply pending CRYPTO_LOAD once vring/mem is ready */
-	vhost_crypto_try_apply_pending_in_worker(vid, dev);
 
 	vq = dev->virtqueue[qid];
 	if (unlikely(vq == NULL))
