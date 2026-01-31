@@ -1205,26 +1205,34 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 	}
 
 
-	case VHOST_USER_CRYPTO_LOAD: {
-		int fd = (ctx->fd_num > 0) ? ctx->fds[0] : -1;
-		ctx->fds[0] = -1;
-		ctx->fd_num = 0;
+	case VHOST_USER_CRYPTO_LOAD_STATE: {   /* 如果你工程里是 VHOST_USER_CRYPTO_LOAD，就改成那个 */
+		int fd = -1;
+		void *buf = NULL;
+		size_t blob_len = 0;
+		size_t off = 0;
 
-		if (fd < 0) {
+		/* 取出 fd，并清掉 ctx，避免后续路径误用/重复 close */
+		if (ctx->fd_num < 1 || ctx->fds[0] < 0) {
 			VC_LOG_ERR("CRYPTO_LOAD missing fd (vid=%d)", vid);
 			ret = RTE_VHOST_MSG_RESULT_ERR;
 			break;
 		}
+		fd = ctx->fds[0];
+		ctx->fds[0] = -1;
+		ctx->fd_num = 0;
 
-		/* QEMU 会在 message payload.u64 里带 blob_len，并且 msg.size == 8 */
+		/* QEMU 侧应当在 msg.size=8 时用 payload.u64 传 blob_len */
 		if (ctx->msg.size != sizeof(uint64_t)) {
-			VC_LOG_ERR("CRYPTO_LOAD bad msg.size=%u (expect 8) vid=%d", ctx->msg.size, vid);
+			VC_LOG_ERR("CRYPTO_LOAD bad msg.size=%u (expect 8) vid=%d",
+					ctx->msg.size, vid);
 			close(fd);
 			ret = RTE_VHOST_MSG_RESULT_ERR;
 			break;
 		}
 
-		size_t blob_len = (size_t)FROMLE64(ctx->msg.payload.u64);
+		/* 更严谨：用 DPDK 的 endian helper（aarch64 小端也OK，但这更稳） */
+		blob_len = (size_t)rte_le_to_cpu_64(ctx->msg.payload.u64);
+
 		if (blob_len == 0 || blob_len > (64u << 20)) {
 			VC_LOG_ERR("CRYPTO_LOAD bad blob_len=%zu vid=%d", blob_len, vid);
 			close(fd);
@@ -1232,7 +1240,7 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 			break;
 		}
 
-		void *buf = rte_malloc(NULL, blob_len, 0);
+		buf = rte_malloc(NULL, blob_len, 0);
 		if (!buf) {
 			VC_LOG_ERR("CRYPTO_LOAD rte_malloc(%zu) failed vid=%d", blob_len, vid);
 			close(fd);
@@ -1240,8 +1248,7 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 			break;
 		}
 
-		/* 精确读 blob_len 字节：绝不能等 EOF，否则会和 QEMU 的 wait_reply 死锁 */
-		size_t off = 0;
+		/* 精确读 blob_len 字节：绝不能等 EOF（否则会和 QEMU 的 wait_reply 互相等死） */
 		while (off < blob_len) {
 			ssize_t n = read(fd, (uint8_t *)buf + off, blob_len - off);
 			if (n > 0) {
@@ -1249,42 +1256,46 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 				continue;
 			}
 			if (n == 0) {
-				VC_LOG_ERR("CRYPTO_LOAD unexpected EOF (got=%zu want=%zu) vid=%d", off, blob_len, vid);
+				VC_LOG_ERR("CRYPTO_LOAD unexpected EOF (got=%zu want=%zu) vid=%d",
+						off, blob_len, vid);
 				rte_free(buf);
 				close(fd);
 				ret = RTE_VHOST_MSG_RESULT_ERR;
-				goto out_break;
+				break;
 			}
 			if (errno == EINTR)
 				continue;
+
 			VC_LOG_ERR("CRYPTO_LOAD read error errno=%d vid=%d", errno, vid);
 			rte_free(buf);
 			close(fd);
 			ret = RTE_VHOST_MSG_RESULT_ERR;
-			goto out_break;
+			break;
 		}
+
+		if (ret == RTE_VHOST_MSG_RESULT_ERR) {
+			/* 出错路径里已经 close(fd)/free(buf) 了 */
+			break;
+		}
+
 		close(fd);
 
-
-
-
-		/* 覆盖旧的 pending + 写入新 pending：必须加锁，避免 try_apply 撕裂/重复释放 */
+		/* 覆盖旧 pending + 写入新 pending：加锁防撕裂 */
 		rte_spinlock_lock(&vcrypto->pending_lock);
-
 		if (vcrypto->pending_load_valid && vcrypto->pending_load_buf) {
 			rte_free(vcrypto->pending_load_buf);
 		}
-
 		vcrypto->pending_load_buf = buf;
-		vcrypto->pending_load_len = len;
+		vcrypto->pending_load_len = blob_len;   /* 这里必须是 blob_len，不是 len */
 		vcrypto->pending_load_valid = 1;
-
 		rte_spinlock_unlock(&vcrypto->pending_lock);
 
-		ret = RTE_VHOST_MSG_RESULT_OK;
+		VC_LOG_INFO("CRYPTO_LOAD cached blob_len=%zu vid=%d", blob_len, vid);
+
+		/* 关键：必须回复，让 QEMU 继续走下去并 close 写端/结束 wait_reply */
+		ret = RTE_VHOST_MSG_RESULT_REPLY;
 		break;
 	}
-
 
 
 	case VHOST_USER_CRYPTO_THAW:
