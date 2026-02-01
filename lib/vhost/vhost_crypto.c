@@ -359,6 +359,8 @@ struct vhost_crypto_data_req {
 
 };
 
+
+
 static int
 transform_cipher_param(struct rte_crypto_sym_xform *xform,
 		VhostUserCryptoSymSessionParam *param)
@@ -419,6 +421,15 @@ transform_chain_param(struct rte_crypto_sym_xform *xforms,
 		return -VIRTIO_CRYPTO_BADMSG;
 	}
 
+	/* ====== ✅ [插入点 1]：这里打“virtio 输入参数” ====== */
+	VC_LOG_INFO("[xform][chain][virtio] chain_dir=%u cipher_algo=%u hash_algo=%u cipher_key_len=%u auth_key_len=%u digest_len=%u",
+		    (unsigned)param->chaining_dir,
+		    (unsigned)param->cipher_algo,
+		    (unsigned)param->hash_algo,
+		    (unsigned)param->cipher_key_len,
+		    (unsigned)param->auth_key_len,
+		    (unsigned)param->digest_len);
+
 	/* cipher */
 	ret = cipher_algo_transform(param->cipher_algo,
 			&xform_cipher->cipher.algo);
@@ -454,8 +465,20 @@ transform_chain_param(struct rte_crypto_sym_xform *xforms,
 	xform_auth->auth.key.length = param->auth_key_len;
 	xform_auth->auth.key.data = param->auth_key_buf;
 
+	/* ====== ✅ [插入点 2]：这里打“DPDK xform 最终值” ====== */
+	VC_LOG_INFO("[xform][chain][dpdk] CIPHER: algo=%u iv_len=%u key_len=%u op=%u | AUTH: algo=%u key_len=%u digest_len=%u op=%u",
+		    (unsigned)xform_cipher->cipher.algo,
+		    (unsigned)xform_cipher->cipher.iv.length,
+		    (unsigned)xform_cipher->cipher.key.length,
+		    (unsigned)xform_cipher->cipher.op,
+		    (unsigned)xform_auth->auth.algo,
+		    (unsigned)xform_auth->auth.key.length,
+		    (unsigned)xform_auth->auth.digest_length,
+		    (unsigned)xform_auth->auth.op);
+
 	return 0;
 }
+
 
 static void
 vhost_crypto_create_sym_sess(struct vhost_crypto *vcrypto,
