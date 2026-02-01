@@ -1096,6 +1096,7 @@ read_all_from_fd(int fd, uint8_t **out_buf, size_t *out_len)
     *out_len = len;
     return 0;
 }
+static __rte_always_inline int vhost_crypto_vq_usable(struct vhost_virtqueue *vq)
 static inline int vhost_crypto_device_ready(struct virtio_net *dev);
 static int vhost_crypto_load_state_fd(int vid, int fd);
 
@@ -1111,6 +1112,16 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
     if (!vcrypto || !dev)
         return;
 
+    /* Safety gate first: keep control-plane fast and avoid early restore.
+     * If not ready, just return and retry on later cfg messages.
+     */
+    if (!vhost_crypto_device_ready(dev)) {
+        RTE_LOG(DEBUG, VHOST_CONFIG,
+                "pending LOAD: device not ready (vid=%d why=%s status=0x%x)",
+                vid, why, dev->status);
+        return;
+    }
+
     /* 1) 抢占 apply 权，避免重入/并发双 apply */
     rte_spinlock_lock(&vcrypto->pending_lock);
 
@@ -1118,20 +1129,16 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
         !vcrypto->pending_load_buf ||
         vcrypto->pending_load_len == 0) {
         rte_spinlock_unlock(&vcrypto->pending_lock);
-        RTE_LOG(DEBUG, VHOST_CONFIG,"pending LOAD: none (vid=%d why=%s)", vid, why);
+        RTE_LOG(DEBUG, VHOST_CONFIG,
+                "pending LOAD: none (vid=%d why=%s)", vid, why);
         return;
     }
 
     if (vcrypto->pending_applying) {
         rte_spinlock_unlock(&vcrypto->pending_lock);
-        RTE_LOG(DEBUG, VHOST_CONFIG,"pending LOAD: applying in progress (vid=%d why=%s)", vid, why);
-        return;
-    }
-
-    /* 只要求 mem table 就绪（不要求 vring ready） */
-    if (!dev->mem || dev->mem->nregions == 0) {
-        rte_spinlock_unlock(&vcrypto->pending_lock);
-        VC_LOG_INFO("pending LOAD, but mem table not ready yet (vid=%d why=%s)", vid, why);
+        RTE_LOG(DEBUG, VHOST_CONFIG,
+                "pending LOAD: applying in progress (vid=%d why=%s)",
+                vid, why);
         return;
     }
 
@@ -1147,9 +1154,10 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
 
     rte_spinlock_unlock(&vcrypto->pending_lock);
 
-    VC_LOG_INFO("Applying deferred CRYPTO_LOAD now (vid=%d why=%s len=%zu)", vid, why, len);
+    VC_LOG_INFO("Applying deferred CRYPTO_LOAD now (vid=%d why=%s len=%zu)",
+                vid, why, len);
 
-    /* 3) 真正执行 load（注意：你的真实函数签名是 vhost_crypto_load_state(vid, ...)） */
+    /* 3) 真正执行 load（锁外重活） */
     rc = vhost_crypto_load_state(vid, buf, len);
 
     /* 4) 收尾：成功 free；失败放回 pending 以便后续触发点重试 */
@@ -1158,15 +1166,16 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
     if (rc == 0) {
         vcrypto->pending_applying = 0;
 
-        /* 你的兜底状态也一并清掉（如果你已引入 load_failed） */
         vcrypto->load_failed = 0;
         vcrypto->last_load_rc = 0;
         vcrypto->load_fail_cnt = 0;
 
         rte_spinlock_unlock(&vcrypto->pending_lock);
-		uint32_t applied_crc = vc_crc32(buf, (uint32_t)len);
-		vcrypto->last_applied_blob_crc = applied_crc;
-		vcrypto->last_applied_blob_len = len;
+
+        uint32_t applied_crc = vc_crc32(buf, (uint32_t)len);
+        vcrypto->last_applied_blob_crc = applied_crc;
+        vcrypto->last_applied_blob_len = len;
+
         rte_free(buf);
         VC_LOG_INFO("Deferred LOAD OK (vid=%d)", vid);
         return;
@@ -1178,14 +1187,14 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
     vcrypto->pending_load_valid = 1;
     vcrypto->pending_applying = 0;
 
-    /* 如果你启用了“失败兜底”，这里也记录一下 */
     vcrypto->load_failed = 1;
     vcrypto->last_load_rc = rc;
     vcrypto->load_fail_cnt++;
 
     rte_spinlock_unlock(&vcrypto->pending_lock);
 
-    VC_LOG_ERR("Deferred LOAD failed (vid=%d rc=%d) keep pending for retry", vid, rc);
+    VC_LOG_ERR("Deferred LOAD failed (vid=%d rc=%d) keep pending for retry",
+               vid, rc);
 }
 
 
@@ -2856,32 +2865,63 @@ vhost_crypto_dump_ready(struct virtio_net *dev, uint32_t qid)
         vq ? vq->access_ok : 0);
 }
 
-static inline int
-vhost_crypto_device_ready(struct virtio_net *dev)
+static __rte_always_inline int
+vhost_crypto_vq_usable(struct vhost_virtqueue *vq)
 {
-    if (!dev || !dev->mem || dev->mem->nregions == 0)
-        return 0;
+    bool access_ok;
 
-    if (dev->nr_vring == 0)
-        return 0;
-
-    struct vhost_virtqueue *vq = dev->virtqueue[0];
     if (!vq)
+        return 0;
+
+    /* Only consider enabled queues.
+     * If the protocol doesn't use SET_VRING_ENABLE, enabled is typically true by default.
+     */
+    if (!vq->enabled)
         return 0;
 
     /* SET_VRING_NUM */
     if (vq->size == 0)
         return 0;
 
-    /* split ring 必须要有这三个 */
+    /* split ring tables must exist */
     if (!vq->desc || !vq->avail || !vq->used)
         return 0;
 
-    /* mem translation + access */
-    if (!vq->ready || !vq->access_ok)
+    /* access_ok is guarded by access_lock */
+    rte_rwlock_read_lock(&vq->access_lock);
+    access_ok = vq->access_ok;
+    rte_rwlock_read_unlock(&vq->access_lock);
+
+    if (!vq->ready || !access_ok)
         return 0;
 
     return 1;
+}
+
+static inline int
+vhost_crypto_device_ready(struct virtio_net *dev)
+{
+    if (!dev || !dev->mem || dev->mem->nregions == 0)
+        return 0;
+
+    /* Hard gate: do NOT restore device state before DRIVER_OK.
+     * Cross-host migration has more message re-ordering/jitter; restoring too early is fragile.
+     */
+    if (!(dev->status & VIRTIO_DEVICE_STATUS_DRIVER_OK))
+        return 0;
+
+    if (dev->nr_vring == 0)
+        return 0;
+
+    /* Any usable (enabled) queue is enough.
+     * Requiring "all enabled queues" is fragile and can stall migration.
+     */
+    for (uint32_t qid = 0; qid < dev->nr_vring; qid++) {
+        if (vhost_crypto_vq_usable(dev->virtqueue[qid]))
+            return 1;
+    }
+
+    return 0;
 }
 
 
