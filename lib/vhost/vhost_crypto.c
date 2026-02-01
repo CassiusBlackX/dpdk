@@ -535,14 +535,18 @@ vhost_crypto_create_sym_sess(struct vhost_crypto *vcrypto,
 	D->op_type     = (uint8_t)sess_param->u.sym_sess.op_type;
 	D->dir         = (uint8_t)sess_param->u.sym_sess.dir;
 	D->hash_mode   = (uint8_t)sess_param->u.sym_sess.hash_mode;
-    /* iv_len：优先记录 guest 传下来的 session 参数；若为 0 再用 cipher xform 补齐 */
-	D->iv_len = (uint16_t)sess_param->u.sym_sess.iv_len;
+	
+	/* iv_len：你的 vhost-user sym sess param 没有 iv_len，只能由算法推导 */
+	D->iv_len = (uint16_t)get_iv_len(sess_param->u.sym_sess.cipher_algo);
+
+	/* 兜底：如果推导失败，再从 xform 里取（防止 get_iv_len 返回 0） */
 	if (D->iv_len == 0) {
 		const struct rte_crypto_sym_xform *cxf = NULL;
 		if (xform1.type == RTE_CRYPTO_SYM_XFORM_CIPHER)      cxf = &xform1;
 		else if (xform2.type == RTE_CRYPTO_SYM_XFORM_CIPHER) cxf = &xform2;
 		D->iv_len = (uint16_t)(cxf ? cxf->cipher.iv.length : 0);
 	}
+
 
     /* 2) 变长 blob 约定顺序：cipher_key | auth_key | iv_seed(可选) */
     uint32_t key_len      = sess_param->u.sym_sess.cipher_key_len;
@@ -3267,167 +3271,117 @@ vc_session_destroy(struct vhost_crypto *vcrypto, struct vhost_crypto_session *vs
     rte_free(vs);
 }
 
-
 static struct vhost_crypto_session *
 vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
                       const struct vc_sym_meta_v1 *D,
                       const void *blob, uint32_t blob_len)
 {
-    /* 0) split blob: cipher_key | auth_key (and ignore any tail if you extend later) */
-    const uint8_t *p = (const uint8_t *)blob;
-    const uint8_t *key = NULL, *auth_key = NULL;
-    uint16_t key_len = D->key_len;
-    uint16_t auth_key_len = 0;
+    struct rte_crypto_sym_xform xform1 = {0}, xform2 = {0};
+    struct rte_cryptodev_sym_session *sess = NULL;
+    struct vhost_crypto_session *vs = NULL;
+    int ret;
 
-    if (key_len) {
-        if (blob_len < key_len) {
-            VC_LOG_ERR("restore: blob too small sid=%" PRIu64 " blob_len=%u key_len=%u",
-                       (uint64_t)sid, (unsigned)blob_len, (unsigned)key_len);
+    /* 1) 构造一个 VhostUserCryptoSymSessionParam，让现有 transform_* 走“同一套”映射逻辑 */
+    VhostUserCryptoSymSessionParam P;
+    memset(&P, 0, sizeof(P));
+
+    /* ——精确恢复三件套（你现在迁移失败最像是这里没恢复对）—— */
+    P.op_type     = (uint8_t)D->op_type;
+    P.dir         = (uint8_t)D->dir;
+    P.hash_mode   = (uint8_t)D->hash_mode;
+
+    /* 其他描述字段 */
+    P.chaining_dir    = (uint8_t)D->chain_mode;
+    P.cipher_algo     = (uint32_t)D->algo_cipher;
+    P.hash_algo       = (uint32_t)D->algo_auth;
+    P.aad_len         = (uint16_t)D->aad_len;
+    P.digest_len      = (uint16_t)D->tag_len;
+
+    /* 2) 从 blob 拆 key / auth_key（你保存端就是 key|auth_key 这么拼的） */
+    const uint8_t *p = (const uint8_t *)blob;
+
+    P.cipher_key_len = (uint16_t)D->key_len;
+    if (P.cipher_key_len) {
+        if (blob_len < P.cipher_key_len) {
+            VC_LOG_ERR("restore: blob too small sid=%" PRIu64
+                       " blob_len=%u cipher_key_len=%u",
+                       (uint64_t)sid, (unsigned)blob_len, (unsigned)P.cipher_key_len);
             return NULL;
         }
-        key = p;
-        p += key_len;
-    }
-    if (blob_len > key_len) {
-        auth_key_len = (uint16_t)(blob_len - key_len);
-        auth_key = p;
+        rte_memcpy(P.cipher_key_buf, p, P.cipher_key_len);
+        P.cipher_key = P.cipher_key_buf;
+        p += P.cipher_key_len;
     }
 
-    /* need_auth is decided the same way as save/create side semantic */
-    const bool need_auth = (D->algo_auth != 0 && D->tag_len != 0);
+    P.auth_key_len = 0;
+    if (blob_len > P.cipher_key_len) {
+        P.auth_key_len = (uint16_t)(blob_len - P.cipher_key_len);
+        rte_memcpy(P.auth_key_buf, p, P.auth_key_len);
+        P.auth_key = P.auth_key_buf;
+    }
 
-    if (need_auth && auth_key_len == 0) {
-        VC_LOG_ERR("restore: need auth but no auth_key sid=%" PRIu64
-                   " algo_auth=%u tag_len=%u blob_len=%u key_len=%u",
-                   (uint64_t)sid, (unsigned)D->algo_auth, (unsigned)D->tag_len,
-                   (unsigned)blob_len, (unsigned)key_len);
+    /* 需要 auth 但没给 auth_key：直接失败更清晰 */
+    if (P.hash_mode == VIRTIO_CRYPTO_SYM_HASH_MODE_AUTH &&
+        P.digest_len > 0 && P.hash_algo != 0 && P.auth_key_len == 0) {
+        VC_LOG_ERR("restore: auth required but auth_key missing sid=%" PRIu64
+                   " hash_algo=%u digest_len=%u",
+                   (uint64_t)sid, (unsigned)P.hash_algo, (unsigned)P.digest_len);
         return NULL;
     }
 
-    /* 1) make writable copies for PMD (avoid const-cast) */
-    uint8_t *cipher_key_copy = NULL;
-    uint8_t *auth_key_copy   = NULL;
-
-    if (key_len) {
-        cipher_key_copy = dup_bytes_dpdk(key, key_len);
-        if (!cipher_key_copy) {
-            VC_LOG_ERR("restore: dup cipher key failed sid=%" PRIu64, (uint64_t)sid);
+    /* 3) 生成 xform：完全复用 DPDK vhost-crypto 自己的映射/方向设置逻辑 */
+    switch (P.op_type) {
+    case VIRTIO_CRYPTO_SYM_OP_NONE:
+    case VIRTIO_CRYPTO_SYM_OP_CIPHER:
+        ret = transform_cipher_param(&xform1, &P);
+        if (unlikely(ret)) {
+            VC_LOG_ERR("restore: transform_cipher_param failed sid=%" PRIu64 " ret=%d",
+                       (uint64_t)sid, ret);
             return NULL;
         }
-    }
-    if (auth_key_len) {
-        auth_key_copy = dup_bytes_dpdk(auth_key, auth_key_len);
-        if (!auth_key_copy) {
-            VC_LOG_ERR("restore: dup auth key failed sid=%" PRIu64, (uint64_t)sid);
-            secure_free(cipher_key_copy, key_len);
+        break;
+
+    case VIRTIO_CRYPTO_SYM_OP_ALGORITHM_CHAINING:
+        if (unlikely(P.hash_mode != VIRTIO_CRYPTO_SYM_HASH_MODE_AUTH)) {
+            VC_LOG_ERR("restore: chaining but hash_mode!=AUTH sid=%" PRIu64
+                       " hash_mode=%u",
+                       (uint64_t)sid, (unsigned)P.hash_mode);
             return NULL;
         }
-    }
-
-    /*
-     * 2) Build a synthetic VhostUserCryptoSessionParam and reuse the
-     *    exact same transform_* path as vhost_crypto_create_sym_sess().
-     */
-    VhostUserCryptoSessionParam sess_param;
-    memset(&sess_param, 0, sizeof(sess_param));
-
-    sess_param.op_type                 = VIRTIO_CRYPTO_SYM_SESS; /* session kind */
-    sess_param.u.sym_sess.op_type      = D->op_type;             /* from snapshot (added) */
-    sess_param.u.sym_sess.dir          = D->dir;                 /* from snapshot (added) */
-    sess_param.u.sym_sess.hash_mode    = D->hash_mode;           /* from snapshot (added) */
-    sess_param.u.sym_sess.chaining_dir = D->chain_mode;
-
-    sess_param.u.sym_sess.cipher_algo      = D->algo_cipher;
-    sess_param.u.sym_sess.hash_algo        = D->algo_auth;
-    sess_param.u.sym_sess.aead_algo        = D->algo_aead;
-
-    sess_param.u.sym_sess.cipher_key_len   = D->key_len;
-    sess_param.u.sym_sess.iv_len           = D->iv_len;
-    sess_param.u.sym_sess.aad_len          = D->aad_len;
-    sess_param.u.sym_sess.digest_len       = D->tag_len;
-
-    sess_param.u.sym_sess.cipher_key       = cipher_key_copy;
-    sess_param.u.sym_sess.auth_key         = auth_key_copy;
-    sess_param.u.sym_sess.auth_key_len     = auth_key_len;
-
-    struct rte_crypto_sym_xform xform1;
-    struct rte_crypto_sym_xform xform2;
-    memset(&xform1, 0, sizeof(xform1));
-    memset(&xform2, 0, sizeof(xform2));
-
-    struct rte_crypto_sym_xform *xform_head = NULL;
-
-    if (sess_param.u.sym_sess.op_type == VIRTIO_CRYPTO_SYM_OP_CIPHER_SESSION) {
-        /* identical to create side: cipher-only path uses dir */
-        if (transform_cipher_param(&xform1, &sess_param.u.sym_sess) < 0) {
-            VC_LOG_ERR("restore: transform_cipher_param failed sid=%" PRIu64, (uint64_t)sid);
-            secure_free(cipher_key_copy, key_len);
-            secure_free(auth_key_copy, auth_key_len);
-            return NULL;
-        }
-        xform_head = &xform1;
-
-    } else if (sess_param.u.sym_sess.op_type == VIRTIO_CRYPTO_SYM_OP_ALGORITHM_CHAINING) {
-        /* identical to create side: chaining path uses chaining_dir(+digest_len etc) */
         xform1.next = &xform2;
-        if (transform_chain_param(&xform1, &sess_param.u.sym_sess) < 0) {
-            VC_LOG_ERR("restore: transform_chain_param failed sid=%" PRIu64, (uint64_t)sid);
-            secure_free(cipher_key_copy, key_len);
-            secure_free(auth_key_copy, auth_key_len);
+        ret = transform_chain_param(&xform1, &P);
+        if (unlikely(ret)) {
+            VC_LOG_ERR("restore: transform_chain_param failed sid=%" PRIu64 " ret=%d",
+                       (uint64_t)sid, ret);
             return NULL;
         }
-        xform_head = &xform1;
+        break;
 
-    } else {
-        /*
-         * Backward compatibility / safety: if op_type wasn't saved (old snapshot),
-         * infer from need_auth.
-         */
-        if (!need_auth) {
-            if (transform_cipher_param(&xform1, &sess_param.u.sym_sess) < 0) {
-                VC_LOG_ERR("restore: transform_cipher_param failed sid=%" PRIu64, (uint64_t)sid);
-                secure_free(cipher_key_copy, key_len);
-                secure_free(auth_key_copy, auth_key_len);
-                return NULL;
-            }
-            xform_head = &xform1;
-        } else {
-            xform1.next = &xform2;
-            if (transform_chain_param(&xform1, &sess_param.u.sym_sess) < 0) {
-                VC_LOG_ERR("restore: transform_chain_param failed sid=%" PRIu64, (uint64_t)sid);
-                secure_free(cipher_key_copy, key_len);
-                secure_free(auth_key_copy, auth_key_len);
-                return NULL;
-            }
-            xform_head = &xform1;
-        }
+    default:
+        VC_LOG_ERR("restore: unsupported op_type sid=%" PRIu64 " op_type=%u",
+                   (uint64_t)sid, (unsigned)P.op_type);
+        return NULL;
     }
 
-    /* 3) create cryptodev session */
-    struct rte_cryptodev_sym_session *sess =
-        rte_cryptodev_sym_session_create(vcrypto->cid, xform_head, vcrypto->sess_pool);
-
+    /* 4) 创建 cryptodev session */
+    sess = rte_cryptodev_sym_session_create(vcrypto->cid, &xform1, vcrypto->sess_pool);
     if (!sess) {
         VC_LOG_ERR("restore: rte_cryptodev_sym_session_create failed sid=%" PRIu64
-                   " cipher_algo=%u auth_algo=%u aead_algo=%u chain_dir=%u dir=%u op_type=%u"
+                   " op_type=%u dir=%u hash_mode=%u cipher_algo=%u hash_algo=%u"
                    " key_len=%u iv_len=%u tag_len=%u auth_key_len=%u rte_errno=%d",
                    (uint64_t)sid,
-                   (unsigned)D->algo_cipher, (unsigned)D->algo_auth, (unsigned)D->algo_aead,
-                   (unsigned)D->chain_mode, (unsigned)D->dir, (unsigned)D->op_type,
-                   (unsigned)D->key_len, (unsigned)D->iv_len, (unsigned)D->tag_len,
-                   (unsigned)auth_key_len, rte_errno);
-
-        secure_free(cipher_key_copy, key_len);
-        secure_free(auth_key_copy, auth_key_len);
+                   (unsigned)P.op_type, (unsigned)P.dir, (unsigned)P.hash_mode,
+                   (unsigned)P.cipher_algo, (unsigned)P.hash_algo,
+                   (unsigned)P.cipher_key_len,
+                   (unsigned)get_iv_len(P.cipher_algo),
+                   (unsigned)P.digest_len,
+                   (unsigned)P.auth_key_len,
+                   rte_errno);
         return NULL;
     }
 
-    /* session created: wipe temporary key buffers */
-    secure_free(cipher_key_copy, key_len);
-    secure_free(auth_key_copy, auth_key_len);
-
-    /* 4) allocate vhost session wrapper + keep meta/blob for next save */
-    struct vhost_crypto_session *vs = rte_zmalloc(NULL, sizeof(*vs), 0);
+    /* 5) 分配 vhost 会话对象，并回填 meta（保持你迁移框架需要的结构） */
+    vs = rte_zmalloc(NULL, sizeof(*vs), 0);
     if (!vs) {
         VC_LOG_ERR("restore: alloc vhost_crypto_session failed sid=%" PRIu64, (uint64_t)sid);
         rte_cryptodev_sym_session_free(vcrypto->cid, sess);
@@ -3440,7 +3394,7 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
     vs->meta.valid      = true;
     vs->meta.session_id = sid;
     vs->meta.kind       = VC_SESS_SYM;
-    memcpy(&vs->meta.sym.desc, D, sizeof(*D));
+    rte_memcpy(&vs->meta.sym.desc, D, sizeof(*D));
 
     if (blob_len) {
         vs->meta.sym.b.blob = rte_zmalloc(NULL, blob_len, 0);
@@ -3451,12 +3405,13 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
             rte_free(vs);
             return NULL;
         }
-        memcpy(vs->meta.sym.b.blob, blob, blob_len);
+        rte_memcpy(vs->meta.sym.b.blob, blob, blob_len);
         vs->meta.sym.b.blob_len = blob_len;
     }
 
     return vs;
 }
+
 
 
 void test_save_load_blob(int vid)
