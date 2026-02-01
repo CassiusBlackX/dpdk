@@ -815,19 +815,55 @@ static uint64_t
 ring_addr_to_vva(struct virtio_net *dev, struct vhost_virtqueue *vq,
 		uint64_t ra, uint64_t *size)
 {
+	/* When IOMMU_PLATFORM is negotiated, vring addresses are treated as IOVA
+	 * and translated through the IOTLB. If the IOTLB is not populated yet,
+	 * translation returns 0 and the device never becomes ready.
+	 *
+	 * For virtio-crypto in our setup, QEMU still passes userspace (QVA-like)
+	 * addresses in SET_VRING_ADDR, so we add a safe fallback: if IOVA->VVA
+	 * fails, try QVA->VVA. If the address is not covered by mem table, the
+	 * fallback will still fail (returns 0), so it won't hide real bugs.
+	 */
 	if (dev->features & (1ULL << VIRTIO_F_IOMMU_PLATFORM)) {
 		uint64_t vva;
 
 		vhost_user_iotlb_rd_lock(vq);
-		vva = vhost_iova_to_vva(dev, vq, ra,
-					size, VHOST_ACCESS_RW);
+		vva = vhost_iova_to_vva(dev, vq, ra, size, VHOST_ACCESS_RW);
 		vhost_user_iotlb_rd_unlock(vq);
 
-		return vva;
+		if (vva)
+			return vva;
+
+		/* Fallback: try QVA mapping */
+		{
+			static uint64_t warn_cnt;
+			uint64_t len2 = size ? *size : 0;
+			uint64_t vva2 = qva_to_vva(dev, ra, &len2);
+
+			warn_cnt++;
+			if (warn_cnt == 1 || (warn_cnt % 4096 == 1)) {
+				VHOST_CONFIG_LOG(dev->ifname, ERR,
+					"ring_addr_to_vva: IOVA translate failed (IOMMU_PLATFORM on), fallback to QVA: ra=0x%lx size=0x%lx vva2=0x%lx len2=0x%lx warn_cnt=%lu",
+					(unsigned long)ra,
+					(unsigned long)(size ? *size : 0),
+					(unsigned long)vva2,
+					(unsigned long)len2,
+					(unsigned long)warn_cnt);
+			}
+
+			if (vva2) {
+				if (size)
+					*size = len2;
+				return vva2;
+			}
+		}
+
+		return 0;
 	}
 
 	return qva_to_vva(dev, ra, size);
 }
+
 
 static uint64_t
 log_addr_to_gpa(struct virtio_net *dev, struct vhost_virtqueue *vq)
@@ -951,7 +987,11 @@ translate_ring_addresses(struct virtio_net **pdev, struct vhost_virtqueue **pvq)
 	vq->desc = (struct vring_desc *)(uintptr_t)ring_addr_to_vva(dev,
 			vq, vq->ring_addrs.desc_user_addr, &len);
 	if (vq->desc == 0 || len != sizeof(struct vring_desc) * vq->size) {
-		VHOST_CONFIG_LOG(dev->ifname, DEBUG, "failed to map desc ring.");
+		VHOST_CONFIG_LOG(dev->ifname, ERR,
+			"failed to map desc ring: ra=0x%lx size=0x%lx features=0x%lx",
+			(unsigned long)vq->ring_addrs.desc_user_addr,
+			(unsigned long)len,
+			(unsigned long)dev->features);
 		return;
 	}
 
@@ -967,7 +1007,12 @@ translate_ring_addresses(struct virtio_net **pdev, struct vhost_virtqueue **pvq)
 	vq->avail = (struct vring_avail *)(uintptr_t)ring_addr_to_vva(dev,
 			vq, vq->ring_addrs.avail_user_addr, &len);
 	if (vq->avail == 0 || len != expected_len) {
-		VHOST_CONFIG_LOG(dev->ifname, DEBUG, "failed to map avail ring.");
+		VHOST_CONFIG_LOG(dev->ifname, ERR,
+        "failed to map avail ring: ra=0x%lx len=0x%lx expected=0x%lx features=0x%lx",
+			(unsigned long)vq->ring_addrs.avail_user_addr,
+			(unsigned long)len,
+			(unsigned long)expected_len,
+			(unsigned long)dev->features);
 		return;
 	}
 
@@ -980,7 +1025,12 @@ translate_ring_addresses(struct virtio_net **pdev, struct vhost_virtqueue **pvq)
 	vq->used = (struct vring_used *)(uintptr_t)ring_addr_to_vva(dev,
 			vq, vq->ring_addrs.used_user_addr, &len);
 	if (vq->used == 0 || len != expected_len) {
-		VHOST_CONFIG_LOG(dev->ifname, DEBUG, "failed to map used ring.");
+		VHOST_CONFIG_LOG(dev->ifname, ERR,
+			"failed to map used ring: ra=0x%lx len=0x%lx expected=0x%lx features=0x%lx",
+			(unsigned long)vq->ring_addrs.used_user_addr,
+			(unsigned long)len,
+			(unsigned long)expected_len,
+			(unsigned long)dev->features);
 		return;
 	}
 
