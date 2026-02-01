@@ -1116,13 +1116,13 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
         !vcrypto->pending_load_buf ||
         vcrypto->pending_load_len == 0) {
         rte_spinlock_unlock(&vcrypto->pending_lock);
-        VC_LOG_DEBUG("pending LOAD: none (vid=%d why=%s)", vid, why);
+        RTE_LOG(DEBUG, VHOST_CONFIG,"pending LOAD: none (vid=%d why=%s)", vid, why);
         return;
     }
 
     if (vcrypto->pending_applying) {
         rte_spinlock_unlock(&vcrypto->pending_lock);
-        VC_LOG_DEBUG("pending LOAD: applying in progress (vid=%d why=%s)", vid, why);
+        RTE_LOG(DEBUG, VHOST_CONFIG,"pending LOAD: applying in progress (vid=%d why=%s)", vid, why);
         return;
     }
 
