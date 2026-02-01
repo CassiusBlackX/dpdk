@@ -359,7 +359,9 @@ struct vhost_crypto_data_req {
 	struct vhost_virtqueue *vq;
 	struct vhost_crypto_writeback_data *wb;
 	struct rte_mempool *wb_pool;
-	uint16_t desc_idx;
+	/* Split indices: used ring slot vs descriptor head index */
+    uint16_t used_idx;   /* slot in avail/used ring */
+    uint16_t head_idx;   /* descriptor head index */
 	uint16_t len;
 	uint16_t zero_copy;
 	struct vhost_crypto *vcrypto;           /* 新增：设备回指，收尾/计数用 */
@@ -2225,7 +2227,7 @@ static __rte_always_inline int
 vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 		struct vhost_virtqueue *vq, struct rte_crypto_op *op,
 		struct vring_desc *head, struct vhost_crypto_desc *descs,
-		uint16_t desc_idx)
+		uint16_t used_idx, uint16_t head_idx)
 	__rte_requires_shared_capability(&vq->iotlb_lock)
 {
 	struct vhost_crypto_data_req *vc_req, *vc_req_out;
@@ -2243,7 +2245,8 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 	int err;
 
 	vc_req = &data_req;
-	vc_req->desc_idx = desc_idx;
+	vc_req->used_idx = used_idx;   /* ring slot */
+	vc_req->head_idx = head_idx;   /* descriptor head index */
 	vc_req->dev = vcrypto->dev;          /* IOVA_TO_VVA 等还会用到 */
     vc_req->vq  = vq;
 	vc_req->vcrypto = vcrypto;           /* 新增：用于 completion 时做 inflight-- */
@@ -2445,49 +2448,84 @@ error_exit:
 
 static __rte_always_inline struct vhost_virtqueue *
 vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
-		struct vhost_virtqueue *old_vq)
+        struct vhost_virtqueue *old_vq)
 {
-	struct rte_mbuf *m_src = NULL, *m_dst = NULL;
-	struct vhost_crypto_data_req *vc_req;
-	struct vhost_virtqueue *vq;
-	uint16_t used_idx, desc_idx;
+    struct rte_mbuf *m_src = NULL, *m_dst = NULL;
+    struct vhost_crypto_data_req *vc_req;
+    struct vhost_virtqueue *vq;
+    uint16_t used_idx, desc_idx;
 
-	if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
-		m_src = op->sym->m_src;
-		m_dst = op->sym->m_dst;
-		vc_req = rte_mbuf_to_priv(m_src);
-	} else if (op->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
-		// vc_req = rte_cryptodev_asym_session_get_user_data(op->asym->session);
-		vc_req = rte_crypto_op_ctod_offset(op, uint8_t *, IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
-	} else {
-		VC_LOG_ERR("Invalid crypto op type");
-		return NULL;
-	}
+    if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+        m_src = op->sym->m_src;
+        m_dst = op->sym->m_dst;
+        vc_req = rte_mbuf_to_priv(m_src);
+    } else if (op->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+        vc_req = rte_crypto_op_ctod_offset(op, uint8_t *,
+                IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
+    } else {
+        VC_LOG_ERR("Invalid crypto op type");
+        return NULL;
+    }
 
-	if (unlikely(!vc_req)) {
-		VC_LOG_ERR("Failed to retrieve vc_req");
-		return NULL;
-	}
-	vq = vc_req->vq;
-	used_idx = vc_req->desc_idx;
+    if (unlikely(!vc_req)) {
+        VC_LOG_ERR("Failed to retrieve vc_req");
+        return NULL;
+    }
 
-	/* vring pointers may be temporarily invalid during migration/reconnect */
-	if (unlikely(vq == NULL || vq->avail == NULL || vq->used == NULL ||
-			used_idx >= vq->size || rte_rwlock_read_trylock(&vq->access_lock) != 0)) {
-		/* transient: do NOT touch guest memory, do NOT recycle buffers */
-		return NULL;
-	}
+    vq = vc_req->vq;
+    used_idx = vc_req->used_idx;   /* ring slot */
+    desc_idx = vc_req->head_idx;   /* descriptor head */
 
-	vhost_user_iotlb_rd_lock(vq);
-	if (unlikely(!vq->access_ok)) {
-		vhost_user_iotlb_rd_unlock(vq);
-		rte_rwlock_read_unlock(&vq->access_lock);
-		/* transient: vring/iotlb not ready, retry later */
-		return NULL;
-	}
-	vhost_user_iotlb_rd_unlock(vq);
+    /* Sanity: if vring pointers are invalid, do NOT touch guest memory.
+     * Baseline choice: recycle buffers to avoid mempool exhaustion.
+     */
+    if (unlikely(vq == NULL || vq->avail == NULL || vq->used == NULL ||
+                 used_idx >= vq->size)) {
+        VC_LOG_ERR("Invalid vq/vring in finalize");
+        goto out_recycle;
+    }
 
+    /* Try-lock access; if we can't safely touch guest memory, recycle and stop. */
+    if (unlikely(rte_rwlock_read_trylock(&vq->access_lock) != 0)) {
+        goto out_recycle;
+    }
+
+    vhost_user_iotlb_rd_lock(vq);
+    if (unlikely(!vq->access_ok)) {
+        vhost_user_iotlb_rd_unlock(vq);
+        rte_rwlock_read_unlock(&vq->access_lock);
+        goto out_recycle;
+    }
+    vhost_user_iotlb_rd_unlock(vq);
+
+    /* write-back for non-zero-copy path */
+    if (vc_req->wb)
+        write_back_data(vc_req);
+
+    /* Fill used ring entry; used->idx is advanced by the caller (batch). */
+    vq->used->ring[used_idx].id  = desc_idx;
+    vq->used->ring[used_idx].len = vc_req->len;
+
+    rte_rwlock_read_unlock(&vq->access_lock);
+
+    /* Recycle writeback chain after successful write-back. */
+    if (vc_req->wb) {
+        free_wb_data(vc_req->wb, vc_req->wb_pool);
+        vc_req->wb = NULL;
+    }
+
+out_recycle:
+    /* Always recycle buffers to avoid mempool depletion.
+     * Guard against double-free when m_dst == m_src (in-place).
+     */
+    if (m_dst && m_dst != m_src)
+        rte_pktmbuf_free(m_dst);
+    if (m_src)
+        rte_pktmbuf_free(m_src);
+
+    return vq;
 }
+
 
 static __rte_always_inline uint16_t
 vhost_crypto_complete_one_vm_requests(struct rte_crypto_op **ops,
@@ -2924,7 +2962,7 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 			op->sym->m_dst->data_off = 0;
 
 			if (unlikely(vhost_crypto_process_one_req(vcrypto, vq,
-					op, head, descs, used_idx) < 0))
+					op, head, descs, used_idx, desc_idx) < 0))
 				break;
 		}
 
@@ -2953,7 +2991,7 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 			op->sym->m_src->data_off = 0;
 
 			if (unlikely(vhost_crypto_process_one_req(vcrypto, vq,
-					op, head, descs, used_idx) < 0))
+					op, head, descs, used_idx, desc_idx) < 0))
 				break;
 		}
 
