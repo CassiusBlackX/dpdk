@@ -613,7 +613,8 @@ vhost_crypto_worker(void *arg)
 				continue;
 }
 
-                uint16_t want = (uint16_t)RTE_MIN(burst_size, cur_infl);
+                uint32_t bs = (uint32_t)burst_size;
+				uint16_t want = (uint16_t)RTE_MIN(bs, nb_inflight_ops[sock][vq]);
                 uint16_t deq = rte_cryptodev_dequeue_burst(
                     info->cid, info->qid, ops_deq[vq], want);
 
