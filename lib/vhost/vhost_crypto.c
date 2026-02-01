@@ -336,6 +336,10 @@ struct __rte_cache_aligned vhost_crypto {
     uint8_t *pending_load_buf;
     size_t pending_load_len;
     uint8_t pending_load_valid;
+	/* ====== ✅ restore 失败兜底：避免 guest 静默卡死 ====== */
+	volatile int load_failed;    /* 1 => session restore failed */
+	int last_load_rc;            /* last error code */
+	uint32_t load_fail_cnt;      /* retry counter */
 };
 
 struct vhost_crypto_writeback_data {
@@ -496,6 +500,18 @@ vhost_crypto_create_sym_sess(struct vhost_crypto *vcrypto,
         if (unlikely(ret)) {
             VC_LOG_ERR("Error transform session msg (%i)", ret);
             sess_param->session_id = ret;
+			/* ====== ✅ [cipher debug] 打 virtio 输入 + 映射后的 rte 参数 ====== */
+			VC_LOG_INFO("[xform][cipher][virtio] dir=%u cipher_algo=%u cipher_key_len=%u",
+						(unsigned)sess_param->u.sym_sess.dir,
+						(unsigned)sess_param->u.sym_sess.cipher_algo,
+						(unsigned)sess_param->u.sym_sess.cipher_key_len);
+
+			VC_LOG_INFO("[xform][cipher][rte] algo=%u op=%u key_len=%u iv_len=%u iv_off=%u",
+						(unsigned)xform1.cipher.algo,
+						(unsigned)xform1.cipher.op,
+						(unsigned)xform1.cipher.key.length,
+						(unsigned)xform1.cipher.iv.length,
+						(unsigned)xform1.cipher.iv.offset);
             return;
         }
         break;
@@ -559,10 +575,13 @@ vhost_crypto_create_sym_sess(struct vhost_crypto *vcrypto,
 	D->dir         = (uint8_t)sess_param->u.sym_sess.dir;
 	D->hash_mode   = (uint8_t)sess_param->u.sym_sess.hash_mode;
 	
-	/* iv_len：你的 vhost-user sym sess param 没有 iv_len，只能由算法推导 */
-	D->iv_len = (uint16_t)get_iv_len(sess_param->u.sym_sess.cipher_algo);
-
-	/* 兜底：如果推导失败，再从 xform 里取（防止 get_iv_len 返回 0） */
+	enum rte_crypto_cipher_algorithm rte_algo = 0;
+	if (cipher_algo_transform(sess_param->u.sym_sess.cipher_algo, &rte_algo) == 0) {
+		int iv = get_iv_len(rte_algo);
+		D->iv_len = (uint16_t)(iv > 0 ? iv : 0);
+	} else {
+		D->iv_len = 0;
+	}
 	if (D->iv_len == 0) {
 		const struct rte_crypto_sym_xform *cxf = NULL;
 		if (xform1.type == RTE_CRYPTO_SYM_XFORM_CIPHER)      cxf = &xform1;
@@ -3362,6 +3381,16 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
                        (uint64_t)sid, ret);
             return NULL;
         }
+		VC_LOG_INFO("[restore][cipher][virtio] sid=%" PRIu64 " dir=%u cipher_algo=%u key_len=%u",
+					(uint64_t)sid, (unsigned)P.dir, (unsigned)P.cipher_algo, (unsigned)P.cipher_key_len);
+		VC_LOG_INFO("[restore][cipher][rte] sid=%" PRIu64 " algo=%u op=%u key_len=%u iv_len=%u iv_off=%u",
+					(uint64_t)sid,
+					(unsigned)xform1.cipher.algo,
+					(unsigned)xform1.cipher.op,
+					(unsigned)xform1.cipher.key.length,
+					(unsigned)xform1.cipher.iv.length,
+					(unsigned)xform1.cipher.iv.offset);
+
         break;
 
     case VIRTIO_CRYPTO_SYM_OP_ALGORITHM_CHAINING:
@@ -3389,17 +3418,20 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
     /* 4) 创建 cryptodev session */
     sess = rte_cryptodev_sym_session_create(vcrypto->cid, &xform1, vcrypto->sess_pool);
     if (!sess) {
-        VC_LOG_ERR("restore: rte_cryptodev_sym_session_create failed sid=%" PRIu64
-                   " op_type=%u dir=%u hash_mode=%u cipher_algo=%u hash_algo=%u"
-                   " key_len=%u iv_len=%u tag_len=%u auth_key_len=%u rte_errno=%d",
-                   (uint64_t)sid,
-                   (unsigned)P.op_type, (unsigned)P.dir, (unsigned)P.hash_mode,
-                   (unsigned)P.cipher_algo, (unsigned)P.hash_algo,
-                   (unsigned)P.cipher_key_len,
-                   (unsigned)get_iv_len(P.cipher_algo),
-                   (unsigned)P.digest_len,
-                   (unsigned)P.auth_key_len,
-                   rte_errno);
+         /* 注意：P.cipher_algo 是 virtio 编号；真正给驱动的是 xform1.cipher.algo / xform1.cipher.iv.length */
+		VC_LOG_ERR("restore: rte_cryptodev_sym_session_create failed sid=%" PRIu64
+				" op_type=%u dir=%u hash_mode=%u"
+				" virtio_cipher_algo=%u virtio_hash_algo=%u"
+				" rte_cipher_algo=%u rte_iv_len=%u"
+				" key_len=%u digest_len=%u auth_key_len=%u rte_errno=%d",
+				(uint64_t)sid,
+				(unsigned)P.op_type, (unsigned)P.dir, (unsigned)P.hash_mode,
+				(unsigned)P.cipher_algo, (unsigned)P.hash_algo,
+				(unsigned)xform1.cipher.algo, (unsigned)xform1.cipher.iv.length,
+				(unsigned)P.cipher_key_len,
+				(unsigned)P.digest_len,
+				(unsigned)P.auth_key_len,
+				rte_errno);
         return NULL;
     }
 
