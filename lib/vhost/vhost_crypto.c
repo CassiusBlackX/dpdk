@@ -1096,7 +1096,7 @@ read_all_from_fd(int fd, uint8_t **out_buf, size_t *out_len)
     *out_len = len;
     return 0;
 }
-static __rte_always_inline int vhost_crypto_vq_usable(struct vhost_virtqueue *vq)
+static __rte_always_inline int vhost_crypto_vq_usable(struct vhost_virtqueue *vq);
 static inline int vhost_crypto_device_ready(struct virtio_net *dev);
 static int vhost_crypto_load_state_fd(int vid, int fd);
 
