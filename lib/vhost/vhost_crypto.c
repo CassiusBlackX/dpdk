@@ -341,6 +341,8 @@ struct __rte_cache_aligned vhost_crypto {
 	int last_load_rc;            /* last error code */
 	uint32_t load_fail_cnt;      /* retry counter */
 	uint8_t pending_applying;
+	uint32_t last_applied_blob_crc;
+	size_t   last_applied_blob_len;
 };
 
 struct vhost_crypto_writeback_data {
@@ -1160,7 +1162,9 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
         vcrypto->load_fail_cnt = 0;
 
         rte_spinlock_unlock(&vcrypto->pending_lock);
-
+		uint32_t applied_crc = vc_crc32(buf, (uint32_t)len);
+		vcrypto->last_applied_blob_crc = applied_crc;
+		vcrypto->last_applied_blob_len = len;
         rte_free(buf);
         VC_LOG_INFO("Deferred LOAD OK (vid=%d)", vid);
         return;
@@ -1372,26 +1376,41 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 					break;
 			}
 
-			/* Cache as pending; apply later when device is ready */
+			/* ---- dedup: ignore duplicate blobs that were already applied ---- */
+			uint32_t blob_crc = vc_crc32(buf, (uint32_t)blob_len);
+
 			rte_spinlock_lock(&vcrypto->pending_lock);
 
+			/* 如果这份 blob 已经成功 apply 过，直接丢弃，避免重复 restore */
+			if (vcrypto->last_applied_blob_len == blob_len &&
+				vcrypto->last_applied_blob_crc == blob_crc) {
+				rte_spinlock_unlock(&vcrypto->pending_lock);
+				VC_LOG_INFO("CRYPTO_LOAD duplicate ignored (vid=%d len=%zu crc=0x%x)",
+							vid, blob_len, blob_crc);
+				rte_free(buf);
+				ret = RTE_VHOST_MSG_RESULT_OK;
+				break;
+			}
+
+			/* 正在 apply 时，如果又来一份 LOAD：直接覆盖旧 pending（更符合“最后一次为准”） */
 			if (vcrypto->pending_load_valid && vcrypto->pending_load_buf) {
-					rte_free(vcrypto->pending_load_buf);
-					vcrypto->pending_load_buf = NULL;
-					vcrypto->pending_load_len = 0;
-					vcrypto->pending_load_valid = 0;
+				rte_free(vcrypto->pending_load_buf);
+				vcrypto->pending_load_buf = NULL;
+				vcrypto->pending_load_len = 0;
+				vcrypto->pending_load_valid = 0;
 			}
 
 			vcrypto->pending_load_buf = (uint8_t *)buf;
-			vcrypto->pending_load_len = blob_len;  /* 关键：必须是 blob_len */
+			vcrypto->pending_load_len = blob_len;
 			vcrypto->pending_load_valid = 1;
 
 			rte_spinlock_unlock(&vcrypto->pending_lock);
 
-			VC_LOG_INFO("CRYPTO_LOAD cached blob_len=%zu vid=%d", blob_len, vid);
+			VC_LOG_INFO("CRYPTO_LOAD cached blob_len=%zu vid=%d crc=0x%x", blob_len, vid, blob_crc);
 
 			ret = RTE_VHOST_MSG_RESULT_OK;
 			break;
+
 	}
 
 
