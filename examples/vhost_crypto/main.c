@@ -573,47 +573,45 @@ vhost_crypto_worker(void *arg)
                 }
 
                 /* --- B0) retry pending finalize first (barrier) --- */
-                if (pend[sock][vq].cnt) {
-                    uint16_t batch = pending_peek_batch(&pend[sock][vq], ops_deq[vq], burst_size);
-                    nb_callfds = 0;
+				if (pend[sock][vq].cnt) {
+					uint16_t batch = pending_peek_batch(&pend[sock][vq], ops_deq[vq], burst_size);
+					nb_callfds = 0;
 
-                    uint16_t fin = rte_vhost_crypto_finalize_requests(
-                        ops_deq[vq], batch, callfds, &nb_callfds);
+					uint16_t fin = rte_vhost_crypto_finalize_requests(
+						ops_deq[vq], batch, callfds, &nb_callfds);
 
-                    if (fin) {
-                        pending_pop_n(&pend[sock][vq], fin);
+					if (fin) {
+						/* pop pending */
+						pending_pop_n(&pend[sock][vq], fin);
 
-                        nb_inflight_ops[sock][vq] -= fin;
-                        vhost_crypto_inflight_sub(vid, fin);
+						/* inflight-- only for committed ops */
+						nb_inflight_ops[sock][vq] -= fin;
+						vhost_crypto_inflight_sub(vid, fin);
 
-                        if (!options.guest_polling) {
-                            for (uint16_t k = 0; k < nb_callfds; k++) {
-                                if (callfds[k] >= 0)
-                                    eventfd_write(callfds[k], (eventfd_t)1);
-                            }
-                        }
-                    } else {
-                        /*
-                         * vring is being reconfigured (migration / reconnect window):
-                         * finalize can't touch used ring now.
-                         * Do NOT drop pending; yield CPU so control-plane can finish SET_VRING_* etc.
-                         */
-                        rte_delay_us_sleep(50);
-                     }
-                        rte_mempool_put_bulk(info->cop_pool, (void **)ops_deq[vq], fin);
-                    }
+						if (!options.guest_polling) {
+							for (uint16_t k = 0; k < nb_callfds; k++) {
+								if (callfds[k] >= 0)
+									eventfd_write(callfds[k], (eventfd_t)1);
+							}
+						}
 
-                    /* pending 没清空前不要继续 dequeue 新的，避免积压扩大 */
-                    if (pend[sock][vq].cnt) {
-                        continue;
-                    }
-                }
+						/* only return ops that are truly finalized */
+						rte_mempool_put_bulk(info->cop_pool, (void **)ops_deq[vq], fin);
+					} else {
+						/* vring not ready (migration / reconnect window), yield */
+						rte_delay_us_sleep(50);
+					}
+
+					/* pending 没清空前不要继续 dequeue 新的，避免积压扩大 */
+					if (pend[sock][vq].cnt)
+						continue;
+				}
+
 
                 /* --- B1) dequeue + finalize (ONLY subtract inflight on fin>0) --- */
-                uint32_t cur_infl = nb_inflight_ops[sock][vq];
-                if (!cur_infl) {
-                    continue;
-                }
+                if (nb_inflight_ops[sock][vq] == 0) {
+				continue;
+}
 
                 uint16_t want = (uint16_t)RTE_MIN(burst_size, cur_infl);
                 uint16_t deq = rte_cryptodev_dequeue_burst(
