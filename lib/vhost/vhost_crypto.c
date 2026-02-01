@@ -340,6 +340,7 @@ struct __rte_cache_aligned vhost_crypto {
 	volatile int load_failed;    /* 1 => session restore failed */
 	int last_load_rc;            /* last error code */
 	uint32_t load_fail_cnt;      /* retry counter */
+	uint8_t pending_applying;
 };
 
 struct vhost_crypto_writeback_data {
@@ -1099,60 +1100,88 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
                                     struct vhost_crypto *vcrypto,
                                     const char *why)
 {
-    void *buf = NULL;
+    uint8_t *buf = NULL;
     size_t len = 0;
     int rc;
 
     if (!vcrypto || !dev)
         return;
 
-    /* 没有 pending 直接返回 */
+    /* 1) 抢占 apply 权，避免重入/并发双 apply */
     rte_spinlock_lock(&vcrypto->pending_lock);
-    if (!vcrypto->pending_load_valid || !vcrypto->pending_load_buf || vcrypto->pending_load_len == 0) {
+
+    if (!vcrypto->pending_load_valid ||
+        !vcrypto->pending_load_buf ||
+        vcrypto->pending_load_len == 0) {
         rte_spinlock_unlock(&vcrypto->pending_lock);
+        VC_LOG_DEBUG("pending LOAD: none (vid=%d why=%s)", vid, why);
         return;
     }
-    rte_spinlock_unlock(&vcrypto->pending_lock);
 
-    /* Only require that mem table is present.
-	* Session restore does not need vring translated yet.
-	*/
-	if (!dev->mem || dev->mem->nregions == 0) {
-		VC_LOG_INFO("pending LOAD, but mem table not ready yet (vid=%d why=%s)", vid, why);
-		return;
-	}
-
-    /* 取出 pending，但先不要清标志：失败要能回滚 */
-    rte_spinlock_lock(&vcrypto->pending_lock);
-    if (!vcrypto->pending_load_valid || !vcrypto->pending_load_buf || vcrypto->pending_load_len == 0) {
+    if (vcrypto->pending_applying) {
         rte_spinlock_unlock(&vcrypto->pending_lock);
+        VC_LOG_DEBUG("pending LOAD: applying in progress (vid=%d why=%s)", vid, why);
         return;
     }
+
+    /* 只要求 mem table 就绪（不要求 vring ready） */
+    if (!dev->mem || dev->mem->nregions == 0) {
+        rte_spinlock_unlock(&vcrypto->pending_lock);
+        VC_LOG_INFO("pending LOAD, but mem table not ready yet (vid=%d why=%s)", vid, why);
+        return;
+    }
+
+    vcrypto->pending_applying = 1;
+
+    /* 2) 把 pending 从全局摘下来，避免另一条路径也来 apply 同一份 buf */
     buf = vcrypto->pending_load_buf;
     len = vcrypto->pending_load_len;
+
+    vcrypto->pending_load_buf = NULL;
+    vcrypto->pending_load_len = 0;
+    vcrypto->pending_load_valid = 0;
+
     rte_spinlock_unlock(&vcrypto->pending_lock);
 
     VC_LOG_INFO("Applying deferred CRYPTO_LOAD now (vid=%d why=%s len=%zu)", vid, why, len);
 
+    /* 3) 真正执行 load（注意：你的真实函数签名是 vhost_crypto_load_state(vid, ...)） */
     rc = vhost_crypto_load_state(vid, buf, len);
 
+    /* 4) 收尾：成功 free；失败放回 pending 以便后续触发点重试 */
+    rte_spinlock_lock(&vcrypto->pending_lock);
+
     if (rc == 0) {
-        /* 成功：再清 pending + free */
-        rte_spinlock_lock(&vcrypto->pending_lock);
-        if (vcrypto->pending_load_buf == buf && vcrypto->pending_load_len == len) {
-            vcrypto->pending_load_buf = NULL;
-            vcrypto->pending_load_len = 0;
-            vcrypto->pending_load_valid = 0;
-        }
+        vcrypto->pending_applying = 0;
+
+        /* 你的兜底状态也一并清掉（如果你已引入 load_failed） */
+        vcrypto->load_failed = 0;
+        vcrypto->last_load_rc = 0;
+        vcrypto->load_fail_cnt = 0;
+
         rte_spinlock_unlock(&vcrypto->pending_lock);
 
         rte_free(buf);
         VC_LOG_INFO("Deferred LOAD OK (vid=%d)", vid);
-    } else {
-        /* 失败：不 free、不清 pending，让后续触发点还能再试（你现在 rc=-5 就属于必须保留的情况） */
-        VC_LOG_ERR("Deferred LOAD failed (vid=%d rc=%d) keep pending for retry", vid, rc);
+        return;
     }
+
+    /* 失败：把 buf 放回去，允许重试；清 applying */
+    vcrypto->pending_load_buf = buf;
+    vcrypto->pending_load_len = len;
+    vcrypto->pending_load_valid = 1;
+    vcrypto->pending_applying = 0;
+
+    /* 如果你启用了“失败兜底”，这里也记录一下 */
+    vcrypto->load_failed = 1;
+    vcrypto->last_load_rc = rc;
+    vcrypto->load_fail_cnt++;
+
+    rte_spinlock_unlock(&vcrypto->pending_lock);
+
+    VC_LOG_ERR("Deferred LOAD failed (vid=%d rc=%d) keep pending for retry", vid, rc);
 }
+
 
 
 
