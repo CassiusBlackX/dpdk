@@ -2473,39 +2473,40 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
     }
 
     vq = vc_req->vq;
-    used_idx = vc_req->used_idx;   /* ring slot */
-    desc_idx = vc_req->head_idx;   /* descriptor head */
+    used_idx = vc_req->used_idx;
+    desc_idx = vc_req->head_idx;
 
-    /* Sanity: if vring pointers are invalid, do NOT touch guest memory.
-     * Baseline choice: recycle buffers to avoid mempool exhaustion.
+    if (unlikely(vq == NULL))
+        return NULL;
+
+    /*
+     * IMPORTANT RULE:
+     * If vring is not safe to touch (reconfig/migration window),
+     * do NOT free buffers and do NOT pretend success.
+     * Leave op intact so upper layer can retry later.
      */
-    if (unlikely(vq == NULL || vq->avail == NULL || vq->used == NULL ||
-                 used_idx >= vq->size)) {
-        VC_LOG_ERR("Invalid vq/vring in finalize");
-        goto out_recycle;
-    }
-
-    /* Try-lock access; if we can't safely touch guest memory, recycle and stop. */
     if (unlikely(rte_rwlock_read_trylock(&vq->access_lock) != 0)) {
-        goto out_recycle;
+        return NULL;
     }
 
     vhost_user_iotlb_rd_lock(vq);
-    if (unlikely(!vq->access_ok)) {
+
+    if (unlikely(!vq->access_ok || vq->avail == NULL || vq->used == NULL ||
+                 used_idx >= vq->size)) {
         vhost_user_iotlb_rd_unlock(vq);
         rte_rwlock_read_unlock(&vq->access_lock);
-        goto out_recycle;
+        return NULL;
     }
-    vhost_user_iotlb_rd_unlock(vq);
 
-    /* write-back for non-zero-copy path */
+    /* write-back for non-zero-copy path (touches guest mem, must be under lock) */
     if (vc_req->wb)
         write_back_data(vc_req);
 
-    /* Fill used ring entry; used->idx is advanced by the caller (batch). */
+    /* Fill used ring entry (idx advance is done by the batch caller under SAME lock) */
     vq->used->ring[used_idx].id  = desc_idx;
     vq->used->ring[used_idx].len = vc_req->len;
 
+    vhost_user_iotlb_rd_unlock(vq);
     rte_rwlock_read_unlock(&vq->access_lock);
 
     /* Recycle writeback chain after successful write-back. */
@@ -2514,10 +2515,7 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
         vc_req->wb = NULL;
     }
 
-out_recycle:
-    /* Always recycle buffers to avoid mempool depletion.
-     * Guard against double-free when m_dst == m_src (in-place).
-     */
+    /* Now it is safe to free mbufs: completion has been committed to used ring entry. */
     if (m_dst && m_dst != m_src)
         rte_pktmbuf_free(m_dst);
     if (m_src)
@@ -2527,57 +2525,86 @@ out_recycle:
 }
 
 
+
 static __rte_always_inline uint16_t
 vhost_crypto_complete_one_vm_requests(struct rte_crypto_op **ops,
-		uint16_t nb_ops, int *callfd)
+        uint16_t nb_ops, int *callfd)
 {
-	uint16_t processed = 1;
-	struct vhost_virtqueue *vq, *tmp_vq;
+    uint16_t processed = 0;
+    struct vhost_virtqueue *vq, *tmp_vq;
 
-	if (unlikely(nb_ops == 0))
-		return 0;
+    if (unlikely(nb_ops == 0))
+        return 0;
 
-	vq = vhost_crypto_finalize_one_request(ops[0], NULL);
-	if (unlikely(vq == NULL))
-		return 0;
-	tmp_vq = vq;
+    /*
+     * First op: try to finalize used entry.
+     * If vring not ready, finalize_one_request returns NULL and we return 0
+     * so upper layer keeps ops and retries later (NO DROP).
+     */
+    vq = vhost_crypto_finalize_one_request(ops[0], NULL);
+    if (unlikely(vq == NULL))
+        return 0;
 
-	while ((processed < nb_ops)) {
-		tmp_vq = vhost_crypto_finalize_one_request(ops[processed],
-				tmp_vq);
+    processed = 1;
+    tmp_vq = vq;
 
-		if (unlikely(vq != tmp_vq))
-			break;
+    while (processed < nb_ops) {
+        tmp_vq = vhost_crypto_finalize_one_request(ops[processed], tmp_vq);
+        if (unlikely(tmp_vq == NULL || tmp_vq != vq))
+            break;
+        processed++;
+    }
 
-		processed++;
-	}
+    /*
+     * Now we must advance used->idx under protection, otherwise vring_invalidate()
+     * can NULL out vq->used between finalize and idx increment (your crash).
+     */
+    if (unlikely(rte_rwlock_read_trylock(&vq->access_lock) != 0)) {
+        /* vring reconfig window: do not consume ops, retry later */
+        return 0;
+    }
 
-	*callfd = vq->callfd;
+    vhost_user_iotlb_rd_lock(vq);
+    if (unlikely(!vq->access_ok || vq->used == NULL)) {
+        vhost_user_iotlb_rd_unlock(vq);
+        rte_rwlock_read_unlock(&vq->access_lock);
+        return 0;
+    }
 
-	*(volatile uint16_t *)&vq->used->idx += processed;
-	vq->last_used_idx += processed;
-	/* inflight accounting: only decrement AFTER used->idx is updated */
-	if (likely(processed != 0)) {
-		struct rte_mbuf *m_src = ops[0]->sym ? ops[0]->sym->m_src : NULL;
-		struct vhost_crypto_data_req *vc_req = m_src ? rte_mbuf_to_priv(m_src) : NULL;
-		struct vhost_crypto *vcrypto = vc_req ? vc_req->vcrypto : NULL;
+    *callfd = vq->callfd;
 
-		if (likely(vcrypto)) {
-			uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
-			if (unlikely(cur < processed)) {
-				VC_LOG_ERR("inflight underflow cur=%u sub=%u (BUG)", cur, processed);
-				__atomic_store_n(&vcrypto->inflight_corrupt, 1, __ATOMIC_RELEASE);
-				__atomic_store_n(&vcrypto->inflight, 0, __ATOMIC_RELEASE);
-			} else {
-				__atomic_fetch_sub(&vcrypto->inflight, processed, __ATOMIC_ACQ_REL);
-			}
-		} else {
-			VC_LOG_ERR("inflight sub skipped: missing vcrypto in op priv (BUG)");
-		}
-	}
+    *(volatile uint16_t *)&vq->used->idx += processed;
+    vq->last_used_idx += processed;
 
-	return processed;
+    vhost_user_iotlb_rd_unlock(vq);
+    rte_rwlock_read_unlock(&vq->access_lock);
+
+    /*
+     * inflight accounting MUST correspond to "committed to used ring".
+     * We decrement AFTER idx update succeeded.
+     */
+    if (likely(processed != 0)) {
+        struct rte_mbuf *m_src = ops[0]->sym ? ops[0]->sym->m_src : NULL;
+        struct vhost_crypto_data_req *vc_req = m_src ? rte_mbuf_to_priv(m_src) : NULL;
+        struct vhost_crypto *vcrypto = vc_req ? vc_req->vcrypto : NULL;
+
+        if (likely(vcrypto)) {
+            uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
+            if (unlikely(cur < processed)) {
+                VC_LOG_ERR("inflight underflow cur=%u sub=%u (BUG)", cur, processed);
+                __atomic_store_n(&vcrypto->inflight_corrupt, 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&vcrypto->inflight, 0, __ATOMIC_RELEASE);
+            } else {
+                __atomic_fetch_sub(&vcrypto->inflight, processed, __ATOMIC_ACQ_REL);
+            }
+        } else {
+            VC_LOG_ERR("inflight sub skipped: missing vcrypto in op priv (BUG)");
+        }
+    }
+
+    return processed;
 }
+
 
 RTE_EXPORT_SYMBOL(rte_vhost_crypto_driver_start)
 int

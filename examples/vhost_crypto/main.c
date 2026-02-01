@@ -592,7 +592,14 @@ vhost_crypto_worker(void *arg)
                                     eventfd_write(callfds[k], (eventfd_t)1);
                             }
                         }
-
+                    } else {
+                        /*
+                         * vring is being reconfigured (migration / reconnect window):
+                         * finalize can't touch used ring now.
+                         * Do NOT drop pending; yield CPU so control-plane can finish SET_VRING_* etc.
+                         */
+                        rte_delay_us_sleep(50);
+                     }
                         rte_mempool_put_bulk(info->cop_pool, (void **)ops_deq[vq], fin);
                     }
 
@@ -647,6 +654,11 @@ vhost_crypto_worker(void *arg)
                             break;
                         }
                     }
+                }
+
+                /* If nothing was committed, vring is not ready yet; yield CPU and retry later. */
+                if (unlikely(fin == 0)) {
+                    rte_delay_us_sleep(50);
                 }
             }
         }
