@@ -60,18 +60,24 @@ struct vc_sess_head_v1 {
     uint32_t rsvd1;        // 置 0
 } __attribute__((packed));
 
-/* symmetric session fixed meta */
-struct VC_PACKED vc_sym_meta_v1 {
+struct vc_sym_meta_v1 {
     uint16_t algo_cipher;
     uint16_t algo_auth;
     uint16_t algo_aead;
-    uint16_t chain_mode;   // cipher-then-auth, etc.
+    uint16_t chain_mode;   /* virtio chaining_dir */
+
     uint16_t key_len;
     uint16_t iv_len;
     uint16_t aad_len;
     uint16_t tag_len;
-    uint32_t iv_gen_mode;  // if any
-    /* then variable blob: key[ key_len ] [auth_key[*]] iv_seed[ iv_len? ] ... */
+
+    uint32_t iv_gen_mode;
+
+    /* ---- added for precise restore (v2-in-desc, desc_len tells) ---- */
+    uint8_t  op_type;      /* VIRTIO_CRYPTO_SYM_OP_* (from sym_sess.op_type) */
+    uint8_t  dir;          /* sym_sess.dir: 1 encrypt, 0 decrypt (see transform_cipher_param) */
+    uint8_t  hash_mode;    /* sym_sess.hash_mode */
+    uint8_t  rsvd0;
 };
 
 /* asymmetric session fixed meta */

@@ -531,7 +531,10 @@ vhost_crypto_create_sym_sess(struct vhost_crypto *vcrypto,
     D->aad_len     = 0;        /* 非 AEAD */
     D->tag_len     = (uint16_t)sess_param->u.sym_sess.digest_len;  /* 链式/HMAC 才用 */
     D->iv_gen_mode = 0;
-
+	/* ====== 关键：精确恢复必须保存这三个 ====== */
+	D->op_type     = (uint8_t)sess_param->u.sym_sess.op_type;
+	D->dir         = (uint8_t)sess_param->u.sym_sess.dir;
+	D->hash_mode   = (uint8_t)sess_param->u.sym_sess.hash_mode;
     /* iv_len 与 transform 一致：优先取 cipher xform 的 iv.length */
     do {
         const struct rte_crypto_sym_xform *cxf = NULL;
@@ -3264,66 +3267,43 @@ vc_session_destroy(struct vhost_crypto *vcrypto, struct vhost_crypto_session *vs
 }
 
 
-static struct vhost_crypto_session*
+static struct vhost_crypto_session *
 vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
                       const struct vc_sym_meta_v1 *D,
                       const void *blob, uint32_t blob_len)
 {
-    /* 0) 将 D(快照里的 meta) 解释为 DPDK 可用的 enum：禁止直接强转 */
-    enum rte_crypto_cipher_algorithm dpdk_cipher_algo = 0;
-    enum rte_crypto_auth_algorithm   dpdk_auth_algo   = 0;
-
-    /* 你的工程里大概率已经有 virtio->dpdk 的映射函数；这里必须用它 */
-    if (cipher_algo_transform(D->algo_cipher, &dpdk_cipher_algo) < 0) {
-        VC_LOG_ERR("restore: unsupported cipher algo (virtio/id=%u) sid=%" PRIu64
-                   " key_len=%u iv_len=%u",
-                   (unsigned)D->algo_cipher, (uint64_t)sid,
-                   (unsigned)D->key_len, (unsigned)D->iv_len);
-        return NULL;
-    }
-
-    const bool need_auth = (D->algo_auth && D->tag_len);
-    if (need_auth) {
-        if (auth_algo_transform(D->algo_auth, &dpdk_auth_algo) < 0) {
-            VC_LOG_ERR("restore: unsupported auth algo (virtio/id=%u) sid=%" PRIu64
-                       " tag_len=%u",
-                       (unsigned)D->algo_auth, (uint64_t)sid,
-                       (unsigned)D->tag_len);
-            return NULL;
-        }
-    }
-
-    /* 1) 从 blob 切分 key | auth_key（当前不保存会话级 IV 模板） */
+    /* 0) split blob: cipher_key | auth_key (and ignore any tail if you extend later) */
     const uint8_t *p = (const uint8_t *)blob;
     const uint8_t *key = NULL, *auth_key = NULL;
-    uint16_t key_len = D->key_len, auth_key_len = 0;
+    uint16_t key_len = D->key_len;
+    uint16_t auth_key_len = 0;
 
     if (key_len) {
         if (blob_len < key_len) {
-            VC_LOG_ERR("restore: blob too small for cipher key sid=%" PRIu64
-                       " blob_len=%u key_len=%u",
+            VC_LOG_ERR("restore: blob too small sid=%" PRIu64 " blob_len=%u key_len=%u",
                        (uint64_t)sid, (unsigned)blob_len, (unsigned)key_len);
             return NULL;
         }
         key = p;
         p += key_len;
     }
-
     if (blob_len > key_len) {
         auth_key_len = (uint16_t)(blob_len - key_len);
         auth_key = p;
     }
 
-    /* 若 meta 表示需要 auth，但 blob 没带 auth_key，也直接判失败更清晰 */
+    /* need_auth is decided the same way as save/create side semantic */
+    const bool need_auth = (D->algo_auth != 0 && D->tag_len != 0);
+
     if (need_auth && auth_key_len == 0) {
-        VC_LOG_ERR("restore: meta requires auth but no auth_key in blob sid=%" PRIu64
+        VC_LOG_ERR("restore: need auth but no auth_key sid=%" PRIu64
                    " algo_auth=%u tag_len=%u blob_len=%u key_len=%u",
                    (uint64_t)sid, (unsigned)D->algo_auth, (unsigned)D->tag_len,
                    (unsigned)blob_len, (unsigned)key_len);
         return NULL;
     }
 
-    /* 2) 为 DPDK xform 准备“可写”密钥副本，避免 const-cast */
+    /* 1) make writable copies for PMD (avoid const-cast) */
     uint8_t *cipher_key_copy = NULL;
     uint8_t *auth_key_copy   = NULL;
 
@@ -3334,7 +3314,6 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
             return NULL;
         }
     }
-
     if (auth_key_len) {
         auth_key_copy = dup_bytes_dpdk(auth_key, auth_key_len);
         if (!auth_key_copy) {
@@ -3344,74 +3323,109 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
         }
     }
 
-    /* 3) 构造 xform：若存在 auth，则 AUTH->CIPHER 链式，否则纯 CIPHER */
+    /*
+     * 2) Build a synthetic VhostUserCryptoSessionParam and reuse the
+     *    exact same transform_* path as vhost_crypto_create_sym_sess().
+     */
+    VhostUserCryptoSessionParam sess_param;
+    memset(&sess_param, 0, sizeof(sess_param));
+
+    sess_param.op_type                 = VIRTIO_CRYPTO_SYM_SESS; /* session kind */
+    sess_param.u.sym_sess.op_type      = D->op_type;             /* from snapshot (added) */
+    sess_param.u.sym_sess.dir          = D->dir;                 /* from snapshot (added) */
+    sess_param.u.sym_sess.hash_mode    = D->hash_mode;           /* from snapshot (added) */
+    sess_param.u.sym_sess.chaining_dir = D->chain_mode;
+
+    sess_param.u.sym_sess.cipher_algo      = D->algo_cipher;
+    sess_param.u.sym_sess.hash_algo        = D->algo_auth;
+    sess_param.u.sym_sess.aead_algo        = D->algo_aead;
+
+    sess_param.u.sym_sess.cipher_key_len   = D->key_len;
+    sess_param.u.sym_sess.iv_len           = D->iv_len;
+    sess_param.u.sym_sess.aad_len          = D->aad_len;
+    sess_param.u.sym_sess.digest_len       = D->tag_len;
+
+    sess_param.u.sym_sess.cipher_key       = cipher_key_copy;
+    sess_param.u.sym_sess.auth_key         = auth_key_copy;
+    sess_param.u.sym_sess.auth_key_len     = auth_key_len;
+
     struct rte_crypto_sym_xform xform1;
     struct rte_crypto_sym_xform xform2;
     memset(&xform1, 0, sizeof(xform1));
     memset(&xform2, 0, sizeof(xform2));
-    struct rte_crypto_sym_xform *head = NULL;
 
-    if (need_auth && auth_key_len) {
-        xform2.type                 = RTE_CRYPTO_SYM_XFORM_AUTH;
-        xform2.next                 = &xform1;
+    struct rte_crypto_sym_xform *xform_head = NULL;
 
-        /* 关键：使用映射后的 DPDK enum，而不是 (enum) 强转 */
-        xform2.auth.algo            = dpdk_auth_algo;
+    if (sess_param.u.sym_sess.op_type == VIRTIO_CRYPTO_SYM_OP_CIPHER_SESSION) {
+        /* identical to create side: cipher-only path uses dir */
+        if (transform_cipher_param(&xform1, &sess_param.u.sym_sess) < 0) {
+            VC_LOG_ERR("restore: transform_cipher_param failed sid=%" PRIu64, (uint64_t)sid);
+            secure_free(cipher_key_copy, key_len);
+            secure_free(auth_key_copy, auth_key_len);
+            return NULL;
+        }
+        xform_head = &xform1;
 
+    } else if (sess_param.u.sym_sess.op_type == VIRTIO_CRYPTO_SYM_OP_ALGORITHM_CHAINING) {
+        /* identical to create side: chaining path uses chaining_dir(+digest_len etc) */
+        xform1.next = &xform2;
+        if (transform_chain_param(&xform1, &sess_param.u.sym_sess) < 0) {
+            VC_LOG_ERR("restore: transform_chain_param failed sid=%" PRIu64, (uint64_t)sid);
+            secure_free(cipher_key_copy, key_len);
+            secure_free(auth_key_copy, auth_key_len);
+            return NULL;
+        }
+        xform_head = &xform1;
+
+    } else {
         /*
-         * 注意：这里仍然是你原来的默认方向。严格来说应该跟 D 的 op 对齐；
-         * 先把 enum 映射修对，迁移先跑通；之后再补 op 的精确恢复。
+         * Backward compatibility / safety: if op_type wasn't saved (old snapshot),
+         * infer from need_auth.
          */
-        xform2.auth.op              = RTE_CRYPTO_AUTH_OP_GENERATE;
-        xform2.auth.digest_length   = D->tag_len;
-        xform2.auth.key.data        = auth_key_copy;
-        xform2.auth.key.length      = auth_key_len;
-        head = &xform2;
+        if (!need_auth) {
+            if (transform_cipher_param(&xform1, &sess_param.u.sym_sess) < 0) {
+                VC_LOG_ERR("restore: transform_cipher_param failed sid=%" PRIu64, (uint64_t)sid);
+                secure_free(cipher_key_copy, key_len);
+                secure_free(auth_key_copy, auth_key_len);
+                return NULL;
+            }
+            xform_head = &xform1;
+        } else {
+            xform1.next = &xform2;
+            if (transform_chain_param(&xform1, &sess_param.u.sym_sess) < 0) {
+                VC_LOG_ERR("restore: transform_chain_param failed sid=%" PRIu64, (uint64_t)sid);
+                secure_free(cipher_key_copy, key_len);
+                secure_free(auth_key_copy, auth_key_len);
+                return NULL;
+            }
+            xform_head = &xform1;
+        }
     }
 
-    xform1.type                    = RTE_CRYPTO_SYM_XFORM_CIPHER;
-    xform1.next                    = NULL;
-
-    /* 关键：使用映射后的 DPDK enum，而不是 (enum) 强转 */
-    xform1.cipher.algo             = dpdk_cipher_algo;
-
-    /*
-     * 同上：严格应与 D 的 op 对齐（encrypt/decrypt）。先保留你原来的默认。
-     */
-    xform1.cipher.op               = RTE_CRYPTO_CIPHER_OP_ENCRYPT;
-    xform1.cipher.iv.length        = D->iv_len;
-    xform1.cipher.key.data         = cipher_key_copy;
-    xform1.cipher.key.length       = key_len;
-
-    if (!head) {
-        head = &xform1;
-    }
-
-    /* 4) 创建 cryptodev 会话 */
+    /* 3) create cryptodev session */
     struct rte_cryptodev_sym_session *sess =
-        rte_cryptodev_sym_session_create(vcrypto->cid, head, vcrypto->sess_pool);
+        rte_cryptodev_sym_session_create(vcrypto->cid, xform_head, vcrypto->sess_pool);
 
     if (!sess) {
-        /* 打印 errno 会更好定位（不同 PMD 会给出不同错误） */
         VC_LOG_ERR("restore: rte_cryptodev_sym_session_create failed sid=%" PRIu64
-                   " cipher(virtio=%u->dpdk=%d) auth(virtio=%u->dpdk=%d need_auth=%d)"
+                   " cipher_algo=%u auth_algo=%u aead_algo=%u chain_dir=%u dir=%u op_type=%u"
                    " key_len=%u iv_len=%u tag_len=%u auth_key_len=%u rte_errno=%d",
                    (uint64_t)sid,
-                   (unsigned)D->algo_cipher, (int)dpdk_cipher_algo,
-                   (unsigned)D->algo_auth,   (int)dpdk_auth_algo, (int)need_auth,
-                   (unsigned)key_len, (unsigned)D->iv_len, (unsigned)D->tag_len,
+                   (unsigned)D->algo_cipher, (unsigned)D->algo_auth, (unsigned)D->algo_aead,
+                   (unsigned)D->chain_mode, (unsigned)D->dir, (unsigned)D->op_type,
+                   (unsigned)D->key_len, (unsigned)D->iv_len, (unsigned)D->tag_len,
                    (unsigned)auth_key_len, rte_errno);
 
         secure_free(cipher_key_copy, key_len);
-        secure_free(auth_key_copy,   auth_key_len);
+        secure_free(auth_key_copy, auth_key_len);
         return NULL;
     }
 
-    /* 会话创建成功后，PMD 一般已拷贝/展开密钥至私有区，立刻擦除临时副本 */
+    /* session created: wipe temporary key buffers */
     secure_free(cipher_key_copy, key_len);
-    secure_free(auth_key_copy,   auth_key_len);
+    secure_free(auth_key_copy, auth_key_len);
 
-    /* 5) 分配 vhost 会话并回填 meta（供后续 save 复原） */
+    /* 4) allocate vhost session wrapper + keep meta/blob for next save */
     struct vhost_crypto_session *vs = rte_zmalloc(NULL, sizeof(*vs), 0);
     if (!vs) {
         VC_LOG_ERR("restore: alloc vhost_crypto_session failed sid=%" PRIu64, (uint64_t)sid);
@@ -3422,9 +3436,9 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
     vs->type = RTE_CRYPTO_OP_TYPE_SYMMETRIC;
     vs->sym  = sess;
 
-    vs->meta.valid       = true;
-    vs->meta.session_id  = sid;
-    vs->meta.kind        = VC_SESS_SYM;
+    vs->meta.valid      = true;
+    vs->meta.session_id = sid;
+    vs->meta.kind       = VC_SESS_SYM;
     memcpy(&vs->meta.sym.desc, D, sizeof(*D));
 
     if (blob_len) {
@@ -3442,6 +3456,7 @@ vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
 
     return vs;
 }
+
 
 void test_save_load_blob(int vid)
 {
