@@ -2634,6 +2634,15 @@ rte_vhost_crypto_create(int vid, uint8_t cryptodev_id,
 	vcrypto->pending_load_buf = NULL;
 	vcrypto->pending_load_len = 0;
 	vcrypto->pending_load_valid = 0;
+	vcrypto->pending_applying = 0;
+
+	/* restore failure bookkeeping (must be deterministic) */
+	vcrypto->load_failed = 0;
+	vcrypto->last_load_rc = 0;
+	vcrypto->load_fail_cnt = 0;
+	vcrypto->last_applied_blob_crc = 0;
+	vcrypto->last_applied_blob_len = 0;
+
 
 	snprintf(name, 127, "HASH_VHOST_CRYPT_%u", (uint32_t)vid);
 	params.name = name;
@@ -2887,13 +2896,6 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 		return 0;
 	}
 
-	/* ✅ 先做一次“前检查式”的 apply 尝试：避免 ready 刚变真但你错过触发点
-	* 重要：vhost_crypto_try_apply_pending_load() 内部也必须先判断 device ready，
-	* 并且在 access_ok 不满足时不能去读 vring/guest 内存。 */
-	if (unlikely(vcrypto->pending_load_buf != NULL)) {
-		vhost_crypto_try_apply_pending_load(vid, dev, vcrypto, "fetch-pre");
-	}
-
 	/* access_ok 是硬门：没开就绝对不要触碰 vring/guest 内存 */
 	if (unlikely(!vq->access_ok)) {
 		static int once;
@@ -2903,11 +2905,6 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 					vid, qid, dev->status, vq->ready, vq->access_ok);
 		}
 		return 0;
-	}
-
-	/* ✅ 再来一次“安全点”的 apply：此时允许做真正的 load/apply（若需要访问 vring/guest 内存） */
-	if (unlikely(vcrypto->pending_load_buf != NULL)) {
-		vhost_crypto_try_apply_pending_load(vid, dev, vcrypto, "fetch-post");
 	}
 
 	if (unlikely(vq == NULL)) {
