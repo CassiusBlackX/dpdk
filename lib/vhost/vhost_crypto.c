@@ -1100,6 +1100,21 @@ static __rte_always_inline int vhost_crypto_vq_usable(struct vhost_virtqueue *vq
 static inline int vhost_crypto_device_ready(struct virtio_net *dev);
 static int vhost_crypto_load_state_fd(int vid, int fd);
 
+/* Restore gate: allow applying CRYPTO_LOAD as soon as mem table + FEATURES_OK are ready.
+ * Do NOT require DRIVER_OK here, otherwise guest requests may arrive before sessions are restored.
+ */
+static inline int
+vhost_crypto_restore_ready(struct virtio_net *dev)
+{
+    if (!dev || !dev->mem || dev->mem->nregions == 0)
+        return 0;
+
+    if (!(dev->status & VIRTIO_DEVICE_STATUS_FEATURES_OK))
+        return 0;
+
+    return 1;
+}
+
 static void
 vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
                                     struct vhost_crypto *vcrypto,
@@ -1115,9 +1130,9 @@ vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
     /* Safety gate first: keep control-plane fast and avoid early restore.
      * If not ready, just return and retry on later cfg messages.
      */
-    if (!vhost_crypto_device_ready(dev)) {
+    if (!vhost_crypto_restore_ready(dev)) {
         RTE_LOG(DEBUG, VHOST_CONFIG,
-                "pending LOAD: device not ready (vid=%d why=%s status=0x%x)",
+                "pending LOAD: restore not ready (vid=%d why=%s status=0x%x)",
                 vid, why, dev->status);
         return;
     }
@@ -2966,6 +2981,13 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 	if (unlikely(__atomic_load_n(&vcrypto->frozen, __ATOMIC_ACQUIRE))) {
 		return 0;
 	}
+	 /* Migration restore is pending/applying: do not process requests yet.
+     * This provides safe backpressure and avoids "Failed to find session".
+     */
+    if (unlikely(__atomic_load_n(&vcrypto->pending_load_valid, __ATOMIC_ACQUIRE) ||
+                 __atomic_load_n(&vcrypto->pending_applying, __ATOMIC_ACQUIRE))) {
+        return 0;
+    }
 
 	/* access_ok 是硬门：没开就绝对不要触碰 vring/guest 内存 */
 	if (unlikely(!vq->access_ok)) {
