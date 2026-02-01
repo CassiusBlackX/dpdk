@@ -535,13 +535,14 @@ vhost_crypto_create_sym_sess(struct vhost_crypto *vcrypto,
 	D->op_type     = (uint8_t)sess_param->u.sym_sess.op_type;
 	D->dir         = (uint8_t)sess_param->u.sym_sess.dir;
 	D->hash_mode   = (uint8_t)sess_param->u.sym_sess.hash_mode;
-    /* iv_len 与 transform 一致：优先取 cipher xform 的 iv.length */
-    do {
-        const struct rte_crypto_sym_xform *cxf = NULL;
-        if (xform1.type == RTE_CRYPTO_SYM_XFORM_CIPHER) cxf = &xform1;
-        else if (xform2.type == RTE_CRYPTO_SYM_XFORM_CIPHER) cxf = &xform2;
-        D->iv_len = (uint16_t)(cxf ? cxf->cipher.iv.length : 0);
-    } while (0);
+    /* iv_len：优先记录 guest 传下来的 session 参数；若为 0 再用 cipher xform 补齐 */
+	D->iv_len = (uint16_t)sess_param->u.sym_sess.iv_len;
+	if (D->iv_len == 0) {
+		const struct rte_crypto_sym_xform *cxf = NULL;
+		if (xform1.type == RTE_CRYPTO_SYM_XFORM_CIPHER)      cxf = &xform1;
+		else if (xform2.type == RTE_CRYPTO_SYM_XFORM_CIPHER) cxf = &xform2;
+		D->iv_len = (uint16_t)(cxf ? cxf->cipher.iv.length : 0);
+	}
 
     /* 2) 变长 blob 约定顺序：cipher_key | auth_key | iv_seed(可选) */
     uint32_t key_len      = sess_param->u.sym_sess.cipher_key_len;
