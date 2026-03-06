@@ -7,6 +7,13 @@
 #include <rte_mbuf.h>
 #include <rte_compressdev.h>
 
+#include <unistd.h>
+#include <errno.h>
+#include <rte_spinlock.h>
+#include <rte_hash_crc.h>
+#include <rte_cycles.h>
+#include <rte_byteorder.h>
+
 #include "iotlb.h"
 #include "rte_vhost_comp.h"
 #include "vhost.h"
@@ -54,6 +61,14 @@ RTE_LOG_REGISTER_SUFFIX(vhost_comp_logtype, compress, INFO);
  */
 #define vhost_comp_desc vring_desc
 
+static int vhost_comp_freeze(int vid);
+static int vhost_comp_thaw(int vid);
+static int vhost_comp_save_state(int vid, int fd);
+static void vhost_comp_try_apply_pending_load(int vid, struct virtio_net *dev,
+					      struct vhost_comp *vcompress,
+					      const char *why);
+static uint32_t vc_crc32(const void *data, uint32_t len);
+
 struct vhost_comp_session {
 	union {
 		void *private_xform;
@@ -61,6 +76,10 @@ struct vhost_comp_session {
 	};
 	enum rte_comp_op_type type;
 	enum rte_comp_xform_type xform_type;
+
+	/* migration: enough info to rebuild private_xform */
+	uint8_t has_stateless_param;
+	VhostUserCompStatelessSessionParam stateless_param;
 };
 
 static int
@@ -131,6 +150,19 @@ struct __rte_cache_aligned vhost_comp {
 	struct virtio_net *dev;
 
 	uint8_t option;
+
+		/* migration: pending load + dedup */
+	rte_spinlock_t pending_lock;
+	uint8_t *pending_load_buf;
+	size_t pending_load_len;
+	uint8_t pending_load_valid;
+	uint8_t pending_applying;
+	uint32_t last_applied_blob_crc;
+	size_t last_applied_blob_len;
+
+	/* migration: quiesce tracking  */
+	uint32_t inflight;
+	uint8_t frozen;
 };
 
 struct vhost_comp_writeback_data {
@@ -221,6 +253,9 @@ vhost_comp_create_private_xform(struct vhost_comp *vcompress,
 	vhost_session->type = RTE_COMP_OP_STATELESS;
 	vhost_session->xform_type = RTE_COMP_COMPRESS;
 	vhost_session->private_xform = private_xform;
+
+	vhost_session->has_stateless_param = 1;
+	vhost_session->stateless_param = param->u.stateless;
 
 	/* insert session to map */
 	if ((rte_hash_add_key_data(vcompress->session_map,
@@ -327,22 +362,193 @@ vhost_comp_msg_post_handler(int vid, void *msg)
 	vcompress->dev = dev;
 
 	VC_LOG_ERR("request frontend %d", ctx->msg.request.frontend);
+	VC_LOG_INFO("TAG_CTRL_POST vid=%d req=%u fd_num=%u",
+		    vid, ctx->msg.request.frontend, ctx->fd_num);
 	switch (ctx->msg.request.frontend) {
 	case VHOST_USER_COMPRESS_CREATE_SESS:
-		vhost_comp_create_sess(vcompress,
-				&ctx->msg.payload.comp_session);
+		vhost_comp_create_sess(vcompress, &ctx->msg.payload.comp_session);
 		ctx->fd_num = 0;
 		ret = RTE_VHOST_MSG_RESULT_REPLY;
 		break;
+
 	case VHOST_USER_COMPRESS_CLOSE_SESS:
 		if (vhost_comp_close_sess(vcompress, ctx->msg.payload.u64))
 			ret = RTE_VHOST_MSG_RESULT_ERR;
 		break;
+
+	case VHOST_USER_SET_STATUS: {
+		uint8_t st = (uint8_t)ctx->msg.payload.u64;
+		/* 对齐 vcrypto：DRIVER_OK 置位就允许数据面工作；迁移恢复后也会走这里 */
+		if (st & VIRTIO_DEVICE_STATUS_DRIVER_OK) {
+			(void)vhost_comp_thaw(vid);
+		}
+		ret = RTE_VHOST_MSG_RESULT_NOT_HANDLED; /* 让 core handler 继续处理 */
+		break;
+	}
+
+	/* ---- migration extensions ---- */
+	case VHOST_USER_COMPRESS_FREEZE:
+		ret = (vhost_comp_freeze(vid) == 0) ? RTE_VHOST_MSG_RESULT_OK
+						    : RTE_VHOST_MSG_RESULT_ERR;
+		break;
+
+	case VHOST_USER_COMPRESS_SAVE: {
+		int fd = (ctx->fd_num > 0) ? ctx->fds[0] : -1;
+		ctx->fds[0] = -1;
+		ctx->fd_num = 0;
+
+		if (fd < 0) {
+			VC_LOG_ERR("COMP_SAVE missing fd (vid=%d)", vid);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* 对齐 vcrypto：SAVE 前必须 freeze；若 -EBUSY 说明还有 inflight，短暂重试 */
+		int fr = vhost_comp_freeze(vid);
+		while (fr == -EBUSY) {
+			rte_delay_us_block(100);
+			fr = vhost_comp_freeze(vid);
+		}
+		if (fr < 0) {
+			VC_LOG_ERR("COMP_SAVE freeze failed (vid=%d ret=%d)", vid, fr);
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* 保险：freeze 后再确认一次 inflight==0（inflight 字段你后面第三处会加） */
+		if (__atomic_load_n(&vcompress->inflight, __ATOMIC_ACQUIRE) != 0) {
+			VC_LOG_ERR("COMP_SAVE while inflight!=0 (vid=%d inflight=%u)",
+				   vid, __atomic_load_n(&vcompress->inflight, __ATOMIC_ACQUIRE));
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		int rc = vhost_comp_save_state(vid, fd);
+		if (rc == 0)
+			(void)fsync(fd);
+
+		close(fd);
+		ret = (rc == 0) ? RTE_VHOST_MSG_RESULT_OK : RTE_VHOST_MSG_RESULT_ERR;
+		break;
+	}
+
+	case VHOST_USER_COMPRESS_LOAD: {
+		int fd = (ctx->fd_num > 0) ? ctx->fds[0] : -1;
+		ctx->fds[0] = -1;
+		ctx->fd_num = 0;
+
+		if (fd < 0) {
+			VC_LOG_ERR("COMP_LOAD missing fd (vid=%d)", vid);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* 对齐 vcrypto：QEMU 约定 msg.size=8，payload.u64=blob_len（注意小端） */
+		if (ctx->msg.size != sizeof(uint64_t)) {
+			VC_LOG_ERR("COMP_LOAD bad msg.size=%u (expect 8) vid=%d",
+				   ctx->msg.size, vid);
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		size_t blob_len = (size_t)FROMLE64(ctx->msg.payload.u64);
+		if (blob_len == 0 || blob_len > (64u << 20)) {
+			VC_LOG_ERR("COMP_LOAD bad blob_len=%zu vid=%d", blob_len, vid);
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		void *buf = rte_malloc(NULL, blob_len, 0);
+		if (!buf) {
+			VC_LOG_ERR("COMP_LOAD rte_malloc(%zu) failed vid=%d", blob_len, vid);
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* 关键：严格读满 blob_len，不能等 EOF（否则 QEMU wait_reply 会互锁） */
+		size_t off = 0;
+		while (off < blob_len) {
+			ssize_t n = read(fd, (uint8_t *)buf + off, blob_len - off);
+			if (n > 0) { off += (size_t)n; continue; }
+			if (n == 0) {
+				VC_LOG_ERR("COMP_LOAD unexpected EOF (got=%zu want=%zu) vid=%d",
+						off, blob_len, vid);
+				rte_free(buf);
+				ret = RTE_VHOST_MSG_RESULT_ERR;
+				break;
+			}
+			if (errno == EINTR)
+				continue;
+
+			VC_LOG_ERR("COMP_LOAD read error errno=%d vid=%d", errno, vid);
+			rte_free(buf);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* while 结束后只 close 一次 */
+		close(fd);
+		if (ret == RTE_VHOST_MSG_RESULT_ERR)
+			break;
+		/* 对齐 vcrypto：LOAD 先缓存，等 restore_ready 后再 apply（try_apply_pending_load） */
+		uint32_t blob_crc = vc_crc32(buf, (uint32_t)blob_len);
+
+		rte_spinlock_lock(&vcompress->pending_lock);
+
+		if (vcompress->last_applied_blob_len == blob_len &&
+		    vcompress->last_applied_blob_crc == blob_crc) {
+			rte_spinlock_unlock(&vcompress->pending_lock);
+			VC_LOG_INFO("COMP_LOAD duplicate ignored (vid=%d len=%zu crc=0x%x)",
+				    vid, blob_len, blob_crc);
+			rte_free(buf);
+			ret = RTE_VHOST_MSG_RESULT_OK;
+			break;
+		}
+
+		if (vcompress->pending_load_valid && vcompress->pending_load_buf) {
+			rte_free(vcompress->pending_load_buf);
+			vcompress->pending_load_buf = NULL;
+			vcompress->pending_load_len = 0;
+			vcompress->pending_load_valid = 0;
+		}
+
+		vcompress->pending_load_buf = (uint8_t *)buf;
+		vcompress->pending_load_len = blob_len;
+		vcompress->pending_load_valid = 1;
+
+		rte_spinlock_unlock(&vcompress->pending_lock);
+
+		VC_LOG_INFO("COMP_LOAD cached blob_len=%zu vid=%d crc=0x%x",
+			    blob_len, vid, blob_crc);
+
+		ret = RTE_VHOST_MSG_RESULT_OK;
+		break;
+	}
+
+	case VHOST_USER_COMPRESS_THAW:
+		ret = (vhost_comp_thaw(vid) == 0) ? RTE_VHOST_MSG_RESULT_OK
+						  : RTE_VHOST_MSG_RESULT_ERR;
+		break;
+
+	case VHOST_USER_SET_MEM_TABLE:
+	case VHOST_USER_SET_VRING_ADDR:
+	case VHOST_USER_SET_VRING_NUM:
+	case VHOST_USER_SET_VRING_BASE:
+	case VHOST_USER_SET_VRING_KICK:
+		/* 对齐 vcrypto：让 core handler 去真正配置，只在配置后尝试 apply pending */
+		ret = RTE_VHOST_MSG_RESULT_NOT_HANDLED;
+		vhost_comp_try_apply_pending_load(vid, dev, vcompress, "cfg-msg-post");
+		break;
+
 	default:
 		ret = RTE_VHOST_MSG_RESULT_NOT_HANDLED;
 		break;
 	}
-
 	return ret;
 }
 
@@ -1096,7 +1302,19 @@ rte_vhost_comp_create(int vid, uint8_t compressdev_id,
 	vcompress->dev = dev;
 	vcompress->option = RTE_VHOST_COMP_ZERO_COPY_DISABLE;
 
-	snprintf(name, 127, "HASH_VHOST_CRYPT_%u", (uint32_t)vid);
+	/* migration-related init (needed because we added pending_* fields) */
+    rte_spinlock_init(&vcompress->pending_lock);
+    vcompress->pending_load_buf = NULL;
+    vcompress->pending_load_len = 0;
+    vcompress->pending_load_valid = 0;
+    vcompress->pending_applying = 0;
+    vcompress->last_applied_blob_crc = 0;
+    vcompress->last_applied_blob_len = 0;
+    vcompress->inflight = 0;
+	vcompress->frozen = 0;
+
+
+	snprintf(name, 127, "HASH_VHOST_COMP_%u", (uint32_t)vid);
 	params.name = name;
 	params.entries = VHOST_COMP_SESSION_MAP_ENTRIES;
 	params.hash_func = rte_jhash;
