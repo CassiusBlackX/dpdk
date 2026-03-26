@@ -370,7 +370,7 @@ static const struct rte_cryptodev_capabilities uadk_crypto_v2_capabilities[] = {
 					(1 << RTE_CRYPTO_ASYM_OP_DECRYPT)), 
 			{.modlen = {					
 				.min = 1,				
-				.max = 1024,				
+				.max = 2048,				
 				.increment = 1				
 			}, }						
 		}							
@@ -874,15 +874,15 @@ static int uadk_rsa_set_key(struct uadk_crypto_session *sess,
 	int ret = 0;
 
 	if (rsa_xform->key_type == RTE_RSA_KEY_TYPE_QT) {
-		rte_crypto_uint dQ;
+		struct wd_dtb dQ;
 		transfer_to_wd_dtb(&dQ, &rsa_xform->qt.dQ);
-		rte_crypto_uint dP;
+		struct wd_dtb dP;
 		transfer_to_wd_dtb(&dP, &rsa_xform->qt.dP);
-		rte_crypto_uint qInv;
+		struct wd_dtb qInv;
 		transfer_to_wd_dtb(&qInv, &rsa_xform->qt.qInv);
-		rte_crypto_uint q;
+		struct wd_dtb q;
 		transfer_to_wd_dtb(&q, &rsa_xform->qt.q);
-		rte_crypto_uint p;
+		struct wd_dtb p;
 		transfer_to_wd_dtb(&p, &rsa_xform->qt.p);
 		ret = wd_rsa_set_crt_prikey_params(sess->handle_rsa,
 						&dQ, &dP, &qInv, &q, &p);
@@ -899,9 +899,9 @@ static int uadk_rsa_set_key(struct uadk_crypto_session *sess,
 		UADK_LOG(ERR, "Failed to set RSA private key");
 		return -EINVAL;
 	}
-	rte_crypto_uint e;
+	struct wd_dtb e;
 	transfer_to_wd_dtb(&e, &rsa_xform->e);
-	rte_crypto_uint n;
+	struct wd_dtb n;
 	transfer_to_wd_dtb(&n, &rsa_xform->n);
 	ret = wd_rsa_set_pubkey_params(sess->handle_rsa,
 				&e, &n);
@@ -944,7 +944,6 @@ uadk_rsa_session_init(struct rte_cryptodev *dev,
 		ctx_set_num->async_ctx_num = priv->nb_qpairs;
 
 		ret = wd_rsa_init2_("rsa", SCHED_POLICY_RR, TASK_HW, &cparams);
-		free(ctx_set_num);
 
 		if (ret) {
 			UADK_LOG(ERR, "failed to do rsa init2!");
@@ -970,8 +969,8 @@ uadk_rsa_session_init(struct rte_cryptodev *dev,
 		goto uninit;
 	}
 
-	// TODO:
-	sess->asym.u.rsa.req.op_type = rsa_xform;
+	/* Initialize op_type to a valid default and set real value per op. */
+	sess->asym.u.rsa.req.op_type = WD_RSA_SIGN;
 	memcpy(&sess->asym.u.rsa.xform, rsa_xform,
 	       sizeof(struct rte_crypto_rsa_xform));
 	
@@ -983,7 +982,7 @@ err:
 	return ret;
 
 uninit:
-	wd_cipher_uninit2();
+	wd_rsa_uninit2();
 	priv->rsa_init = false;
 	return ret;
 }
@@ -1261,6 +1260,28 @@ static void uadk_rsa_async_cb(void *cb_param)
 	return;
 }
 
+static void padding_add_PKCS1_type_1(struct rte_crypto_op *op,
+				struct uadk_crypto_session *sess, struct wd_rsa_req *req) {
+	unsigned int key_bytes = sess->asym.u.rsa.xform.n.length;
+	req->src = OPENSSL_malloc(key_bytes);
+	req->src_bytes = key_bytes;
+	switch (op->asym->rsa.op_type) {
+	case RTE_CRYPTO_ASYM_OP_ENCRYPT:
+	case RTE_CRYPTO_ASYM_OP_SIGN:
+		RSA_padding_add_PKCS1_type_1(req->src, key_bytes, op->asym->rsa.message.data, op->asym->rsa.message.length);
+		break;
+	case RTE_CRYPTO_ASYM_OP_DECRYPT:
+		RSA_padding_add_PKCS1_type_1(req->src, key_bytes, op->asym->rsa.cipher.data, op->asym->rsa.cipher.length);
+		break;
+	case RTE_CRYPTO_ASYM_OP_VERIFY:
+		RSA_padding_add_PKCS1_type_1(req->src, key_bytes, op->asym->rsa.sign.data, op->asym->rsa.sign.length);
+		break;
+	default:
+		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+		return;
+	}
+}
+
 static void uadk_process_rsa_op(struct rte_crypto_op *op,
 				struct uadk_crypto_session *sess, bool async)
 {
@@ -1271,56 +1292,45 @@ static void uadk_process_rsa_op(struct rte_crypto_op *op,
 	memset(req, 0, sizeof(*req));
 
 	// TODO:PADDING_TYPE
-	switch (sess->asym.u.rsa.xform.padding.type) {
-	case RTE_CRYPTO_RSA_PADDING_NONE:
-		break;
-	case RTE_CRYPTO_RSA_PADDING_PKCS1_5:
-		// RSA_padding_add_PKCS1_type_1(out, rsa_size, data, data_len);
-		break;
-	default:
-		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
-		return;
-	}
+	padding_add_PKCS1_type_1(op, sess, req);
 
 	switch (op->asym->rsa.op_type) {
 	//TODO: WD_RSA_GENKEY
+	case RTE_CRYPTO_ASYM_OP_ENCRYPT:
+		req->dst = asym_op->rsa.cipher.data;
+		req->dst_bytes = asym_op->rsa.cipher.length;
+		req->op_type = WD_RSA_SIGN;
+		break;
 	case RTE_CRYPTO_ASYM_OP_SIGN:
-		if (asym_op->rsa.cipher.data != NULL) {
-			op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
-			return;
-		}
-		asym_op->rsa.cipher.data = malloc(asym_op->rsa.sign.length);
-		asym_op->rsa.cipher.length = asym_op->rsa.sign.length;
-		req->src = asym_op->rsa.message.data;
-		req->src_bytes = asym_op->rsa.message.length;
 		req->dst = asym_op->rsa.sign.data;
 		req->dst_bytes = asym_op->rsa.sign.length;
 		req->op_type = WD_RSA_SIGN;
 		break;
-	case RTE_CRYPTO_ASYM_OP_ENCRYPT:
 	case RTE_CRYPTO_ASYM_OP_DECRYPT:
+		req->dst = asym_op->rsa.message.data;
+		req->dst_bytes = asym_op->rsa.message.length;
+		req->op_type = WD_RSA_VERIFY;
+		break;
 	case RTE_CRYPTO_ASYM_OP_VERIFY:
-		req->src = asym_op->rsa.sign.data;
-		req->src_bytes = asym_op->rsa.sign.length;
-		req->dst = asym_op->rsa.sign.data;
-		req->dst_bytes = asym_op->rsa.sign.length;
+		req->dst = asym_op->rsa.message.data;
+		req->dst_bytes = asym_op->rsa.message.length;
 		req->op_type = WD_RSA_VERIFY;
 		break;
 	default:
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
 		return;
 	}
-
 	req->cb = uadk_rsa_async_cb;
 	req->cb_param = op;
 
 	do {
-		if (async)
-			ret = wd_do_rsa_async(sess->handle_rsa, req);
-		else
-			ret = wd_do_rsa_sync(sess->handle_rsa, req);
+		// if (async)
+		// 	ret = wd_do_rsa_async(sess->handle_rsa, req);
+		// else
+		// 	ret = wd_do_rsa_sync(sess->handle_rsa, req);
+		ret = wd_do_rsa_sync(sess->handle_rsa, req);
 	} while (ret == -WD_EBUSY);
-
+	OPENSSL_free(req->src);
 	op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
 	if (ret)
 		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
@@ -1475,7 +1485,7 @@ static int uadk_crypto_asym_op_dequeue(struct uadk_qp *qp,
 {
 	int ret = 0;
 	struct uadk_crypto_session *sess = NULL;
-	sess = CRYPTODEV_GET_ASYM_SESS_PRIV(op->sym->session);
+	sess = CRYPTODEV_GET_ASYM_SESS_PRIV(op->asym->session);
 
 	if (!sess) {
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
@@ -1577,7 +1587,8 @@ uadk_cryptodev_probe(struct rte_vdev_device *vdev)
 	dev->dequeue_burst = uadk_crypto_dequeue_burst;
 	dev->enqueue_burst = uadk_crypto_enqueue_burst;
 	dev->feature_flags = RTE_CRYPTODEV_FF_HW_ACCELERATED |
-			     RTE_CRYPTODEV_FF_SYMMETRIC_CRYPTO;
+			     RTE_CRYPTODEV_FF_SYMMETRIC_CRYPTO
+				 | RTE_CRYPTODEV_FF_ASYMMETRIC_CRYPTO;
 	priv = dev->data->dev_private;
 	priv->version = version;
 	priv->max_nb_qpairs = init_params.max_nb_queue_pairs;
