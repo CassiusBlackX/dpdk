@@ -40,7 +40,6 @@ int main(int argc, char **argv)
     struct rte_mempool *mbuf_pool = NULL;
     uint16_t dev_id = CRYPTODEV_ID;
     uint16_t qp_id = QP_ID;
-
     /* 1) Init EAL */
     ret = rte_eal_init(argc, argv);
     if (ret < 0) {
@@ -99,7 +98,7 @@ int main(int argc, char **argv)
     /* 8) Create crypto op pool (for allocating crypto ops) */
     struct rte_mempool *crypto_mp = rte_crypto_op_pool_create("CRYPTO_OP_POOL",
                                                               RTE_CRYPTO_OP_TYPE_SYMMETRIC,
-                                                              2048, 0, 0,
+                                                              2048, 0, 4,
                                                               rte_socket_id());
     if (!crypto_mp) {
         fprintf(stderr, "Failed to create crypto op pool\n");
@@ -199,8 +198,17 @@ int main(int argc, char **argv)
     }
 
     time_t time1 = time(NULL);
-    for (int i = 0; i < 1000000; i++) {
-      // fprintf(stderr, "%ld\n", 111);
+    for (int i = 0; i < 2; i++) {
+      fprintf(stderr, "%s %d %p\n", __FUNCTION__, __LINE__, op[0]->mempool);
+
+    int* tmp = __rte_crypto_op_get_priv_data(op[0], 4);
+      fprintf(stderr, "%s %d %p\n", __FUNCTION__, __LINE__, op[0]->mempool);
+    if (tmp == NULL) {
+      fprintf(stderr, "tmp is null\n");
+    }
+      fprintf(stderr, "%p\n", tmp);
+    
+    *tmp = i % 4;
     uint16_t enq = rte_cryptodev_enqueue_burst(dev_id, qp_id, op, 1);
 
     struct rte_crypto_op *dequeued[1];

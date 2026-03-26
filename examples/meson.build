@@ -13,6 +13,7 @@ all_examples = [
         'cmdline',
         'compress',
         'crypto',
+        'cryptoasym',
         'distributor',
         'dma',
         'ethtool',

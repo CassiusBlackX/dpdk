@@ -655,9 +655,9 @@ error_exit:
 static __rte_always_inline uint8_t
 vhost_comp_check_stateless_request(struct virtio_comp_stateless_data_req *req)
 {
-	if (likely((req->para.src_data_len <= RTE_MBUF_DEFAULT_BUF_SIZE) &&
+	if (likely((req->para.src_data_len <= 32768) &&
 		(req->para.dst_data_len >= req->para.src_data_len) &&
-		(req->para.dst_data_len <= RTE_MBUF_DEFAULT_BUF_SIZE)))
+		(req->para.dst_data_len <= 32768)))
 		return VIRTIO_COMP_OK;
 	return VIRTIO_COMP_BADMSG;
 }
