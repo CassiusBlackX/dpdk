@@ -178,22 +178,18 @@ static int setup_cryptodev() {
     .nb_queue_pairs = 1,
     .socket_id = SOCKET_ID_ANY,
   };
-  printf("%s %d", __FUNCTION__, __LINE__);
   if (rte_cryptodev_configure(cdev_id, &config) < 0) {
     fprintf(stderr, "failed to configure crypto dev: %u\n", cdev_id);
     return -1;
   }
-  printf("%s %d", __FUNCTION__, __LINE__);
 
   struct rte_cryptodev_qp_conf qp_conf = {
     .nb_descriptors = 256,
   };
-  printf("%s %d", __FUNCTION__, __LINE__);
   if (rte_cryptodev_queue_pair_setup(cdev_id, 0, &qp_conf, rte_socket_id()) < 0) {
     fprintf(stderr, "failed to setup queue pair 0 on crypto dev: %u\n", cdev_id);
     return -1;
   }
-  printf("%s %d", __FUNCTION__, __LINE__);
 
   if (rte_cryptodev_start(cdev_id) < 0) {
     fprintf(stderr, "failed to start crypto dev: %u\n", cdev_id);
@@ -229,7 +225,6 @@ static bool do_asym_op(uint8_t cdev_id, struct rte_crypto_op *op) {
   unsigned int retires = 0;
 
 
-  fprintf(stderr, "%s %d %u\n", __FUNCTION__, __LINE__, op->asym->rsa.message.length);
   // 1. enqueue
   enqueued = rte_cryptodev_enqueue_burst(cdev_id, 0, ops_enq, 1);
   if (enqueued != 1) {
@@ -269,8 +264,8 @@ static struct rte_cryptodev_asym_session *create_asym_session(uint8_t cdev_id, c
     .qt.dP = {.data = (uint8_t *)key_data->dmp1, .length = RSA_KEY_SIZE_BYTES / 2},
     .qt.dQ = {.data = (uint8_t *)key_data->dmq1, .length = RSA_KEY_SIZE_BYTES / 2},
     .qt.qInv = {.data = (uint8_t *)key_data->iqmp, .length = RSA_KEY_SIZE_BYTES / 2},
-    // .padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5,
-    .padding.type = RTE_CRYPTO_RSA_PADDING_NONE,
+    .padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5,
+    // .padding.type = RTE_CRYPTO_RSA_PADDING_NONE,
   };
   struct rte_crypto_asym_xform asym_xform = {
     .next = NULL,

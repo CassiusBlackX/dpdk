@@ -1282,7 +1282,6 @@ static void uadk_process_rsa_op(struct rte_crypto_op *op,
 		return;
 	}
 
-	UADK_LOG(ERR, "%d", op->asym->rsa.op_type);
 	switch (op->asym->rsa.op_type) {
 	//TODO: WD_RSA_GENKEY
 	case RTE_CRYPTO_ASYM_OP_SIGN:
@@ -1322,6 +1321,7 @@ static void uadk_process_rsa_op(struct rte_crypto_op *op,
 			ret = wd_do_rsa_sync(sess->handle_rsa, req);
 	} while (ret == -WD_EBUSY);
 
+	op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
 	if (ret)
 		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
 }
@@ -1388,7 +1388,7 @@ static void uadk_crypto_asym_op_enqueue(struct rte_crypto_op *op)
 		return;
 	}
 
-	uadk_process_rsa_op(op, sess, true);
+	uadk_process_rsa_op(op, sess, false);
 }
 
 static uint16_t
@@ -1482,9 +1482,10 @@ static int uadk_crypto_asym_op_dequeue(struct uadk_qp *qp,
 		return;
 	}
 
-	do {
-		ret = wd_rsa_poll(1, recv);
-	} while (ret == -WD_EAGAIN);
+	// do {
+	// 	ret = wd_rsa_poll(1, recv);
+	// } while (ret == -WD_EAGAIN);
+	*recv = 1;
 
 	if (sess->asym.u.rsa.req.op_type == WD_RSA_SIGN ||
 		sess->asym.u.rsa.req.op_type == WD_RSA_VERIFY ) {
