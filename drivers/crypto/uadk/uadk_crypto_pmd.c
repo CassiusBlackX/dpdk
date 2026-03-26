@@ -587,13 +587,15 @@ qp_setup_cleanup:
 static unsigned int
 uadk_crypto_sym_session_get_size(struct rte_cryptodev *dev __rte_unused)
 {
-	return sizeof(struct uadk_crypto_session);
+	// return sizeof(struct uadk_crypto_session);
+	return sizeof(struct uadk_crypto_session_multi);
 }
 
 static unsigned int
 uadk_crypto_asym_session_get_size(struct rte_cryptodev *dev __rte_unused)
 {
-	return sizeof(struct uadk_crypto_session);
+	// return sizeof(struct uadk_crypto_session);
+	return sizeof(struct uadk_crypto_session_multi);
 }
 
 static enum uadk_chain_order
@@ -623,7 +625,7 @@ uadk_get_chain_order(const struct rte_crypto_sym_xform *xform)
 
 static int
 uadk_set_session_cipher_parameters(struct rte_cryptodev *dev,
-				   struct uadk_crypto_session *sess,
+				   struct uadk_crypto_session_multi *sess,
 				   struct rte_crypto_sym_xform *xform)
 {
 	struct uadk_crypto_priv *priv = dev->data->dev_private;
@@ -635,44 +637,46 @@ uadk_set_session_cipher_parameters(struct rte_cryptodev *dev,
 	char alg_name[MAX_ALG_NAME];
 	int ret;
 
-	sess->cipher.direction = cipher->op;
-	sess->iv.offset = cipher->iv.offset;
-	sess->iv.length = cipher->iv.length;
+	for (int i = 0; i < 4; i++) {
+		sess->session[i].cipher.direction = cipher->op;
+		sess->session[i].iv.offset = cipher->iv.offset;
+		sess->session[i].iv.length = cipher->iv.length;
 
-	switch (cipher->algo) {
-	/* Cover supported cipher algorithms */
-	case RTE_CRYPTO_CIPHER_AES_CTR:
-		setup.alg = WD_CIPHER_AES;
-		setup.mode = WD_CIPHER_CTR;
-		sess->cipher.req.out_bytes = 64;
-		rte_strscpy(alg_name, "ctr(aes)", sizeof(alg_name));
-		break;
-	case RTE_CRYPTO_CIPHER_AES_ECB:
-		setup.alg = WD_CIPHER_AES;
-		setup.mode = WD_CIPHER_ECB;
-		sess->cipher.req.out_bytes = 16;
-		rte_strscpy(alg_name, "ecb(aes)", sizeof(alg_name));
-		break;
-	case RTE_CRYPTO_CIPHER_AES_CBC:
-		setup.alg = WD_CIPHER_AES;
-		setup.mode = WD_CIPHER_CBC;
-		rte_strscpy(alg_name, "cbc(aes)", sizeof(alg_name));
-		if (cipher->key.length == 16)
-			sess->cipher.req.out_bytes = 16;
-		else
-			sess->cipher.req.out_bytes = 64;
-		break;
-	case RTE_CRYPTO_CIPHER_AES_XTS:
-		setup.alg = WD_CIPHER_AES;
-		setup.mode = WD_CIPHER_XTS;
-		rte_strscpy(alg_name, "xts(aes)", sizeof(alg_name));
-		if (cipher->key.length == 16)
-			sess->cipher.req.out_bytes = 32;
-		else
-			sess->cipher.req.out_bytes = 512;
-		break;
-	default:
-		return -ENOTSUP;
+		switch (cipher->algo) {
+		/* Cover supported cipher algorithms */
+		case RTE_CRYPTO_CIPHER_AES_CTR:
+			setup.alg = WD_CIPHER_AES;
+			setup.mode = WD_CIPHER_CTR;
+			sess->session[i].cipher.req.out_bytes = 64;
+			rte_strscpy(alg_name, "ctr(aes)", sizeof(alg_name));
+			break;
+		case RTE_CRYPTO_CIPHER_AES_ECB:
+			setup.alg = WD_CIPHER_AES;
+			setup.mode = WD_CIPHER_ECB;
+			sess->session[i].cipher.req.out_bytes = 16;
+			rte_strscpy(alg_name, "ecb(aes)", sizeof(alg_name));
+			break;
+		case RTE_CRYPTO_CIPHER_AES_CBC:
+			setup.alg = WD_CIPHER_AES;
+			setup.mode = WD_CIPHER_CBC;
+			rte_strscpy(alg_name, "cbc(aes)", sizeof(alg_name));
+			if (cipher->key.length == 16)
+				sess->session[i].cipher.req.out_bytes = 16;
+			else
+				sess->session[i].cipher.req.out_bytes = 64;
+			break;
+		case RTE_CRYPTO_CIPHER_AES_XTS:
+			setup.alg = WD_CIPHER_AES;
+			setup.mode = WD_CIPHER_XTS;
+			rte_strscpy(alg_name, "xts(aes)", sizeof(alg_name));
+			if (cipher->key.length == 16)
+				sess->session[i].cipher.req.out_bytes = 32;
+			else
+				sess->session[i].cipher.req.out_bytes = 512;
+			break;
+		default:
+			return -ENOTSUP;
+		}
 	}
 
 	if (!priv->cipher_init) {
@@ -684,6 +688,13 @@ uadk_set_session_cipher_parameters(struct rte_cryptodev *dev,
 
 		cparams.op_type_num = 1;
 		cparams.ctx_set_num = ctx_set_num;
+		// enable devices on all numa node
+		cparams.bmp = numa_allocate_nodemask();
+		if (!cparams.bmp) {
+			UADK_LOG(ERR, "failed to allocate nodemask");
+			return -WD_ENOMEM;
+		}
+		numa_bitmask_setall(cparams.bmp);
 		ctx_set_num->sync_ctx_num = priv->nb_qpairs;
 		ctx_set_num->async_ctx_num = priv->nb_qpairs;
 
@@ -697,21 +708,23 @@ uadk_set_session_cipher_parameters(struct rte_cryptodev *dev,
 		priv->cipher_init = true;
 	}
 
-	params.numa_id = -1;	/* choose nearby numa node */
-	setup.sched_param = &params;
-	sess->handle_cipher = wd_cipher_alloc_sess(&setup);
-	if (!sess->handle_cipher) {
-		UADK_LOG(ERR, "uadk failed to alloc session!");
-		ret = -EINVAL;
-		goto uninit;
-	}
+	for (int i = 0; i < 4; i++) {
+		params.numa_id = i;
+		setup.sched_param = &params;
+		sess->session[i].handle_cipher = wd_cipher_alloc_sess(&setup);
+		if (!sess->session[i].handle_cipher) {
+			UADK_LOG(ERR, "uadk failed to alloc session!");
+			ret = -EINVAL;
+			goto uninit;
+		}
 
-	ret = wd_cipher_set_key(sess->handle_cipher, cipher->key.data, cipher->key.length);
-	if (ret) {
-		wd_cipher_free_sess(sess->handle_cipher);
-		UADK_LOG(ERR, "uadk failed to set key!");
-		ret = -EINVAL;
-		goto uninit;
+		ret = wd_cipher_set_key(sess->session[i].handle_cipher, cipher->key.data, cipher->key.length);
+		if (ret) {
+			wd_cipher_free_sess(sess->session[i].handle_cipher);
+			UADK_LOG(ERR, "uadk failed to set key!");
+			ret = -EINVAL;
+			goto uninit;
+		}
 	}
 
 	return 0;
@@ -1163,9 +1176,11 @@ uadk_process_cipher_op(struct rte_crypto_op *op,
 		       struct rte_mbuf *msrc, struct rte_mbuf *mdst,
 		       bool async)
 {
+	UADK_LOG(ERR, "%s %d", __FUNCTION__, __LINE__);
 	uint32_t off = op->sym->cipher.data.offset;
 	struct wd_cipher_req *req = &sess->cipher.req;
 	int ret;
+	UADK_LOG(ERR, "%s %d", __FUNCTION__, __LINE__);
 
 	req->src = rte_pktmbuf_mtod_offset(msrc, uint8_t *, off);
 	req->in_bytes = op->sym->cipher.data.length;
@@ -1180,6 +1195,7 @@ uadk_process_cipher_op(struct rte_crypto_op *op,
 		req->op_type = WD_CIPHER_ENCRYPTION;
 	else
 		req->op_type = WD_CIPHER_DECRYPTION;
+	UADK_LOG(ERR, "%s %d %p %p", __FUNCTION__, __LINE__, sess, sess->handle_cipher);
 
 	do {
 		if (async)
@@ -1187,6 +1203,7 @@ uadk_process_cipher_op(struct rte_crypto_op *op,
 		else
 			ret = wd_do_cipher_sync(sess->handle_cipher, req);
 	} while (ret == -WD_EBUSY);
+	UADK_LOG(ERR, "%s %d %p %p", __FUNCTION__, __LINE__, sess, sess->handle_cipher);
 
 	if (ret)
 		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
@@ -1329,8 +1346,11 @@ static void uadk_process_rsa_op(struct rte_crypto_op *op,
 static void uadk_crypto_sym_op_enqueue(struct uadk_qp *qp, 
 	struct rte_crypto_op *op, int idx)
 {
+	struct uadk_crypto_session_multi *sessions = NULL;
 	struct uadk_crypto_session *sess = NULL;
 	struct rte_mbuf *msrc, *mdst;
+	int index;
+	UADK_LOG(ERR, "%s %d", __FUNCTION__, __LINE__);
 
 	op->status = RTE_CRYPTO_OP_STATUS_NOT_PROCESSED;
 	msrc = op->sym->m_src;
@@ -1338,14 +1358,21 @@ static void uadk_crypto_sym_op_enqueue(struct uadk_qp *qp,
 
 	if (op->sess_type == RTE_CRYPTO_OP_WITH_SESSION) {
 		if (likely(op->sym->session != NULL))
-			sess = CRYPTODEV_GET_SYM_SESS_PRIV(
+			sessions = CRYPTODEV_GET_SYM_SESS_PRIV(
 				op->sym->session);
 	}
+	UADK_LOG(ERR, "%s %d", __FUNCTION__, __LINE__);
 
-	if (!sess) {
+	if (!sessions) {
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
 		return;
 	}
+	UADK_LOG(ERR, "%s %d", __FUNCTION__, __LINE__);
+
+	index = *(int*)__rte_crypto_op_get_priv_data(op, 4);
+	UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, index);
+	sess = &sessions->session[index];
+	UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, sess->chain_order);
 
 	switch (sess->chain_order) {
 	case UADK_CHAIN_ONLY_CIPHER:
@@ -1435,13 +1462,23 @@ static int uadk_crypto_sym_op_dequeue(struct uadk_qp *qp,
 	struct rte_crypto_op *op, int i, unsigned int *recv)
 {
 	int ret = 0;
+	struct uadk_crypto_session_multi *sessions = NULL;
 	struct uadk_crypto_session *sess = NULL;
-	sess = CRYPTODEV_GET_SYM_SESS_PRIV(op->sym->session);
+	int index = 0;
+	sessions = CRYPTODEV_GET_SYM_SESS_PRIV(op->sym->session);
+	UADK_LOG(ERR, "%s %d %p", __FUNCTION__, __LINE__, op->mempool);
 
-	if (!sess) {
+	if (!sessions) {
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
 		return;
 	}
+	UADK_LOG(ERR, "%s %d %p", __FUNCTION__, __LINE__, op->mempool);
+
+	index = *(int*)__rte_crypto_op_get_priv_data(op, 4);
+	UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, index);
+	sess = &sessions->session[index];
+	UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, sess->chain_order);
+	UADK_LOG(ERR, "%s %d %p", __FUNCTION__, __LINE__, op->mempool);
 
 	switch (sess->chain_order) {
 	case UADK_CHAIN_ONLY_CIPHER:
@@ -1460,6 +1497,8 @@ static int uadk_crypto_sym_op_dequeue(struct uadk_qp *qp,
 		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
 		break;
 	}
+	UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, sess->chain_order);
+	UADK_LOG(ERR, "%s %d %p", __FUNCTION__, __LINE__, op->mempool);
 
 	if (sess->auth.operation == RTE_CRYPTO_AUTH_OP_VERIFY) {
 		uint8_t *dst = qp->temp_digest[i % BURST_MAX];
@@ -1548,7 +1587,6 @@ uadk_cryptodev_probe(struct rte_vdev_device *vdev)
 	struct uacce_dev *udev;
 	const char *input_args;
 	const char *name;
-
 	udev = wd_get_accel_dev("cipher");
 	if (!udev)
 		return -ENODEV;

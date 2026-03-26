@@ -71,6 +71,10 @@ struct __rte_cache_aligned uadk_crypto_session {
 	} asym;
 };
 
+struct __rte_cache_aligned uadk_crypto_session_multi {
+	struct uadk_crypto_session session[4];
+};
+
 enum uadk_crypto_version {
 	UADK_CRYPTO_V2,
 	UADK_CRYPTO_V3,
