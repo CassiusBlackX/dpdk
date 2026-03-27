@@ -312,11 +312,16 @@ static bool perform_rsa_sign_verify_test(uint8_t cdev_id, const RsaKeyData *key_
   // 4. fill in op for sign
   rte_crypto_op_attach_asym_session(op, sess);
   op->status = RTE_CRYPTO_OP_STATUS_NOT_PROCESSED;
-  op->asym->rsa.op_type = RTE_CRYPTO_ASYM_OP_SIGN;
+  op->asym->rsa.op_type = RTE_CRYPTO_ASYM_OP_ENCRYPT;
   op->asym->rsa.message.data = plain_buf;
   op->asym->rsa.message.length = RSA_KEY_SIZE_BYTES;
-  op->asym->rsa.sign.data = sign_buf;
-  op->asym->rsa.sign.length = RSA_KEY_SIZE_BYTES;
+  op->asym->rsa.cipher.data = sign_buf;
+  op->asym->rsa.cipher.length = RSA_KEY_SIZE_BYTES;
+  // op->asym->rsa.op_type = RTE_CRYPTO_ASYM_OP_SIGN;
+  // op->asym->rsa.message.data = plain_buf;
+  // op->asym->rsa.message.length = RSA_KEY_SIZE_BYTES;
+  // op->asym->rsa.sign.data = sign_buf;
+  // op->asym->rsa.sign.length = RSA_KEY_SIZE_BYTES;
 
   // 5. sign
   if (!do_asym_op(cdev_id, op)) {
@@ -327,11 +332,16 @@ static bool perform_rsa_sign_verify_test(uint8_t cdev_id, const RsaKeyData *key_
 
   // 6. fill in op for verify
   op->status = RTE_CRYPTO_OP_STATUS_NOT_PROCESSED;
-  op->asym->rsa.op_type = RTE_CRYPTO_ASYM_OP_VERIFY;
-  op->asym->rsa.sign.data = sign_buf;
-  op->asym->rsa.sign.length = RSA_KEY_SIZE_BYTES;
+  op->asym->rsa.op_type = RTE_CRYPTO_ASYM_OP_DECRYPT;
+  op->asym->rsa.cipher.data = sign_buf;
+  op->asym->rsa.cipher.length = RSA_KEY_SIZE_BYTES;
   op->asym->rsa.message.data = plain_buf;
   op->asym->rsa.message.length = RSA_KEY_SIZE_BYTES;
+  // op->asym->rsa.op_type = RTE_CRYPTO_ASYM_OP_VERIFY;
+  // op->asym->rsa.sign.data = sign_buf;
+  // op->asym->rsa.sign.length = RSA_KEY_SIZE_BYTES;
+  // op->asym->rsa.message.data = plain_buf;
+  // op->asym->rsa.message.length = RSA_KEY_SIZE_BYTES;
 
   // 7. verify
   if (!do_asym_op(cdev_id, op)) {

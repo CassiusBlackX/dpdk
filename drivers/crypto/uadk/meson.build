@@ -28,3 +28,11 @@ if not dep.found()
 else
     ext_deps += dep
 endif
+
+dep = dependency('libcrypto', required: false, method: 'pkg-config')
+if not dep.found()
+    build = false
+    reason = 'missing dependency, "libcrypto"'
+else
+    ext_deps += dep
+endif
