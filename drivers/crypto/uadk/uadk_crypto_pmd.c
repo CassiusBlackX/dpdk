@@ -1299,7 +1299,7 @@ static void uadk_process_rsa_op(struct rte_crypto_op *op,
 	case RTE_CRYPTO_ASYM_OP_ENCRYPT:
 		req->dst = asym_op->rsa.cipher.data;
 		req->dst_bytes = asym_op->rsa.cipher.length;
-		req->op_type = WD_RSA_SIGN;
+		req->op_type = WD_RSA_VERIFY;
 		break;
 	case RTE_CRYPTO_ASYM_OP_SIGN:
 		req->dst = asym_op->rsa.sign.data;
@@ -1314,7 +1314,7 @@ static void uadk_process_rsa_op(struct rte_crypto_op *op,
 	case RTE_CRYPTO_ASYM_OP_VERIFY:
 		req->dst = asym_op->rsa.message.data;
 		req->dst_bytes = asym_op->rsa.message.length;
-		req->op_type = WD_RSA_VERIFY;
+		req->op_type = WD_RSA_SIGN;
 		break;
 	default:
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
