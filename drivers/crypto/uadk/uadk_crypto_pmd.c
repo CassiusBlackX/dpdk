@@ -868,12 +868,30 @@ static void transfer_to_wd_dtb(
 	dst->bsize = src->length;
 }
 
+static bool
+rsa_has_qt_prikey(const struct rte_crypto_rsa_xform *rsa_xform)
+{
+	return rsa_xform->qt.p.data && rsa_xform->qt.p.length &&
+		rsa_xform->qt.q.data && rsa_xform->qt.q.length &&
+		rsa_xform->qt.dP.data && rsa_xform->qt.dP.length &&
+		rsa_xform->qt.dQ.data && rsa_xform->qt.dQ.length &&
+		rsa_xform->qt.qInv.data && rsa_xform->qt.qInv.length;
+}
+
+static bool
+rsa_has_exp_prikey(const struct rte_crypto_rsa_xform *rsa_xform)
+{
+	return rsa_xform->d.data && rsa_xform->d.length;
+}
+
 static int uadk_rsa_set_key(struct uadk_crypto_session *sess,
 		      struct rte_crypto_rsa_xform *rsa_xform)
 {
 	int ret = 0;
+	bool has_qt = rsa_has_qt_prikey(rsa_xform);
+	bool has_exp = rsa_has_exp_prikey(rsa_xform);
 
-	if (rsa_xform->key_type == RTE_RSA_KEY_TYPE_QT) {
+	if (rsa_xform->key_type == RTE_RSA_KEY_TYPE_QT && has_qt) {
 		struct wd_dtb dQ;
 		transfer_to_wd_dtb(&dQ, &rsa_xform->qt.dQ);
 		struct wd_dtb dP;
@@ -886,15 +904,14 @@ static int uadk_rsa_set_key(struct uadk_crypto_session *sess,
 		transfer_to_wd_dtb(&p, &rsa_xform->qt.p);
 		ret = wd_rsa_set_crt_prikey_params(sess->handle_rsa,
 						&dQ, &dP, &qInv, &q, &p);
-	} 
-	// else {
-	// 	rte_crypto_uint d;
-	// 	transfer_to_wd_dtb(&d, &rsa_xform->d);
-	// 	rte_crypto_uint n;
-	// 	transfer_to_wd_dtb(&n, &rsa_xform->n);
-	// 	ret = wd_rsa_set_prikey_params(sess->handle_rsa,
-	// 				&d, &n);
-	// }
+	} else if (has_exp) {
+		struct wd_dtb d;
+		transfer_to_wd_dtb(&d, &rsa_xform->d);
+		struct wd_dtb n_pri;
+		transfer_to_wd_dtb(&n_pri, &rsa_xform->n);
+		ret = wd_rsa_set_prikey_params(sess->handle_rsa,
+						&d, &n_pri);
+	}
 	if (ret) {
 		UADK_LOG(ERR, "Failed to set RSA private key");
 		return -EINVAL;
@@ -928,7 +945,8 @@ uadk_rsa_session_init(struct rte_cryptodev *dev,
 	memset(&setup, 0, sizeof(setup));
 	
 	setup.key_bits = get_rsa_key_bits(rsa_xform);
-	setup.is_crt = (rsa_xform->key_type == RTE_RSA_KEY_TYPE_QT) ? 1 : 0;
+	setup.is_crt = (rsa_xform->key_type == RTE_RSA_KEY_TYPE_QT &&
+		rsa_has_qt_prikey(rsa_xform)) ? 1 : 0;
 	setup.sched_param = NULL;
 	
 	if (!priv->rsa_init) {
@@ -944,6 +962,7 @@ uadk_rsa_session_init(struct rte_cryptodev *dev,
 		ctx_set_num->async_ctx_num = priv->nb_qpairs;
 
 		ret = wd_rsa_init2_("rsa", SCHED_POLICY_RR, TASK_HW, &cparams);
+		free(ctx_set_num);
 
 		if (ret) {
 			UADK_LOG(ERR, "failed to do rsa init2!");
@@ -1247,39 +1266,11 @@ static void uadk_rsa_async_cb(void *cb_param)
 	struct rte_crypto_op *op = req->cb_param;
 
 	if (op->status == RTE_CRYPTO_OP_STATUS_NOT_PROCESSED) {
+		// FIXME: did not check the result of RSA operation, just set success if no error returned from WD.
 		op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
-
-		// check verify result
-		if (op->asym->rsa.op_type == RTE_CRYPTO_ASYM_OP_VERIFY) {
-			if (strncmp(op->asym->rsa.message.data, op->asym->rsa.sign.data, op->asym->rsa.message.length)) {
-				op->status = RTE_CRYPTO_OP_STATUS_ERROR;
-			}
-		}
 	}
 
 	return;
-}
-
-static void padding_add_PKCS1_type_1(struct rte_crypto_op *op,
-				struct uadk_crypto_session *sess, struct wd_rsa_req *req) {
-	unsigned int key_bytes = sess->asym.u.rsa.xform.n.length;
-	req->src = OPENSSL_malloc(key_bytes);
-	req->src_bytes = key_bytes;
-	switch (op->asym->rsa.op_type) {
-	case RTE_CRYPTO_ASYM_OP_ENCRYPT:
-	case RTE_CRYPTO_ASYM_OP_SIGN:
-		RSA_padding_add_PKCS1_type_1(req->src, key_bytes, op->asym->rsa.message.data, op->asym->rsa.message.length);
-		break;
-	case RTE_CRYPTO_ASYM_OP_DECRYPT:
-		RSA_padding_add_PKCS1_type_1(req->src, key_bytes, op->asym->rsa.cipher.data, op->asym->rsa.cipher.length);
-		break;
-	case RTE_CRYPTO_ASYM_OP_VERIFY:
-		RSA_padding_add_PKCS1_type_1(req->src, key_bytes, op->asym->rsa.sign.data, op->asym->rsa.sign.length);
-		break;
-	default:
-		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
-		return;
-	}
 }
 
 static void uadk_process_rsa_op(struct rte_crypto_op *op,
@@ -1287,34 +1278,108 @@ static void uadk_process_rsa_op(struct rte_crypto_op *op,
 {
 	struct rte_crypto_asym_op *asym_op = op->asym;
 	struct wd_rsa_req *req = &sess->asym.u.rsa.req;
+	uint8_t *src_pad = NULL;
+	uint8_t *dst_tmp = NULL;
+	uint8_t *verify_buf = NULL;
+	unsigned int key_bytes = sess->asym.u.rsa.xform.n.length;
+	int out_len;
 	int ret;
 
 	memset(req, 0, sizeof(*req));
-
-	// TODO:PADDING_TYPE
-	padding_add_PKCS1_type_1(op, sess, req);
+	req->src_bytes = key_bytes;
 
 	switch (op->asym->rsa.op_type) {
-	//TODO: WD_RSA_GENKEY
 	case RTE_CRYPTO_ASYM_OP_ENCRYPT:
-		req->dst = asym_op->rsa.cipher.data;
-		req->dst_bytes = asym_op->rsa.cipher.length;
 		req->op_type = WD_RSA_VERIFY;
+		if (asym_op->rsa.cipher.length < key_bytes) {
+			op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+			return;
+		}
+		req->dst = asym_op->rsa.cipher.data;
+		req->dst_bytes = key_bytes;
+		if (sess->asym.u.rsa.xform.padding.type ==
+			RTE_CRYPTO_RSA_PADDING_PKCS1_5) {
+			src_pad = OPENSSL_malloc(key_bytes);
+			if (!src_pad) {
+				op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+				return;
+			}
+			if (RSA_padding_add_PKCS1_type_2(src_pad, key_bytes,
+				asym_op->rsa.message.data,
+				asym_op->rsa.message.length) != 1) {
+				op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+				goto free_tmp;
+			}
+			req->src = src_pad;
+		} else if (sess->asym.u.rsa.xform.padding.type ==
+			RTE_CRYPTO_RSA_PADDING_NONE) {
+			if (asym_op->rsa.message.length != key_bytes) {
+				op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+				goto free_tmp;
+			}
+			req->src = asym_op->rsa.message.data;
+		} else {
+			op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+			goto free_tmp;
+		}
 		break;
 	case RTE_CRYPTO_ASYM_OP_SIGN:
-		req->dst = asym_op->rsa.sign.data;
-		req->dst_bytes = asym_op->rsa.sign.length;
 		req->op_type = WD_RSA_SIGN;
+		if (asym_op->rsa.sign.length < key_bytes) {
+			op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+			return;
+		}
+		req->dst = asym_op->rsa.sign.data;
+		req->dst_bytes = key_bytes;
+		if (sess->asym.u.rsa.xform.padding.type ==
+			RTE_CRYPTO_RSA_PADDING_PKCS1_5) {
+			src_pad = OPENSSL_malloc(key_bytes);
+			if (!src_pad) {
+				op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+				return;
+			}
+			if (RSA_padding_add_PKCS1_type_1(src_pad, key_bytes,
+				asym_op->rsa.message.data,
+				asym_op->rsa.message.length) != 1) {
+				op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+				goto free_tmp;
+			}
+			req->src = src_pad;
+		} else if (sess->asym.u.rsa.xform.padding.type ==
+			RTE_CRYPTO_RSA_PADDING_NONE) {
+			if (asym_op->rsa.message.length != key_bytes) {
+				op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+				goto free_tmp;
+			}
+			req->src = asym_op->rsa.message.data;
+		} else {
+			op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+			goto free_tmp;
+		}
 		break;
 	case RTE_CRYPTO_ASYM_OP_DECRYPT:
-		req->dst = asym_op->rsa.message.data;
-		req->dst_bytes = asym_op->rsa.message.length;
-		req->op_type = WD_RSA_VERIFY;
+		req->op_type = WD_RSA_SIGN;
+		req->src = asym_op->rsa.cipher.data;
+		req->src_bytes = asym_op->rsa.cipher.length;
+		dst_tmp = OPENSSL_malloc(key_bytes);
+		if (!dst_tmp) {
+			op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+			return;
+		}
+		req->dst = dst_tmp;
+		req->dst_bytes = key_bytes;
 		break;
 	case RTE_CRYPTO_ASYM_OP_VERIFY:
-		req->dst = asym_op->rsa.message.data;
-		req->dst_bytes = asym_op->rsa.message.length;
-		req->op_type = WD_RSA_SIGN;
+		req->op_type = WD_RSA_VERIFY;
+		req->src = asym_op->rsa.sign.data;
+		req->src_bytes = asym_op->rsa.sign.length;
+		dst_tmp = OPENSSL_malloc(key_bytes);
+		if (!dst_tmp) {
+			op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+			return;
+		}
+		req->dst = dst_tmp;
+		req->dst_bytes = key_bytes;
 		break;
 	default:
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
@@ -1324,16 +1389,99 @@ static void uadk_process_rsa_op(struct rte_crypto_op *op,
 	req->cb_param = op;
 
 	do {
-		// if (async)
-		// 	ret = wd_do_rsa_async(sess->handle_rsa, req);
-		// else
-		// 	ret = wd_do_rsa_sync(sess->handle_rsa, req);
-		ret = wd_do_rsa_sync(sess->handle_rsa, req);
+		if (async)
+			ret = wd_do_rsa_async(sess->handle_rsa, req);
+		else
+			ret = wd_do_rsa_sync(sess->handle_rsa, req);
 	} while (ret == -WD_EBUSY);
-	OPENSSL_free(req->src);
-	op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
-	if (ret)
+
+	if (ret || req->status) {
 		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+		goto free_tmp;
+	}
+
+	switch (op->asym->rsa.op_type) {
+	case RTE_CRYPTO_ASYM_OP_ENCRYPT:
+		asym_op->rsa.cipher.length = req->dst_bytes;
+		op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
+		break;
+	case RTE_CRYPTO_ASYM_OP_SIGN:
+		asym_op->rsa.sign.length = req->dst_bytes;
+		op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
+		break;
+	case RTE_CRYPTO_ASYM_OP_DECRYPT:
+		if (sess->asym.u.rsa.xform.padding.type ==
+			RTE_CRYPTO_RSA_PADDING_PKCS1_5) {
+			out_len = RSA_padding_check_PKCS1_type_2(
+				asym_op->rsa.message.data,
+				asym_op->rsa.message.length,
+				req->dst,
+				req->dst_bytes,
+				key_bytes);
+			if (out_len <= 0) {
+				op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+				break;
+			}
+			asym_op->rsa.message.length = out_len;
+			op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
+		} else if (sess->asym.u.rsa.xform.padding.type ==
+			RTE_CRYPTO_RSA_PADDING_NONE) {
+			if (asym_op->rsa.message.length < req->dst_bytes) {
+				op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+				break;
+			}
+			rte_memcpy(asym_op->rsa.message.data, req->dst, req->dst_bytes);
+			asym_op->rsa.message.length = req->dst_bytes;
+			op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
+		} else {
+			op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+		}
+		break;
+	case RTE_CRYPTO_ASYM_OP_VERIFY:
+		if (sess->asym.u.rsa.xform.padding.type ==
+			RTE_CRYPTO_RSA_PADDING_PKCS1_5) {
+			verify_buf = OPENSSL_malloc(key_bytes);
+			if (!verify_buf) {
+				op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+				break;
+			}
+			out_len = RSA_padding_check_PKCS1_type_1(
+				verify_buf,
+				key_bytes,
+				req->dst,
+				req->dst_bytes,
+				key_bytes);
+			if (out_len <= 0 ||
+				(size_t)out_len != asym_op->rsa.message.length ||
+				memcmp(verify_buf, asym_op->rsa.message.data,
+					asym_op->rsa.message.length) != 0)
+				op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+			else
+				op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
+		} else if (sess->asym.u.rsa.xform.padding.type ==
+			RTE_CRYPTO_RSA_PADDING_NONE) {
+			if (asym_op->rsa.message.length != req->dst_bytes ||
+				memcmp(req->dst, asym_op->rsa.message.data,
+					req->dst_bytes) != 0)
+				op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+			else
+				op->status = RTE_CRYPTO_OP_STATUS_SUCCESS;
+		} else {
+			op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
+		}
+		break;
+	default:
+		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
+		break;
+	}
+
+free_tmp:
+	if (src_pad)
+		OPENSSL_free(src_pad);
+	if (dst_tmp)
+		OPENSSL_free(dst_tmp);
+	if (verify_buf)
+		OPENSSL_free(verify_buf);
 }
 
 static void uadk_crypto_sym_op_enqueue(struct uadk_qp *qp, 
@@ -1450,7 +1598,7 @@ static int uadk_crypto_sym_op_dequeue(struct uadk_qp *qp,
 
 	if (!sess) {
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
-		return;
+		return -EINVAL;
 	}
 
 	switch (sess->chain_order) {
@@ -1478,18 +1626,21 @@ static int uadk_crypto_sym_op_dequeue(struct uadk_qp *qp,
 					sess->auth.digest_length) != 0)
 			op->status = RTE_CRYPTO_OP_STATUS_AUTH_FAILED;
 	}
+
+	return 0;
 }
 
 static int uadk_crypto_asym_op_dequeue(struct uadk_qp *qp, 
 	struct rte_crypto_op *op, int i, unsigned int *recv)
 {
-	int ret = 0;
+	RTE_SET_USED(qp);
+	RTE_SET_USED(i);
 	struct uadk_crypto_session *sess = NULL;
 	sess = CRYPTODEV_GET_ASYM_SESS_PRIV(op->asym->session);
 
 	if (!sess) {
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
-		return;
+		return -EINVAL;
 	}
 
 	// do {
@@ -1497,13 +1648,7 @@ static int uadk_crypto_asym_op_dequeue(struct uadk_qp *qp,
 	// } while (ret == -WD_EAGAIN);
 	*recv = 1;
 
-	if (sess->asym.u.rsa.req.op_type == WD_RSA_SIGN ||
-		sess->asym.u.rsa.req.op_type == WD_RSA_VERIFY ) {
-		uint8_t *dst = qp->temp_digest[i % BURST_MAX];
-		if (memcmp(dst, op->asym->rsa.sign.data,
-					sess->auth.digest_length) != 0)
-			op->status = RTE_CRYPTO_OP_STATUS_ERROR;
-	}
+	return 0;
 }
 
 static uint16_t
@@ -1511,11 +1656,9 @@ uadk_crypto_dequeue_burst(void *queue_pair, struct rte_crypto_op **ops,
 			  uint16_t nb_ops)
 {
 	struct uadk_qp *qp = queue_pair;
-	struct uadk_crypto_session *sess = NULL;
 	struct rte_crypto_op *op;
 	unsigned int nb_dequeued;
 	unsigned int recv = 0, count = 0, i;
-	int ret;
 	nb_dequeued = rte_ring_dequeue_burst(qp->processed_pkts,
 			(void **)ops, nb_ops, NULL);
 
@@ -1525,11 +1668,12 @@ uadk_crypto_dequeue_burst(void *queue_pair, struct rte_crypto_op **ops,
 			continue;
 		switch (op->type)
 		{
+			// FIXME: did not check the result of dequeue
 		case RTE_CRYPTO_OP_TYPE_SYMMETRIC:
-			ret = uadk_crypto_sym_op_dequeue(qp, op, i, &recv);
+			uadk_crypto_sym_op_dequeue(qp, op, i, &recv);
 		break;
 		case RTE_CRYPTO_OP_TYPE_ASYMMETRIC:
-			ret = uadk_crypto_asym_op_dequeue(qp, op, i, &recv);
+			uadk_crypto_asym_op_dequeue(qp, op, i, &recv);
 		
 		default:
 			break;
