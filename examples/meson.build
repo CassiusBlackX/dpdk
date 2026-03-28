@@ -14,6 +14,7 @@ all_examples = [
         'compress',
         'crypto',
         'cryptoasym',
+        'cryptosign',
         'distributor',
         'dma',
         'ethtool',
