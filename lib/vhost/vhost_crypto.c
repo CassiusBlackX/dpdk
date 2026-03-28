@@ -1564,7 +1564,7 @@ static __rte_always_inline int
 vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 		struct vhost_virtqueue *vq, struct rte_crypto_op *op,
 		struct vring_desc *head, struct vhost_crypto_desc *descs,
-		uint16_t desc_idx)
+		uint16_t desc_idx, struct rte_mbuf *mbuf)
 	__rte_requires_shared_capability(&vq->iotlb_lock)
 {
 	struct vhost_crypto_data_req *vc_req, *vc_req_out;
@@ -1736,6 +1736,9 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 
 		asym_session = vcrypto->cache_asym_session;
 		op->type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
+		// fixme
+		if (mbuf != NULL)
+			rte_mempool_put(mbuf->pool, (void *)mbuf);
 
 		err = rte_crypto_op_attach_asym_session(op, asym_session);
 		if (unlikely(err < 0)) {
@@ -2115,6 +2118,8 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 	 */
 	switch (vcrypto->option) {
 	case RTE_VHOST_CRYPTO_ZERO_COPY_ENABLE:
+			VC_LOG_ERR("%d", count);
+
 		if (unlikely(rte_mempool_get_bulk(vcrypto->mbuf_pool,
 				(void **)mbufs, count * 2) < 0)) {
 			VC_LOG_ERR("Insufficient memory");
@@ -2133,7 +2138,7 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 			op->sym->m_dst->data_off = 0;
 
 			if (unlikely(vhost_crypto_process_one_req(vcrypto, vq,
-					op, head, descs, used_idx) < 0))
+					op, head, descs, used_idx, NULL) < 0))
 				break;
 		}
 
@@ -2148,6 +2153,7 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 		if (unlikely(rte_mempool_get_bulk(vcrypto->mbuf_pool,
 				(void **)mbufs, count) < 0)) {
 			VC_LOG_ERR("Insufficient memory");
+			exit(0);
 			goto out_unlock;
 		}
 
@@ -2157,12 +2163,14 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 			struct vring_desc *head = &vq->desc[desc_idx];
 			struct rte_crypto_op *op = ops[i];
 
-			op->sym->m_src = mbufs[i];
-			op->sym->m_dst = NULL;
-			op->sym->m_src->data_off = 0;
+			if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+				op->sym->m_src = mbufs[i];
+				op->sym->m_dst = NULL;
+				op->sym->m_src->data_off = 0;
+			}
 
 			if (unlikely(vhost_crypto_process_one_req(vcrypto, vq,
-					op, head, descs, desc_idx) < 0))
+					op, head, descs, desc_idx, mbufs[i]) < 0))
 				break;
 		}
 
