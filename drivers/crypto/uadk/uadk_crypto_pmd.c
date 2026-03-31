@@ -1194,11 +1194,9 @@ uadk_process_cipher_op(struct rte_crypto_op *op,
 		       struct rte_mbuf *msrc, struct rte_mbuf *mdst,
 		       bool async)
 {
-	UADK_LOG(ERR, "%s %d", __FUNCTION__, __LINE__);
 	uint32_t off = op->sym->cipher.data.offset;
 	struct wd_cipher_req *req = &sess->cipher.req;
 	int ret;
-	UADK_LOG(ERR, "%s %d", __FUNCTION__, __LINE__);
 
 	req->src = rte_pktmbuf_mtod_offset(msrc, uint8_t *, off);
 	req->in_bytes = op->sym->cipher.data.length;
@@ -1213,7 +1211,6 @@ uadk_process_cipher_op(struct rte_crypto_op *op,
 		req->op_type = WD_CIPHER_ENCRYPTION;
 	else
 		req->op_type = WD_CIPHER_DECRYPTION;
-	UADK_LOG(ERR, "%s %d %p %p", __FUNCTION__, __LINE__, sess, sess->handle_cipher);
 
 	do {
 		if (async)
@@ -1221,7 +1218,6 @@ uadk_process_cipher_op(struct rte_crypto_op *op,
 		else
 			ret = wd_do_cipher_sync(sess->handle_cipher, req);
 	} while (ret == -WD_EBUSY);
-	UADK_LOG(ERR, "%s %d %p %p", __FUNCTION__, __LINE__, sess, sess->handle_cipher);
 
 	if (ret)
 		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
@@ -1502,13 +1498,11 @@ free_tmp:
 }
 
 static void uadk_crypto_sym_op_enqueue(struct uadk_qp *qp, 
-	struct rte_crypto_op *op, int idx)
+	struct rte_crypto_op *op, int idx, int numa_node_id)
 {
 	struct uadk_crypto_session_multi *sessions = NULL;
 	struct uadk_crypto_session *sess = NULL;
 	struct rte_mbuf *msrc, *mdst;
-	int index;
-	UADK_LOG(ERR, "%s %d", __FUNCTION__, __LINE__);
 
 	op->status = RTE_CRYPTO_OP_STATUS_NOT_PROCESSED;
 	msrc = op->sym->m_src;
@@ -1519,18 +1513,13 @@ static void uadk_crypto_sym_op_enqueue(struct uadk_qp *qp,
 			sessions = CRYPTODEV_GET_SYM_SESS_PRIV(
 				op->sym->session);
 	}
-	UADK_LOG(ERR, "%s %d", __FUNCTION__, __LINE__);
 
 	if (!sessions) {
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
 		return;
 	}
-	UADK_LOG(ERR, "%s %d", __FUNCTION__, __LINE__);
 
-	index = *(int*)__rte_crypto_op_get_priv_data(op, 4);
-	UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, index);
-	sess = &sessions->session[index];
-	UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, sess->chain_order);
+	sess = &sessions->session[numa_node_id];
 
 	switch (sess->chain_order) {
 	case UADK_CHAIN_ONLY_CIPHER:
@@ -1553,7 +1542,7 @@ static void uadk_crypto_sym_op_enqueue(struct uadk_qp *qp,
 	}
 }
 
-static void uadk_crypto_asym_op_enqueue(struct rte_crypto_op *op)
+static void uadk_crypto_asym_op_enqueue(struct rte_crypto_op *op, int numa_node_id)
 {
 	struct uadk_crypto_session *sess = NULL;
 	op->status = RTE_CRYPTO_OP_STATUS_NOT_PROCESSED;
@@ -1584,21 +1573,26 @@ uadk_crypto_enqueue_burst(void *queue_pair, struct rte_crypto_op **ops,
 	struct rte_crypto_op *op;
 	uint16_t enqd = 0;
 	int i, ret;
+	static int count = 0;
 	for (i = 0; i < nb_ops; i++) {
 		op = ops[i];
+		struct uadk_processed_pkt pkt;
+		pkt.op = op;
+		pkt.numa_node_id = (count / 1) % 4;
+		count++;
 		switch (op->type)
 		{
 		case RTE_CRYPTO_OP_TYPE_SYMMETRIC:
-			uadk_crypto_sym_op_enqueue(qp, op, i);
+			uadk_crypto_sym_op_enqueue(qp, op, i, pkt.numa_node_id);
 			break;
 		case RTE_CRYPTO_OP_TYPE_ASYMMETRIC:
-			uadk_crypto_asym_op_enqueue(op);
+			uadk_crypto_asym_op_enqueue(op, pkt.numa_node_id);
 			break;
 		default:
 			break;
 		}
 		if (op->status != RTE_CRYPTO_OP_STATUS_ERROR) {
-			ret = rte_ring_enqueue(qp->processed_pkts, (void *)op);
+			ret = rte_ring_enqueue_elem(qp->processed_pkts, (void *)&pkt, sizeof(struct uadk_processed_pkt));
 			if (ret < 0)
 				goto enqueue_err;
 			qp->qp_stats.enqueued_count++;
@@ -1617,26 +1611,17 @@ enqueue_err:
 }
 
 static int uadk_crypto_sym_op_dequeue(struct uadk_qp *qp, 
-	struct rte_crypto_op *op, int i, unsigned int *recv)
+	struct rte_crypto_op *op, int numa_node_id, int i, unsigned int *recv)
 {
 	int ret = 0;
 	struct uadk_crypto_session_multi *sessions = NULL;
 	struct uadk_crypto_session *sess = NULL;
-	int index = 0;
 	sessions = CRYPTODEV_GET_SYM_SESS_PRIV(op->sym->session);
-	UADK_LOG(ERR, "%s %d %p", __FUNCTION__, __LINE__, op->mempool);
-
 	if (!sessions) {
 		op->status = RTE_CRYPTO_OP_STATUS_INVALID_ARGS;
 		return -EINVAL;
 	}
-	UADK_LOG(ERR, "%s %d %p", __FUNCTION__, __LINE__, op->mempool);
-
-	index = *(int*)__rte_crypto_op_get_priv_data(op, 4);
-	UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, index);
-	sess = &sessions->session[index];
-	UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, sess->chain_order);
-	UADK_LOG(ERR, "%s %d %p", __FUNCTION__, __LINE__, op->mempool);
+	sess = &sessions->session[0];
 
 	switch (sess->chain_order) {
 	case UADK_CHAIN_ONLY_CIPHER:
@@ -1655,8 +1640,6 @@ static int uadk_crypto_sym_op_dequeue(struct uadk_qp *qp,
 		op->status = RTE_CRYPTO_OP_STATUS_ERROR;
 		break;
 	}
-	UADK_LOG(ERR, "%s %d %d", __FUNCTION__, __LINE__, sess->chain_order);
-	UADK_LOG(ERR, "%s %d %p", __FUNCTION__, __LINE__, op->mempool);
 
 	if (sess->auth.operation == RTE_CRYPTO_AUTH_OP_VERIFY) {
 		uint8_t *dst = qp->temp_digest[i % BURST_MAX];
@@ -1670,7 +1653,7 @@ static int uadk_crypto_sym_op_dequeue(struct uadk_qp *qp,
 }
 
 static int uadk_crypto_asym_op_dequeue(struct uadk_qp *qp, 
-	struct rte_crypto_op *op, int i, unsigned int *recv)
+	struct rte_crypto_op *op, int numa_node_id, int i, unsigned int *recv)
 {
 	RTE_SET_USED(qp);
 	RTE_SET_USED(i);
@@ -1698,31 +1681,48 @@ uadk_crypto_dequeue_burst(void *queue_pair, struct rte_crypto_op **ops,
 	struct rte_crypto_op *op;
 	unsigned int nb_dequeued;
 	unsigned int recv = 0, count = 0, i;
-	nb_dequeued = rte_ring_dequeue_burst(qp->processed_pkts,
-			(void **)ops, nb_ops, NULL);
 
-	for (i = 0; i < nb_dequeued; i++) {
-		op = ops[i];
-		if (op->sess_type != RTE_CRYPTO_OP_WITH_SESSION)
-			continue;
-		switch (op->type)
-		{
-			// FIXME: did not check the result of dequeue
-		case RTE_CRYPTO_OP_TYPE_SYMMETRIC:
-			uadk_crypto_sym_op_dequeue(qp, op, i, &recv);
-		break;
-		case RTE_CRYPTO_OP_TYPE_ASYMMETRIC:
-			uadk_crypto_asym_op_dequeue(qp, op, i, &recv);
-		
-		default:
-			break;
+	// store dequeued pkts in ring_buffer before they are ready
+	static struct uadk_processed_pkt pkts[2048];
+
+	unsigned int j = 0;
+
+	while (nb_ops) {
+		uint16_t to_dequeue = 128;
+		if (nb_ops < to_dequeue) {
+			to_dequeue = nb_ops;
+		}
+		nb_dequeued = rte_ring_dequeue_burst_elem(qp->processed_pkts,
+				(void **)&pkts, sizeof(struct uadk_processed_pkt), to_dequeue, NULL);
+
+		for (i = 0; i < nb_dequeued; i++) {
+			op = pkts[i].op;
+			ops[j] = op;
+			j++;
+			if (op->sess_type != RTE_CRYPTO_OP_WITH_SESSION)
+				continue;
+			while(op->status == RTE_CRYPTO_OP_STATUS_NOT_PROCESSED) {
+				switch (op->type)
+				{
+					// FIXME: did not check the result of dequeue
+				case RTE_CRYPTO_OP_TYPE_SYMMETRIC:
+					uadk_crypto_sym_op_dequeue(qp, op, pkts[i].numa_node_id, i, &recv);
+				break;
+				case RTE_CRYPTO_OP_TYPE_ASYMMETRIC:
+					uadk_crypto_asym_op_dequeue(qp, op, pkts[i].numa_node_id, i, &recv);
+				
+				default:
+					break;
+				}
+			}
+
+			count += recv;
+			recv = 0;
 		}
 
-		count += recv;
-		recv = 0;
+		qp->qp_stats.dequeued_count += nb_dequeued;
+		nb_ops -= nb_dequeued;
 	}
-
-	qp->qp_stats.dequeued_count += nb_dequeued;
 
 	return count;
 }

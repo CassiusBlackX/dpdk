@@ -7,8 +7,15 @@
 #define _UADK_CRYPTO_PMD_PRIVATE_H_
 
 /* Maximum length for digest (SHA-512 needs 64 bytes) */
+#include "rte_common.h"
 #define DIGEST_LENGTH_MAX 64
 #define BURST_MAX 64
+
+struct uadk_processed_pkt {
+	struct rte_crypto_op *op;
+	long int numa_node_id;
+};
+
 
 struct __rte_cache_aligned uadk_qp {
 	/* Ring for placing process packets */
