@@ -13,13 +13,16 @@
 #include "uadk_compress_pmd_private.h"
 
 #define UADK_COMP_DEF_CTXS    2
+#define UADK_COMP_DEF_SYNC_CTXS 1
 static char alg_name[8] = "deflate";
 
 static const struct
 rte_compressdev_capabilities uadk_compress_pmd_capabilities[] = {
 	{   /* Deflate */
 		.algo = RTE_COMP_ALGO_DEFLATE,
-		.comp_feature_flags = RTE_COMP_FF_SHAREABLE_PRIV_XFORM |
+		.comp_feature_flags = RTE_COMP_FF_STATEFUL_COMPRESSION |
+				      RTE_COMP_FF_STATEFUL_DECOMPRESSION |
+				      RTE_COMP_FF_SHAREABLE_PRIV_XFORM |
 				      RTE_COMP_FF_HUFFMAN_FIXED |
 				      RTE_COMP_FF_HUFFMAN_DYNAMIC,
 	},
@@ -46,6 +49,9 @@ uadk_compress_pmd_config(struct rte_compressdev *dev,
 
 	cparams.op_type_num = WD_DIR_MAX;
 	cparams.ctx_set_num = ctx_set_num;
+
+	for (int i = 0; i < WD_DIR_MAX; i++)
+		ctx_set_num[i].sync_ctx_num = UADK_COMP_DEF_SYNC_CTXS;
 
 	for (int i = 0; i < WD_DIR_MAX; i++)
 		ctx_set_num[i].async_ctx_num = UADK_COMP_DEF_CTXS;
@@ -299,6 +305,20 @@ uadk_compress_pmd_xform_free(struct rte_compressdev *dev __rte_unused, void *xfo
 	return 0;
 }
 
+static int
+uadk_compress_pmd_stream_create(struct rte_compressdev *dev,
+				const struct rte_comp_xform *xform,
+				void **stream)
+{
+	return uadk_compress_pmd_xform_create(dev, xform, stream);
+}
+
+static int
+uadk_compress_pmd_stream_free(struct rte_compressdev *dev, void *stream)
+{
+	return uadk_compress_pmd_xform_free(dev, stream);
+}
+
 static struct rte_compressdev_ops uadk_compress_pmd_ops = {
 		.dev_configure		= uadk_compress_pmd_config,
 		.dev_start		= uadk_compress_pmd_start,
@@ -309,6 +329,8 @@ static struct rte_compressdev_ops uadk_compress_pmd_ops = {
 		.dev_infos_get		= uadk_compress_pmd_info_get,
 		.queue_pair_setup	= uadk_compress_pmd_qp_setup,
 		.queue_pair_release	= uadk_compress_pmd_qp_release,
+		.stream_create		= uadk_compress_pmd_stream_create,
+		.stream_free		= uadk_compress_pmd_stream_free,
 		.private_xform_create	= uadk_compress_pmd_xform_create,
 		.private_xform_free	= uadk_compress_pmd_xform_free,
 };
@@ -317,7 +339,7 @@ static void *uadk_compress_pmd_async_cb(struct wd_comp_req *req,
 					void *data __rte_unused)
 {
 	struct rte_comp_op *op = req->cb_param;
-	uint16_t dst_len = rte_pktmbuf_data_len(op->m_dst);
+	uint16_t dst_len = rte_pktmbuf_data_len(op->m_dst) - op->dst.offset;
 
 	if (req->dst_len <= dst_len) {
 		op->produced += req->dst_len;
@@ -329,6 +351,42 @@ static void *uadk_compress_pmd_async_cb(struct wd_comp_req *req,
 	return NULL;
 }
 
+static int
+uadk_compress_pmd_set_stateful_last(const struct rte_comp_op *op,
+					   struct wd_comp_req *req)
+{
+	switch (op->flush_flag) {
+	case RTE_COMP_FLUSH_NONE:
+	case RTE_COMP_FLUSH_SYNC:
+	case RTE_COMP_FLUSH_FULL:
+		req->last = 0;
+		break;
+	case RTE_COMP_FLUSH_FINAL:
+		req->last = 1;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static enum rte_comp_op_status
+uadk_compress_pmd_status_from_req(const struct wd_comp_req *req, int ret)
+{
+	if (ret)
+		return ret == -WD_EINVAL ?
+			RTE_COMP_OP_STATUS_INVALID_ARGS : RTE_COMP_OP_STATUS_ERROR;
+
+	if (req->status == WD_IN_EPARA)
+		return RTE_COMP_OP_STATUS_INVALID_ARGS;
+
+	if (req->status == WD_SUCCESS || req->status == WD_STREAM_END)
+		return RTE_COMP_OP_STATUS_SUCCESS;
+
+	return RTE_COMP_OP_STATUS_ERROR;
+}
+
 static uint16_t
 uadk_compress_pmd_enqueue_burst_async(void *queue_pair,
 				      struct rte_comp_op **ops, uint16_t nb_ops)
@@ -337,50 +395,76 @@ uadk_compress_pmd_enqueue_burst_async(void *queue_pair,
 	struct uadk_compress_xform *xform;
 	struct rte_comp_op *op;
 	uint16_t enqd = 0;
-	int i, ret = 0;
+	int i;
 
 	for (i = 0; i < nb_ops; i++) {
+		int ret = 0;
+		int enq_ret;
+		uint16_t src_len;
+		uint16_t dst_len;
+		struct wd_comp_req req = {0};
+
 		op = ops[i];
+		xform = op->op_type == RTE_COMP_OP_STATEFUL ?
+			(struct uadk_compress_xform *)op->stream :
+			(struct uadk_compress_xform *)op->private_xform;
 
-		if (op->op_type == RTE_COMP_OP_STATEFUL) {
+		if (!xform) {
 			op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
-		} else {
-			/* process stateless ops */
-			xform = op->private_xform;
-			if (xform) {
-				struct wd_comp_req req = {0};
-				uint16_t dst_len = rte_pktmbuf_data_len(op->m_dst);
-
-				req.src = rte_pktmbuf_mtod(op->m_src, uint8_t *);
-				req.src_len = op->src.length;
-				req.dst = rte_pktmbuf_mtod(op->m_dst, uint8_t *);
-				req.dst_len = dst_len;
-				req.op_type = (enum wd_comp_op_type)xform->type;
-				req.cb = uadk_compress_pmd_async_cb;
-				req.cb_param = op;
-				req.data_fmt = WD_FLAT_BUF;
-				do {
-					ret = wd_do_comp_async(xform->handle, &req);
-				} while (ret == -WD_EBUSY);
-
-				op->consumed += req.src_len;
-
-				if (ret) {
-					op->status = RTE_COMP_OP_STATUS_ERROR;
-					break;
-				}
-			} else {
-				op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
-			}
+			goto enqueue_done;
 		}
 
+		src_len = rte_pktmbuf_data_len(op->m_src);
+		dst_len = rte_pktmbuf_data_len(op->m_dst);
+
+		if (op->src.offset > src_len || op->dst.offset > dst_len ||
+		    op->src.length > src_len - op->src.offset) {
+			op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+			goto enqueue_done;
+		}
+
+		req.src = rte_pktmbuf_mtod_offset(op->m_src, uint8_t *,
+				op->src.offset);
+		req.src_len = op->src.length;
+		req.dst = rte_pktmbuf_mtod_offset(op->m_dst, uint8_t *,
+				op->dst.offset);
+		req.dst_len = dst_len - op->dst.offset;
+		req.op_type = (enum wd_comp_op_type)xform->type;
+		req.data_fmt = WD_FLAT_BUF;
+
+		if (op->op_type == RTE_COMP_OP_STATEFUL) {
+			ret = uadk_compress_pmd_set_stateful_last(op, &req);
+			if (ret) {
+				op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+				goto enqueue_done;
+			}
+
+			ret = wd_do_comp_strm(xform->handle, &req);
+			op->status = uadk_compress_pmd_status_from_req(&req, ret);
+			op->consumed += req.src_len;
+			op->produced += req.dst_len;
+		} else {
+			req.cb = uadk_compress_pmd_async_cb;
+			req.cb_param = op;
+			do {
+				ret = wd_do_comp_async(xform->handle, &req);
+			} while (ret == -WD_EBUSY);
+
+			op->consumed += req.src_len;
+
+			if (ret)
+				op->status = uadk_compress_pmd_status_from_req(&req, ret);
+			else
+				op->status = RTE_COMP_OP_STATUS_NOT_PROCESSED;
+		}
+
+enqueue_done:
 		/* Whatever is out of op, put it into completion queue with
 		 * its status
 		 */
-		if (!ret)
-			ret = rte_ring_enqueue(qp->processed_pkts, (void *)op);
+		enq_ret = rte_ring_enqueue(qp->processed_pkts, (void *)op);
 
-		if (unlikely(ret)) {
+		if (unlikely(enq_ret)) {
 			/* increment count if failed to enqueue op */
 			qp->qp_stats.enqueue_err_count++;
 		} else {
@@ -399,7 +483,9 @@ uadk_compress_pmd_dequeue_burst_async(void *queue_pair,
 {
 	struct uadk_compress_qp *qp = queue_pair;
 	unsigned int nb_dequeued = 0;
+	unsigned int completed = 0;
 	unsigned int recv = 0;
+	uint16_t i;
 	int ret;
 
 	nb_dequeued = rte_ring_dequeue_burst(qp->processed_pkts,
@@ -407,13 +493,34 @@ uadk_compress_pmd_dequeue_burst_async(void *queue_pair,
 	if (nb_dequeued == 0)
 		return 0;
 
-	do {
-		ret = wd_comp_poll(nb_dequeued, &recv);
-	} while (ret == -WD_EAGAIN);
+	for (i = 0; i < nb_dequeued; i++) {
+		if (ops[i]->status == RTE_COMP_OP_STATUS_NOT_PROCESSED)
+			completed++;
+	}
+
+	while (completed) {
+		recv = 0;
+		do {
+			ret = wd_comp_poll(completed, &recv);
+		} while (ret == -WD_EAGAIN);
+
+		if (ret)
+			break;
+
+		if (recv == 0)
+			break;
+
+		completed -= recv;
+	}
+
+	for (i = 0; i < nb_dequeued; i++) {
+		if (ops[i]->status == RTE_COMP_OP_STATUS_NOT_PROCESSED)
+			ops[i]->status = RTE_COMP_OP_STATUS_ERROR;
+	}
 
 	qp->qp_stats.dequeued_count += nb_dequeued;
 
-	return recv;
+	return nb_dequeued;
 }
 
 static int
