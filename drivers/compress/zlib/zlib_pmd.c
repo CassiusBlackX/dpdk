@@ -19,18 +19,41 @@ static void
 process_zlib_deflate(struct rte_comp_op *op, z_stream *strm)
 {
 	int ret, flush, fin_flush;
+	uint32_t remaining_in;
+	uLong pre_total_in, pre_total_out;
 	struct rte_mbuf *mbuf_src = op->m_src;
 	struct rte_mbuf *mbuf_dst = op->m_dst;
 
-	switch (op->flush_flag) {
-	case RTE_COMP_FLUSH_FULL:
-	case RTE_COMP_FLUSH_FINAL:
-		fin_flush = Z_FINISH;
-		break;
-	default:
-		op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
-		ZLIB_PMD_ERR("Invalid flush value");
-		return;
+	if (op->op_type == RTE_COMP_OP_STATEFUL) {
+		switch (op->flush_flag) {
+		case RTE_COMP_FLUSH_NONE:
+			fin_flush = Z_NO_FLUSH;
+			break;
+		case RTE_COMP_FLUSH_SYNC:
+			fin_flush = Z_SYNC_FLUSH;
+			break;
+		case RTE_COMP_FLUSH_FULL:
+			fin_flush = Z_FULL_FLUSH;
+			break;
+		case RTE_COMP_FLUSH_FINAL:
+			fin_flush = Z_FINISH;
+			break;
+		default:
+			op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+			ZLIB_PMD_ERR("Invalid stateful flush value");
+			return;
+		}
+	} else {
+		switch (op->flush_flag) {
+		case RTE_COMP_FLUSH_FULL:
+		case RTE_COMP_FLUSH_FINAL:
+			fin_flush = Z_FINISH;
+			break;
+		default:
+			op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+			ZLIB_PMD_ERR("Invalid stateless flush value");
+			return;
+		}
 	}
 
 	if (unlikely(!strm)) {
@@ -53,15 +76,23 @@ process_zlib_deflate(struct rte_comp_op *op, z_stream *strm)
 	flush = Z_NO_FLUSH;
 	/* Initialize status to SUCCESS */
 	op->status = RTE_COMP_OP_STATUS_SUCCESS;
+	remaining_in = op->src.length;
+	pre_total_in = strm->total_in;
+	pre_total_out = strm->total_out;
 
 	do {
+		uInt prev_avail_in;
+
 		/* Set flush value to Z_FINISH for last block */
-		if ((op->src.length - strm->total_in) <= strm->avail_in) {
-			strm->avail_in = (op->src.length - strm->total_in);
+		if (remaining_in <= strm->avail_in) {
+			strm->avail_in = remaining_in;
 			flush = fin_flush;
 		}
 		do {
+			prev_avail_in = strm->avail_in;
 			ret = deflate(strm, flush);
+			if (prev_avail_in >= strm->avail_in)
+				remaining_in -= (prev_avail_in - strm->avail_in);
 			if (unlikely(ret == Z_STREAM_ERROR)) {
 				/* error return, do not process further */
 				op->status =  RTE_COMP_OP_STATUS_ERROR;
@@ -86,29 +117,37 @@ process_zlib_deflate(struct rte_comp_op *op, z_stream *strm)
 	/* Update source buffer to next mbuf
 	 * Exit if input buffers are fully consumed
 	 */
-	} while (COMPUTE_BUF(mbuf_src, strm->next_in, strm->avail_in));
+	} while ((remaining_in > 0) &&
+		COMPUTE_BUF(mbuf_src, strm->next_in, strm->avail_in));
+
+	if (remaining_in > 0 && op->status == RTE_COMP_OP_STATUS_SUCCESS)
+		op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
 
 def_end:
 	/* Update op stats */
 	switch (op->status) {
 	case RTE_COMP_OP_STATUS_SUCCESS:
-		op->consumed += strm->total_in;
+		op->consumed += (uint32_t)(strm->total_in - pre_total_in);
 	/* Fall-through */
 	case RTE_COMP_OP_STATUS_OUT_OF_SPACE_TERMINATED:
-		op->produced += strm->total_out;
+		op->produced += (uint32_t)(strm->total_out - pre_total_out);
 		break;
 	default:
 		ZLIB_PMD_ERR("stats not updated for status:%d",
 				op->status);
 	}
 
-	deflateReset(strm);
+	if (op->op_type == RTE_COMP_OP_STATELESS ||
+			(op->op_type == RTE_COMP_OP_STATEFUL &&
+			op->flush_flag == RTE_COMP_FLUSH_FINAL))
+		deflateReset(strm);
 }
 
 static void
 process_zlib_inflate(struct rte_comp_op *op, z_stream *strm)
 {
 	int ret, flush;
+	uLong pre_total_in, pre_total_out;
 	struct rte_mbuf *mbuf_src = op->m_src;
 	struct rte_mbuf *mbuf_dst = op->m_dst;
 
@@ -131,6 +170,8 @@ process_zlib_inflate(struct rte_comp_op *op, z_stream *strm)
 	flush = Z_NO_FLUSH;
 	/* initialize status to SUCCESS */
 	op->status = RTE_COMP_OP_STATUS_SUCCESS;
+	pre_total_in = strm->total_in;
+	pre_total_out = strm->total_out;
 
 	do {
 		do {
@@ -178,17 +219,18 @@ inf_end:
 	/* Update op stats */
 	switch (op->status) {
 	case RTE_COMP_OP_STATUS_SUCCESS:
-		op->consumed += strm->total_in;
+		op->consumed += (uint32_t)(strm->total_in - pre_total_in);
 	/* Fall-through */
 	case RTE_COMP_OP_STATUS_OUT_OF_SPACE_TERMINATED:
-		op->produced += strm->total_out;
+		op->produced += (uint32_t)(strm->total_out - pre_total_out);
 		break;
 	default:
 		ZLIB_PMD_ERR("stats not produced for status:%d",
 				op->status);
 	}
 
-	inflateReset(strm);
+	if (op->op_type == RTE_COMP_OP_STATELESS || ret == Z_STREAM_END)
+		inflateReset(strm);
 }
 
 /** Process comp operation for mbuf */
@@ -198,15 +240,26 @@ process_zlib_op(struct zlib_qp *qp, struct rte_comp_op *op)
 	struct zlib_stream *stream;
 	struct zlib_priv_xform *private_xform;
 
-	if ((op->op_type == RTE_COMP_OP_STATEFUL) ||
-			(op->src.offset > rte_pktmbuf_data_len(op->m_src)) ||
+	if ((op->src.offset > rte_pktmbuf_data_len(op->m_src)) ||
 			(op->dst.offset > rte_pktmbuf_data_len(op->m_dst))) {
 		op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
 		ZLIB_PMD_ERR("Invalid source or destination buffers or "
 			     "invalid Operation requested");
 	} else {
-		private_xform = (struct zlib_priv_xform *)op->private_xform;
-		stream = &private_xform->stream;
+		if (op->op_type == RTE_COMP_OP_STATEFUL) {
+			stream = (struct zlib_stream *)op->stream;
+			if (unlikely(stream == NULL)) {
+				op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+				return rte_ring_enqueue(qp->processed_pkts, (void *)op);
+			}
+		} else {
+			private_xform = (struct zlib_priv_xform *)op->private_xform;
+			if (unlikely(private_xform == NULL)) {
+				op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+				return rte_ring_enqueue(qp->processed_pkts, (void *)op);
+			}
+			stream = &private_xform->stream;
+		}
 		stream->comp(op, &stream->strm);
 	}
 	/* whatever is out of op, put it into completion queue with

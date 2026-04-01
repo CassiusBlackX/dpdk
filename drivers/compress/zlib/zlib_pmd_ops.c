@@ -13,7 +13,9 @@
 static const struct rte_compressdev_capabilities zlib_pmd_capabilities[] = {
 	{   /* Deflate */
 		.algo = RTE_COMP_ALGO_DEFLATE,
-		.comp_feature_flags = (RTE_COMP_FF_NONCOMPRESSED_BLOCKS |
+		.comp_feature_flags = (RTE_COMP_FF_STATEFUL_COMPRESSION |
+					RTE_COMP_FF_STATEFUL_DECOMPRESSION |
+					RTE_COMP_FF_NONCOMPRESSED_BLOCKS |
 					RTE_COMP_FF_HUFFMAN_FIXED |
 					RTE_COMP_FF_HUFFMAN_DYNAMIC),
 		.window_size = {
@@ -301,8 +303,8 @@ struct rte_compressdev_ops zlib_pmd_ops = {
 		.private_xform_create	= zlib_pmd_private_xform_create,
 		.private_xform_free	= zlib_pmd_private_xform_free,
 
-		.stream_create	= NULL,
-		.stream_free	= NULL
+		.stream_create	= zlib_pmd_stream_create,
+		.stream_free	= zlib_pmd_stream_free
 };
 
 struct rte_compressdev_ops *rte_zlib_pmd_ops = &zlib_pmd_ops;
