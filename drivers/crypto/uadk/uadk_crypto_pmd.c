@@ -1278,6 +1278,7 @@ static void uadk_rsa_async_cb(void *cb_param)
 	struct uadk_crypto_session *sess = param->sess;
 	unsigned int key_bytes = sess->asym.u.rsa.xform.n.length;
 	int out_len;
+	req->dst_bytes = sess->asym.u.rsa.xform.n.length;
 	
 	if (op->status == RTE_CRYPTO_OP_STATUS_NOT_PROCESSED) {
 		// FIXME: did not check the result of RSA operation, just set success if no error returned from WD.
@@ -1795,7 +1796,7 @@ uadk_crypto_dequeue_burst(void *queue_pair, struct rte_crypto_op **ops,
 			}
 		}
 
-		count += recv;
+		count += 1;
 		recv = 0;
 	}
 
