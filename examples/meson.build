@@ -14,7 +14,6 @@ all_examples = [
         'compress',
         'bigcompress',
         'statefulcompress',
-        'zstdcompress',
         'crypto',
         'cryptoasym',
         'cryptosign',
