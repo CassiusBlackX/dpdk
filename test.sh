@@ -10,21 +10,20 @@
 
 # wait
 sudo \
-WD_RSA_CTX_NUM="sync:2@0,async:2@0" \
-./build/app/dpdk-test-crypto-perf --file-prefix=dpdk1 -l 3-4 --vdev crypto_uadk -- \
+./build/app/dpdk-test-crypto-perf --file-prefix=dpdk2 -l 3-4 --vdev crypto_uadk -- \
 --devtype crypto_uadk --ptest throughput --optype rsa --asym-op sign \
---rsa-modlen 2048 --rsa-priv-keytype qt --total-ops 1000  --burst-sz 256 &
-sudo \
-WD_RSA_CTX_NUM="sync:2@1,async:2@1" \
-./build/app/dpdk-test-crypto-perf --file-prefix=dpdk2 -l 5-6 --vdev crypto_uadk -- \
---devtype crypto_uadk --ptest throughput --optype rsa --asym-op sign \
---rsa-modlen 2048 --rsa-priv-keytype qt --total-ops 1000  --burst-sz 256 &
-sudo \
-WD_RSA_CTX_NUM="sync:2@2,async:2@2" \
-./build/app/dpdk-test-crypto-perf --file-prefix=dpdk3 -l 7-8 --vdev crypto_uadk -- \
---devtype crypto_uadk --ptest throughput --optype rsa --asym-op sign \
---rsa-modlen 2048 --rsa-priv-keytype qt --total-ops 1000  --burst-sz 256 &
-wait
+--rsa-modlen 2048 --rsa-priv-keytype qt --total-ops 2000  --burst-sz 64
+# sudo \
+# WD_RSA_CTX_NUM="sync:2@1,async:2@1" \
+# ./build/app/dpdk-test-crypto-perf --file-prefix=dpdk2 -l 5-6 --vdev crypto_uadk -- \
+# --devtype crypto_uadk --ptest throughput --optype rsa --asym-op sign \
+# --rsa-modlen 2048 --rsa-priv-keytype qt --total-ops 1000  --burst-sz 256 &
+# sudo \
+# WD_RSA_CTX_NUM="sync:2@2,async:2@2" \
+# ./build/app/dpdk-test-crypto-perf --file-prefix=dpdk3 -l 7-8 --vdev crypto_uadk -- \
+# --devtype crypto_uadk --ptest throughput --optype rsa --asym-op sign \
+# --rsa-modlen 2048 --rsa-priv-keytype qt --total-ops 1000  --burst-sz 256 &
+# wait
 
 # ./build/app/dpdk-test-crypto-perf -l 3-4 --vdev crypto_uadk -- \
 # --devtype crypto_uadk --ptest throughput --optype rsa --asym-op encrypt \
