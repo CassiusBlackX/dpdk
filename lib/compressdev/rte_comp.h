@@ -124,6 +124,10 @@ enum rte_comp_algorithm {
 	/**< LZ4 compression algorithm
 	 * https://github.com/lz4/lz4
 	 */
+	RTE_COMP_ALGO_ZSTD,
+	/**< Zstandard (ZSTD) compression algorithm
+	 * https://www.rfc-editor.org/rfc/rfc8878.html
+	 */
 };
 
 /** Compression Hash Algorithms */
@@ -282,6 +286,11 @@ struct rte_comp_lz4_params {
 	 */
 };
 
+/** Parameters specific to the Zstandard algorithm (reserved for future use) */
+struct rte_comp_zstd_params {
+	uint8_t reserved;
+};
+
 /** Setup Data for compression */
 struct rte_comp_compress_xform {
 	enum rte_comp_algorithm algo;
@@ -291,6 +300,8 @@ struct rte_comp_compress_xform {
 		/**< Parameters specific to the deflate algorithm */
 		struct rte_comp_lz4_params lz4;
 		/**< Parameters specific to the LZ4 algorithm */
+		struct rte_comp_zstd_params zstd;
+		/**< Parameters specific to the Zstandard algorithm */
 	}; /**< Algorithm specific parameters */
 	int level;
 	/**< Compression level */
@@ -323,6 +334,8 @@ struct rte_comp_decompress_xform {
 	union {
 		struct rte_comp_lz4_params lz4;
 		/**< Parameters specific to the LZ4 algorithm */
+		struct rte_comp_zstd_params zstd;
+		/**< Parameters specific to the Zstandard algorithm */
 	}; /**< Algorithm specific parameters */
 	enum rte_comp_hash_algorithm hash_algo;
 	/**< Hash algorithm to be used with decompress operation. Hash is always
