@@ -21,6 +21,10 @@
 #define MEMPOOL_CACHE_SIZE 128
 #define QP_NB_DESCRIPTORS 1024
 #define DECOMP_DST_CHAIN_BYTES (CHUNK_SIZE_BYTES * 64u)
+/* Feed compressed bytes in fixed-size slices; boundaries need not match
+ * compression ops — DEFLATE state continues across ops on the same stream.
+ */
+#define DECOMP_IN_CHUNK_BYTES (32u * 1024u)
 
 static int copy_from_mbuf_chain(const struct rte_mbuf *mbuf, uint8_t *dst,
                                 uint32_t len) {
@@ -118,16 +122,13 @@ int main(int argc, char **argv) {
   uint8_t *input = NULL;
   uint8_t *compressed = NULL;
   uint8_t *decompressed = NULL;
-  uint32_t *compressed_chunk_lens = NULL;
   size_t compressed_cap;
   size_t compressed_len = 0;
   size_t decompressed_len = 0;
   size_t input_off = 0;
   size_t compressed_off = 0;
-  uint64_t nb_input_chunks =
-      (INPUT_SIZE_BYTES + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES;
   uint64_t chunk_idx = 0;
-  uint64_t decomp_chunk_idx = 0;
+  uint64_t decomp_in_ops = 0;
 
   ret = rte_eal_init(argc, argv);
   if (ret < 0)
@@ -152,11 +153,6 @@ int main(int argc, char **argv) {
   compressed = malloc(compressed_cap);
   if (compressed == NULL)
     rte_exit(EXIT_FAILURE, "Cannot allocate compressed buffer\n");
-
-  compressed_chunk_lens =
-      calloc(nb_input_chunks, sizeof(*compressed_chunk_lens));
-  if (compressed_chunk_lens == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot allocate compressed chunk lens\n");
 
   decompressed = malloc(INPUT_SIZE_BYTES);
   if (decompressed == NULL)
@@ -269,15 +265,21 @@ int main(int argc, char **argv) {
     if (compressed_len + op->produced > compressed_cap)
       rte_exit(EXIT_FAILURE, "compressed output buffer too small\n");
 
+    if (op->consumed == 0 && op->produced == 0) {
+      rte_exit(EXIT_FAILURE,
+               "stateful compress made no progress at chunk=%" PRIu64
+               " (consumed=0, produced=0)\n",
+               chunk_idx);
+    }
+
     memcpy(compressed + compressed_len, dst_data, op->produced);
-    compressed_chunk_lens[chunk_idx] = op->produced;
     compressed_len += op->produced;
 
     rte_comp_op_free(op);
     rte_pktmbuf_free(src);
     rte_pktmbuf_free(dst);
 
-    input_off += chunk_len;
+    input_off += op->consumed;
     chunk_idx++;
   }
 
@@ -292,39 +294,38 @@ int main(int argc, char **argv) {
              "rte_compressdev_stream_create failed for decompression\n");
 
   decompressed_len = 0;
-  for (decomp_chunk_idx = 0; decomp_chunk_idx < chunk_idx; decomp_chunk_idx++) {
-    uint32_t chunk_len = compressed_chunk_lens[decomp_chunk_idx];
+  compressed_off = 0;
+  while (compressed_off < compressed_len) {
+    uint32_t in_chunk = (uint32_t)RTE_MIN((size_t)DECOMP_IN_CHUNK_BYTES,
+                                          compressed_len - compressed_off);
+    int is_last = (compressed_off + in_chunk == compressed_len);
     struct rte_mbuf *src;
     struct rte_mbuf *dst;
     struct rte_comp_op *op;
     uint8_t *src_data;
-    enum rte_comp_flush_flag flush = (decomp_chunk_idx + 1 == chunk_idx)
-                                         ? RTE_COMP_FLUSH_FINAL
-                                         : RTE_COMP_FLUSH_NONE;
-
-    if (chunk_len == 0)
-      continue;
+    enum rte_comp_flush_flag flush =
+        is_last ? RTE_COMP_FLUSH_FINAL : RTE_COMP_FLUSH_NONE;
 
     src = rte_pktmbuf_alloc(src_pool);
     dst = alloc_dst_chain(dst_pool, DECOMP_DST_CHAIN_BYTES);
     op = rte_comp_op_alloc(op_pool);
     if (!src || !dst || !op)
       rte_exit(EXIT_FAILURE,
-               "mbuf/op alloc failed at decomp chunk=%" PRIu64 "\n",
-               decomp_chunk_idx);
+               "mbuf/op alloc failed at decomp input op=%" PRIu64 "\n",
+               decomp_in_ops);
 
-    src_data = (uint8_t *)(uintptr_t)rte_pktmbuf_append(src, chunk_len);
+    src_data = (uint8_t *)(uintptr_t)rte_pktmbuf_append(src, in_chunk);
     if (!src_data)
       rte_exit(EXIT_FAILURE,
-               "rte_pktmbuf_append failed at decomp chunk=%" PRIu64 "\n",
-               decomp_chunk_idx);
+               "rte_pktmbuf_append failed at decomp input op=%" PRIu64 "\n",
+               decomp_in_ops);
 
-    memcpy(src_data, compressed + compressed_off, chunk_len);
+    memcpy(src_data, compressed + compressed_off, in_chunk);
 
     op->m_src = src;
     op->m_dst = dst;
     op->src.offset = 0;
-    op->src.length = chunk_len;
+    op->src.length = in_chunk;
     op->dst.offset = 0;
     op->flush_flag = flush;
     op->op_type = RTE_COMP_OP_STATEFUL;
@@ -339,13 +340,13 @@ int main(int argc, char **argv) {
     if (op->status != RTE_COMP_OP_STATUS_SUCCESS) {
       if (op->status == RTE_COMP_OP_STATUS_OUT_OF_SPACE_TERMINATED) {
         rte_exit(EXIT_FAILURE,
-                 "stateful decompress dst chain too small at chunk=%" PRIu64
+                 "stateful decompress dst chain too small at op=%" PRIu64
                  ", produced=%u (status=%u)\n",
-                 decomp_chunk_idx, op->produced, op->status);
+                 decomp_in_ops, op->produced, op->status);
       }
       rte_exit(EXIT_FAILURE,
-               "stateful decompress failed at chunk=%" PRIu64 ", status=%u\n",
-               decomp_chunk_idx, op->status);
+               "stateful decompress failed at op=%" PRIu64 ", status=%u\n",
+               decomp_in_ops, op->status);
     }
 
     if (decompressed_len + op->produced > INPUT_SIZE_BYTES) {
@@ -357,11 +358,18 @@ int main(int argc, char **argv) {
           (size_t)INPUT_SIZE_BYTES);
     }
 
+    if (op->consumed == 0 && op->produced == 0) {
+      rte_exit(EXIT_FAILURE,
+               "stateful decompress made no progress at op=%" PRIu64
+               " (consumed=0, produced=0)\n",
+               decomp_in_ops);
+    }
+
     if (copy_from_mbuf_chain(dst, decompressed + decompressed_len,
                              op->produced) < 0) {
       rte_exit(EXIT_FAILURE,
-               "copy_from_mbuf_chain failed at chunk=%" PRIu64 "\n",
-               decomp_chunk_idx);
+               "copy_from_mbuf_chain failed at op=%" PRIu64 "\n",
+               decomp_in_ops);
     }
     decompressed_len += op->produced;
 
@@ -369,18 +377,14 @@ int main(int argc, char **argv) {
     rte_pktmbuf_free(src);
     rte_pktmbuf_free(dst);
 
-    compressed_off += chunk_len;
+    compressed_off += op->consumed;
+    decomp_in_ops++;
   }
 
-  if (compressed_off != compressed_len)
-    rte_exit(EXIT_FAILURE,
-             "decompression consumed %zu compressed bytes, expected %zu\n",
-             compressed_off, compressed_len);
-
   printf(
-      "Stateful decompressed %zu bytes compressed data to %zu bytes (%" PRIu64
-      " chunks)\n",
-      compressed_len, decompressed_len, decomp_chunk_idx);
+      "Stateful decompressed %zu bytes compressed data to %zu bytes "
+      "(%" PRIu64 " compress ops -> %" PRIu64 " arbitrary decompress reads)\n",
+      compressed_len, decompressed_len, chunk_idx, decomp_in_ops);
 
   ret = verify_decompressed_data(decompressed, decompressed_len, input,
                                  INPUT_SIZE_BYTES);
@@ -402,7 +406,6 @@ int main(int argc, char **argv) {
   free(input);
   free(compressed);
   free(decompressed);
-  free(compressed_chunk_lens);
-
   return ret;
 }
+
