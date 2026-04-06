@@ -7,6 +7,8 @@
 # DPDK instance, use 'make'
 
 allow_experimental_apis = true
+ext_deps += dependency('libcrypto', required: true, method: 'pkg-config')
+ext_deps += dependency('libssl', required: true, method: 'pkg-config')
 deps += ['cryptodev']
 sources = files(
         'main.c',

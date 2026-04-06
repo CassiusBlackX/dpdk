@@ -12,6 +12,8 @@ drivers = [
         'octeontx',
         'uadk',
         'zlib',
+        'zstd',
+        'zstd_raw',
 ]
 
 std_deps = ['compressdev'] # compressdev pulls in all other needed deps

@@ -3,9 +3,14 @@
  * Copyright 2024-2025 Linaro ltd.
  */
 
+#include <errno.h>
+#include <string.h>
+
 #include <bus_vdev_driver.h>
 #include <rte_compressdev_pmd.h>
+#include <rte_kvargs.h>
 #include <rte_malloc.h>
+#include <rte_mbuf.h>
 
 #include <uadk/wd_comp.h>
 #include <uadk/wd_sched.h>
@@ -14,7 +19,8 @@
 
 #define UADK_COMP_DEF_CTXS    2
 #define UADK_COMP_DEF_SYNC_CTXS 1
-static char alg_name[8] = "deflate";
+
+static const char *const uadk_init_alg_kw[] = {"init_alg", NULL};
 
 static const struct
 rte_compressdev_capabilities uadk_compress_pmd_capabilities[] = {
@@ -31,9 +37,192 @@ rte_compressdev_capabilities uadk_compress_pmd_capabilities[] = {
 			.increment = 0,
 		},
 	},
+	{   /* ZSTD via UADK WD_LZ77_ZSTD (literals + sequences in dst mbuf) */
+		.algo = RTE_COMP_ALGO_ZSTD,
+		.comp_feature_flags = RTE_COMP_FF_SHAREABLE_PRIV_XFORM,
+	},
 
 	RTE_COMP_END_OF_CAPABILITIES_LIST()
 };
+
+static enum wd_comp_level
+uadk_map_comp_level(int level)
+{
+	if (level == RTE_COMP_LEVEL_PMD_DEFAULT || level < RTE_COMP_LEVEL_MIN)
+		return WD_COMP_L8;
+	if (level > (int)WD_COMP_L15)
+		return WD_COMP_L15;
+	return (enum wd_comp_level)level;
+}
+
+static enum wd_comp_winsz_type
+uadk_map_window(uint8_t wlog)
+{
+	if (wlog == 0)
+		return WD_COMP_WS_32K;
+	if (wlog <= 12)
+		return WD_COMP_WS_4K;
+	if (wlog == 13)
+		return WD_COMP_WS_8K;
+	if (wlog == 14)
+		return WD_COMP_WS_16K;
+	if (wlog == 15)
+		return WD_COMP_WS_32K;
+	/* 24K window maps between 14 and 15 */
+	if (wlog < 15)
+		return WD_COMP_WS_24K;
+	return WD_COMP_WS_32K;
+}
+
+static void
+uadk_compress_parse_init_alg(struct rte_vdev_device *vdev,
+			     struct uadk_compress_priv *priv)
+{
+	const char *args = rte_vdev_device_args(vdev);
+	struct rte_kvargs *kv;
+
+	strncpy(priv->init_alg, "deflate", sizeof(priv->init_alg) - 1);
+	priv->init_alg[sizeof(priv->init_alg) - 1] = '\0';
+
+	if (args == NULL || args[0] == '\0')
+		return;
+
+	kv = rte_kvargs_parse(args, uadk_init_alg_kw);
+	if (kv == NULL)
+		return;
+
+	if (rte_kvargs_count(kv, "init_alg") == 1) {
+		const char *v = rte_kvargs_get(kv, "init_alg");
+
+		if (v != NULL && v[0] != '\0')
+			rte_strscpy(priv->init_alg, v, sizeof(priv->init_alg));
+	}
+
+	rte_kvargs_free(kv);
+}
+
+static uint32_t
+uadk_zstd_dst_min(uint32_t in_len)
+{
+	return in_len + UADK_ZSTD_LIT_RSV + UADK_ZSTD_FREQ_SZ +
+		UADK_ZSTD_SEQ_ROOM;
+}
+
+static void
+uadk_datalist_link(struct wd_datalist *nodes, int n)
+{
+	int i;
+
+	for (i = 0; i < n - 1; i++)
+		nodes[i].next = &nodes[i + 1];
+	if (n > 0)
+		nodes[n - 1].next = NULL;
+}
+
+static int
+uadk_mbuf_read_datalist(const struct rte_mbuf *m, uint32_t pkt_off,
+			uint32_t nbytes, struct wd_datalist *nodes, int max_nodes,
+			struct wd_datalist **head_out)
+{
+	uint32_t skip = pkt_off;
+	uint32_t rem = nbytes;
+	int n = 0;
+	struct wd_datalist *prev = NULL;
+
+	*head_out = NULL;
+	while (m != NULL && rem > 0) {
+		uint32_t sl = rte_pktmbuf_data_len(m);
+
+		if (skip >= sl) {
+			skip -= sl;
+			m = m->next;
+			continue;
+		}
+		uint32_t so = skip;
+
+		skip = 0;
+		uint32_t take = RTE_MIN(sl - so, rem);
+
+		if (n >= max_nodes)
+			return -ENOSPC;
+		nodes[n].data = rte_pktmbuf_mtod_offset(m, void *, so);
+		nodes[n].len = take;
+		nodes[n].next = NULL;
+		if (prev)
+			prev->next = &nodes[n];
+		else
+			*head_out = &nodes[n];
+		prev = &nodes[n];
+		n++;
+		rem -= take;
+		if (take < sl - so)
+			break;
+		m = m->next;
+	}
+	if (rem != 0)
+		return -EINVAL;
+	return n;
+}
+
+static int
+uadk_mbuf_writable_datalist(const struct rte_mbuf *m, uint32_t pkt_off,
+			    struct wd_datalist *nodes, int max_nodes,
+			    struct wd_datalist **head_out, uint32_t *avail_out)
+{
+	uint32_t skip = pkt_off;
+	int n = 0;
+	struct wd_datalist *prev = NULL;
+	uint32_t acc = 0;
+
+	*head_out = NULL;
+	*avail_out = 0;
+	while (m != NULL) {
+		uint32_t dlen = rte_pktmbuf_data_len(m);
+		uint32_t tr = rte_pktmbuf_tailroom(m);
+		uint32_t seg_room = dlen + tr;
+
+		if (skip >= seg_room) {
+			skip -= seg_room;
+			m = m->next;
+			continue;
+		}
+		uint32_t loff = skip;
+
+		skip = 0;
+		uint32_t chunk = seg_room - loff;
+
+		if (n >= max_nodes)
+			return -ENOSPC;
+		nodes[n].data = rte_pktmbuf_mtod(m, uint8_t *) + loff;
+		nodes[n].len = chunk;
+		nodes[n].next = NULL;
+		if (prev)
+			prev->next = &nodes[n];
+		else
+			*head_out = &nodes[n];
+		prev = &nodes[n];
+		n++;
+		acc += chunk;
+		m = m->next;
+	}
+	*avail_out = acc;
+	return n;
+}
+
+static unsigned int
+uadk_mbuf_chain_segments(const struct rte_mbuf *m)
+{
+	unsigned int n = 0;
+
+	while (m != NULL) {
+		n++;
+		m = m->next;
+	}
+	return n;
+}
+
+static enum rte_comp_op_status
+uadk_compress_pmd_status_from_req(const struct wd_comp_req *req, int ret);
 
 static int
 uadk_compress_pmd_config(struct rte_compressdev *dev,
@@ -61,7 +250,7 @@ uadk_compress_pmd_config(struct rte_compressdev *dev,
 	for (int i = 0; i < WD_DIR_MAX; i++)
 		ctx_set_num[i].async_ctx_num = UADK_COMP_DEF_CTXS;
 
-	ret = wd_comp_init2_(alg_name, SCHED_POLICY_RR, TASK_MIX, &cparams);
+	ret = wd_comp_init2_(priv->init_alg, SCHED_POLICY_RR, TASK_MIX, &cparams);
 	free(ctx_set_num);
 
 	if (ret) {
@@ -244,6 +433,7 @@ uadk_compress_pmd_xform_create(struct rte_compressdev *dev __rte_unused,
 	xfrm = rte_malloc(NULL, sizeof(struct uadk_compress_xform), 0);
 	if (xfrm == NULL)
 		return -ENOMEM;
+	memset(xfrm, 0, sizeof(*xfrm));
 
 	switch (xform->type) {
 	case RTE_COMP_COMPRESS:
@@ -258,6 +448,17 @@ uadk_compress_pmd_xform_create(struct rte_compressdev *dev __rte_unused,
 			param.type = setup.op_type;
 			param.numa_id = -1;	/* choose nearby numa node */
 			setup.sched_param = &param;
+			xfrm->pmd_alg = UADK_PMD_ALG_DEFLATE;
+			break;
+		case RTE_COMP_ALGO_ZSTD:
+			setup.alg_type = WD_LZ77_ZSTD;
+			setup.win_sz = uadk_map_window(xform->compress.window_size);
+			setup.comp_lv = uadk_map_comp_level(xform->compress.level);
+			setup.op_type = WD_DIR_COMPRESS;
+			param.type = setup.op_type;
+			param.numa_id = -1;
+			setup.sched_param = &param;
+			xfrm->pmd_alg = UADK_PMD_ALG_ZSTD;
 			break;
 		default:
 			goto err;
@@ -267,6 +468,9 @@ uadk_compress_pmd_xform_create(struct rte_compressdev *dev __rte_unused,
 		switch (xform->decompress.algo) {
 		case RTE_COMP_ALGO_NULL:
 			break;
+		case RTE_COMP_ALGO_ZSTD:
+			UADK_LOG(ERR, "ZSTD decompression is not supported");
+			goto err;
 		case RTE_COMP_ALGO_DEFLATE:
 			setup.alg_type = WD_DEFLATE;
 			setup.win_sz = uadk_map_window(xform->decompress.window_size);
@@ -275,6 +479,7 @@ uadk_compress_pmd_xform_create(struct rte_compressdev *dev __rte_unused,
 			param.type = setup.op_type;
 			param.numa_id = -1;	/* choose nearby numa node */
 			setup.sched_param = &param;
+			xfrm->pmd_alg = UADK_PMD_ALG_DEFLATE;
 			break;
 		default:
 			goto err;
@@ -341,16 +546,45 @@ static struct rte_compressdev_ops uadk_compress_pmd_ops = {
 		.private_xform_free	= uadk_compress_pmd_xform_free,
 };
 
-static void *uadk_compress_pmd_async_cb(struct wd_comp_req *req,
-					void *data __rte_unused)
+static void *
+uadk_compress_pmd_async_cb(struct wd_comp_req *req, void *data __rte_unused)
 {
 	struct rte_comp_op *op = req->cb_param;
+	struct uadk_compress_xform *xf = (struct uadk_compress_xform *)op->private_xform;
 	uint16_t dst_len = rte_pktmbuf_data_len(op->m_dst) - op->dst.offset;
+	struct wd_lz77_zstd_data *zstd = req->priv;
+
+	if (xf && xf->pmd_alg == UADK_PMD_ALG_ZSTD) {
+		if (req->status == WD_SUCCESS || req->status == WD_STREAM_END) {
+			if (zstd && zstd->literals_start && zstd->freq) {
+				ptrdiff_t used = (uint8_t *)zstd->freq -
+						(uint8_t *)zstd->literals_start;
+
+				if (used >= 0 &&
+				    (size_t)used + UADK_ZSTD_FREQ_SZ <= UINT32_MAX)
+					op->produced = (uint32_t)used +
+							UADK_ZSTD_FREQ_SZ;
+				else
+					op->produced = 0;
+			} else {
+				op->produced = 0;
+			}
+			if (zstd)
+				op->debug_status = (uint64_t)zstd->lit_num |
+					((uint64_t)zstd->seq_num << 32);
+			op->status = RTE_COMP_OP_STATUS_SUCCESS;
+		} else {
+			op->status = uadk_compress_pmd_status_from_req(req, 0);
+		}
+		if (zstd)
+			rte_free(zstd);
+		return NULL;
+	}
 
 	if (req->dst_len <= dst_len) {
 		op->produced += req->dst_len;
 		op->status = RTE_COMP_OP_STATUS_SUCCESS;
-	} else  {
+	} else {
 		op->status = RTE_COMP_OP_STATUS_OUT_OF_SPACE_TERMINATED;
 	}
 
@@ -449,6 +683,96 @@ uadk_compress_pmd_enqueue_burst_async(void *queue_pair,
 			op->status = uadk_compress_pmd_status_from_req(&req, ret);
 			op->consumed += req.src_len;
 			op->produced += req.dst_len;
+		} else if (xform->pmd_alg == UADK_PMD_ALG_ZSTD) {
+			struct wd_lz77_zstd_data *zd;
+			struct wd_datalist *nodes;
+			struct wd_datalist *src_nodes;
+			struct wd_datalist *dst_nodes;
+			void *blob;
+			int n_src, n_dst;
+			unsigned int n_src_max;
+			unsigned int n_dst_max;
+			uint32_t need;
+			uint32_t avail = 0;
+			struct wd_datalist *src_head;
+			struct wd_datalist *dst_head;
+
+			if (xform->type != RTE_COMP_COMPRESS) {
+				op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+				goto enqueue_done;
+			}
+			if (op->flush_flag != RTE_COMP_FLUSH_FULL &&
+			    op->flush_flag != RTE_COMP_FLUSH_FINAL) {
+				op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+				goto enqueue_done;
+			}
+			if (op->src.length > UADK_ZSTD_HW_MAX_IN) {
+				op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+				goto enqueue_done;
+			}
+			need = uadk_zstd_dst_min(op->src.length);
+			n_src_max = uadk_mbuf_chain_segments(op->m_src);
+			n_dst_max = uadk_mbuf_chain_segments(op->m_dst);
+			blob = rte_malloc(NULL,
+				sizeof(*zd) + (size_t)(n_src_max + n_dst_max) *
+				sizeof(struct wd_datalist),
+				RTE_CACHE_LINE_SIZE);
+			if (blob == NULL) {
+				op->status = RTE_COMP_OP_STATUS_ERROR;
+				goto enqueue_done;
+			}
+			memset(blob, 0,
+			       sizeof(*zd) + (size_t)(n_src_max + n_dst_max) *
+			       sizeof(struct wd_datalist));
+			zd = blob;
+			nodes = (struct wd_datalist *)((uint8_t *)blob + sizeof(*zd));
+			src_nodes = nodes;
+			dst_nodes = nodes + n_src_max;
+			n_src = uadk_mbuf_read_datalist(op->m_src, op->src.offset,
+					op->src.length, src_nodes,
+					(int)n_src_max, &src_head);
+			if (n_src < 0) {
+				rte_free(blob);
+				op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+				goto enqueue_done;
+			}
+			n_dst = uadk_mbuf_writable_datalist(op->m_dst, op->dst.offset,
+					dst_nodes, (int)n_dst_max, &dst_head,
+					&avail);
+			if (n_dst < 0) {
+				rte_free(blob);
+				op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+				goto enqueue_done;
+			}
+			if (avail < need) {
+				rte_free(blob);
+				op->status = RTE_COMP_OP_STATUS_INVALID_ARGS;
+				goto enqueue_done;
+			}
+			uadk_datalist_link(src_nodes, n_src);
+			uadk_datalist_link(dst_nodes, n_dst);
+			memset(&req, 0, sizeof(req));
+			req.list_src = n_src ? src_nodes : NULL;
+			req.list_dst = n_dst ? dst_nodes : NULL;
+			req.src_len = op->src.length;
+			req.dst_len = avail;
+			req.data_fmt = WD_SGL_BUF;
+			req.op_type = WD_DIR_COMPRESS;
+			req.priv = zd;
+			req.cb = uadk_compress_pmd_async_cb;
+			req.cb_param = op;
+			do {
+				ret = wd_do_comp_async(xform->handle, &req);
+			} while (ret == -WD_EBUSY);
+
+			op->consumed += op->src.length;
+
+			if (ret) {
+				rte_free(blob);
+				op->status = uadk_compress_pmd_status_from_req(&req, ret);
+			} else {
+				op->status = RTE_COMP_OP_STATUS_NOT_PROCESSED;
+			}
 		} else {
 			req.cb = uadk_compress_pmd_async_cb;
 			req.cb_param = op;
@@ -537,12 +861,9 @@ uadk_compress_probe(struct rte_vdev_device *vdev)
 		rte_socket_id(),
 	};
 	struct rte_compressdev *compressdev;
+	struct uadk_compress_priv *priv;
 	struct uacce_dev *udev;
 	const char *name;
-
-	udev = wd_get_accel_dev(alg_name);
-	if (!udev)
-		return -ENODEV;
 
 	name = rte_vdev_device_name(vdev);
 	if (name == NULL)
@@ -552,6 +873,16 @@ uadk_compress_probe(struct rte_vdev_device *vdev)
 			sizeof(struct uadk_compress_priv), &init_params);
 	if (compressdev == NULL) {
 		UADK_LOG(ERR, "driver %s: create failed", init_params.name);
+		return -ENODEV;
+	}
+
+	priv = compressdev->data->dev_private;
+	memset(priv, 0, sizeof(*priv));
+	uadk_compress_parse_init_alg(vdev, priv);
+
+	udev = wd_get_accel_dev(priv->init_alg);
+	if (!udev) {
+		rte_compressdev_pmd_destroy(compressdev);
 		return -ENODEV;
 	}
 

@@ -6,8 +6,21 @@
 #ifndef _UADK_COMPRESS_PMD_PRIVATE_H_
 #define _UADK_COMPRESS_PMD_PRIVATE_H_
 
+enum uadk_pmd_comp_alg {
+	UADK_PMD_ALG_DEFLATE = 0,
+	UADK_PMD_ALG_ZSTD,
+};
+
+/** UADK hisi_zip lz77_zstd layout (see KAE/uadk/drv/hisi_comp.c). */
+#define UADK_ZSTD_HW_MAX_IN		(1u << 17)
+#define UADK_ZSTD_LIT_RSV		16
+#define UADK_ZSTD_FREQ_SZ		784
+/** Headroom for sequences + freq after literals (matches HZ_MAX_SIZE cap). */
+#define UADK_ZSTD_SEQ_ROOM		(8 * 1024 * 1024)
+
 struct uadk_compress_priv {
 	bool init;
+	char init_alg[64];
 };
 
 struct __rte_cache_aligned uadk_compress_qp {
@@ -21,9 +34,10 @@ struct __rte_cache_aligned uadk_compress_qp {
 	char name[RTE_COMPRESSDEV_NAME_MAX_LEN];
 };
 
-struct  uadk_compress_xform {
+struct uadk_compress_xform {
 	handle_t handle;
 	enum rte_comp_xform_type type;
+	enum uadk_pmd_comp_alg pmd_alg;
 };
 
 extern int uadk_compress_logtype;

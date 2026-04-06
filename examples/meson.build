@@ -57,6 +57,7 @@ all_examples = [
         'service_cores',
         'skeleton',
         'timer',
+        'uadk_zstd_compress',
         'vdpa',
         'vhost',
         'vhost_blk',
