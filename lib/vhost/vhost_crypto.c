@@ -9,11 +9,48 @@
 #include <rte_mbuf.h>
 #include <rte_cryptodev.h>
 
+#include <unistd.h>
+#include <errno.h>
+#include <stdatomic.h>
+
 #include "iotlb.h"
 #include "rte_vhost_crypto.h"
 #include "vhost.h"
 #include "vhost_user.h"
 #include "virtio_crypto.h"
+#include "vhost_crypto_migration.h"
+#include <rte_hash_crc.h>
+#include "vhost_crypto_snapshot.h"
+
+#include <rte_errno.h>
+#include <fcntl.h>    // for O_CREAT, O_WRONLY, O_TRUNC
+#include <unistd.h>   // for close()
+#include <rte_cycles.h>
+
+static inline uint64_t vc_ts_ms(void)
+{
+    uint64_t hz = rte_get_timer_hz();
+    uint64_t cyc = rte_get_timer_cycles();
+    return hz ? (cyc * 1000 / hz) : 0;
+}
+
+#define VCLOG(level, fmt, ...) \
+    RTE_LOG(level, USER1, "[VC][%llu ms] " fmt "\n", \
+            (unsigned long long)vc_ts_ms(), ##__VA_ARGS__)
+
+
+static inline uint16_t TOLE16(uint16_t x){ return rte_cpu_to_le_16(x); }
+static inline uint32_t TOLE32(uint32_t x){ return rte_cpu_to_le_32(x); }
+static inline uint64_t TOLE64(uint64_t x){ return rte_cpu_to_le_64(x); }
+static inline uint16_t FROMLE16(uint16_t x){ return rte_le_to_cpu_16(x); }
+static inline uint32_t FROMLE32(uint32_t x){ return rte_le_to_cpu_32(x); }
+static inline uint64_t FROMLE64(uint64_t x){ return rte_le_to_cpu_64(x); }
+
+uint32_t vc_crc32(const void *data, uint32_t len) {
+    return rte_hash_crc(data, len, 0);
+}
+
+#define VHOST_USER_CRYPTO_TEST 55
 
 #define INHDR_LEN		(sizeof(struct virtio_crypto_inhdr))
 #define IV_OFFSET		(sizeof(struct rte_crypto_op) + \
@@ -38,12 +75,15 @@ RTE_LOG_REGISTER_SUFFIX(vhost_crypto_logtype, crypto, INFO);
 #define VC_LOG_DBG(...)
 #endif
 
+static void test_save_load_blob(int vid);
+
 #define VIRTIO_CRYPTO_FEATURES ((1ULL << VIRTIO_F_NOTIFY_ON_EMPTY) |	\
 		(1ULL << VIRTIO_RING_F_INDIRECT_DESC) |			\
 		(1ULL << VIRTIO_RING_F_EVENT_IDX) |			\
 		(1ULL << VIRTIO_NET_F_CTRL_VQ) |			\
 		(1ULL << VIRTIO_F_VERSION_1) |				\
-		(1ULL << VHOST_USER_F_PROTOCOL_FEATURES))
+		(1ULL << VHOST_USER_F_PROTOCOL_FEATURES) | \
+		(1ULL << VHOST_F_LOG_ALL)) 
 
 #define IOVA_TO_VVA(t, dev, vq, a, l, p)				\
 	((t)(uintptr_t)vhost_iova_to_vva(dev, vq, a, l, p))
@@ -56,13 +96,75 @@ RTE_LOG_REGISTER_SUFFIX(vhost_crypto_logtype, crypto, INFO);
  */
 #define vhost_crypto_desc vring_desc
 
+static inline void explicit_bzero_fallback(void *p, size_t n) {
+    volatile uint8_t *vp = (volatile uint8_t*)p;
+    while (n--) *vp++ = 0;
+}
+#ifndef explicit_bzero
+#define explicit_bzero explicit_bzero_fallback
+#endif
+
+
+
+
+
+
+/* duplicate bytes into DPDK heap (zero-inited) */
+static inline uint8_t *
+dup_bytes_dpdk(const void *src, size_t len)
+{
+    if (!src || len == 0)
+        return NULL;
+
+    uint8_t *p = rte_zmalloc(NULL, len, 0);  /* zero-init for safety */
+    if (p == NULL)
+        return NULL;
+
+    rte_memcpy(p, src, len);
+    return p;
+}
+
+/* secure zero + free (best effort) */
+static inline void secure_free(void *p, size_t len) {
+    if (!p) return;
+    /* try to wipe; avoid being optimized out */
+    volatile uint8_t *vp = (volatile uint8_t *)p;
+    for (size_t i = 0; i < len; i++) vp[i] = 0;
+    rte_free(p);
+}
+
+struct vc_session_meta_blob {
+    void    *blob;      // 连续缓冲：key|auth_key|iv_seed|…
+    uint32_t blob_len;
+};
+
+struct vc_session_meta {
+    bool     valid;
+    uint64_t session_id;
+    enum vc_sess_kind kind; // 来自 snapshot.h
+    union {
+        struct { struct vc_sym_meta_v1  desc; struct vc_session_meta_blob b; } sym;
+        struct { struct vc_asym_meta_v1 desc; struct vc_session_meta_blob b; } asym;
+    };
+};
+
 struct vhost_crypto_session {
 	union {
 		struct rte_cryptodev_asym_session *asym;
 		struct rte_cryptodev_sym_session *sym;
 	};
 	enum rte_crypto_op_type type;
+	struct vc_session_meta meta;
 };
+struct virtio_net;
+extern struct virtio_net *get_device(int vid);
+
+/* 从 vhost 设备拿到你自己的 vhost_crypto 实例 */
+static inline struct vhost_crypto *vc_lookup(int vid) {
+    struct virtio_net *dev = get_device(vid);
+    if (!dev || !dev->extern_data) return NULL;
+    return (struct vhost_crypto *)dev->extern_data;
+}
 
 static int
 cipher_algo_transform(uint32_t virtio_cipher_algo,
@@ -226,6 +328,21 @@ struct __rte_cache_aligned vhost_crypto {
 	struct virtio_net *dev;
 
 	uint8_t option;
+	_Atomic unsigned int inflight;  /* ++ on submit, -- on completion */
+	_Atomic unsigned int inflight_corrupt;
+    volatile int frozen;            /* 1 => reject new submissions */
+
+	rte_spinlock_t pending_lock;
+    uint8_t *pending_load_buf;
+    size_t pending_load_len;
+    uint8_t pending_load_valid;
+	/* ====== ✅ restore 失败兜底：避免 guest 静默卡死 ====== */
+	volatile int load_failed;    /* 1 => session restore failed */
+	int last_load_rc;            /* last error code */
+	uint32_t load_fail_cnt;      /* retry counter */
+	uint8_t pending_applying;
+	uint32_t last_applied_blob_crc;
+	size_t   last_applied_blob_len;
 };
 
 struct vhost_crypto_writeback_data {
@@ -242,10 +359,16 @@ struct vhost_crypto_data_req {
 	struct vhost_virtqueue *vq;
 	struct vhost_crypto_writeback_data *wb;
 	struct rte_mempool *wb_pool;
-	uint16_t desc_idx;
+	/* Split indices: used ring slot vs descriptor head index */
+    uint16_t used_idx;   /* slot in avail/used ring */
+    uint16_t head_idx;   /* descriptor head index */
 	uint16_t len;
 	uint16_t zero_copy;
+	struct vhost_crypto *vcrypto;           /* 新增：设备回指，收尾/计数用 */
+
 };
+
+
 
 static int
 transform_cipher_param(struct rte_crypto_sym_xform *xform,
@@ -307,6 +430,15 @@ transform_chain_param(struct rte_crypto_sym_xform *xforms,
 		return -VIRTIO_CRYPTO_BADMSG;
 	}
 
+	/* ====== ✅ [插入点 1]：这里打“virtio 输入参数” ====== */
+	VC_LOG_INFO("[xform][chain][virtio] chain_dir=%u cipher_algo=%u hash_algo=%u cipher_key_len=%u auth_key_len=%u digest_len=%u",
+		    (unsigned)param->chaining_dir,
+		    (unsigned)param->cipher_algo,
+		    (unsigned)param->hash_algo,
+		    (unsigned)param->cipher_key_len,
+		    (unsigned)param->auth_key_len,
+		    (unsigned)param->digest_len);
+
 	/* cipher */
 	ret = cipher_algo_transform(param->cipher_algo,
 			&xform_cipher->cipher.algo);
@@ -342,116 +474,213 @@ transform_chain_param(struct rte_crypto_sym_xform *xforms,
 	xform_auth->auth.key.length = param->auth_key_len;
 	xform_auth->auth.key.data = param->auth_key_buf;
 
+	/* ====== ✅ [插入点 2]：这里打“DPDK xform 最终值” ====== */
+	VC_LOG_INFO("[xform][chain][dpdk] CIPHER: algo=%u iv_len=%u key_len=%u op=%u | AUTH: algo=%u key_len=%u digest_len=%u op=%u",
+		    (unsigned)xform_cipher->cipher.algo,
+		    (unsigned)xform_cipher->cipher.iv.length,
+		    (unsigned)xform_cipher->cipher.key.length,
+		    (unsigned)xform_cipher->cipher.op,
+		    (unsigned)xform_auth->auth.algo,
+		    (unsigned)xform_auth->auth.key.length,
+		    (unsigned)xform_auth->auth.digest_length,
+		    (unsigned)xform_auth->auth.op);
+
 	return 0;
 }
 
+
 static void
 vhost_crypto_create_sym_sess(struct vhost_crypto *vcrypto,
-		VhostUserCryptoSessionParam *sess_param)
+                             VhostUserCryptoSessionParam *sess_param)
 {
-	struct rte_crypto_sym_xform xform1 = {0}, xform2 = {0};
-	struct vhost_crypto_session *vhost_session;
-	struct rte_cryptodev_sym_session *session;
-	int ret;
+    struct rte_crypto_sym_xform xform1 = {0}, xform2 = {0};
+    struct vhost_crypto_session *vhost_session = NULL;
+    struct rte_cryptodev_sym_session *session = NULL;
+    int ret;
 
-	switch (sess_param->u.sym_sess.op_type) {
-	case VIRTIO_CRYPTO_SYM_OP_NONE:
-	case VIRTIO_CRYPTO_SYM_OP_CIPHER:
-		ret = transform_cipher_param(&xform1, &sess_param->u.sym_sess);
-		if (unlikely(ret)) {
-			VC_LOG_ERR("Error transform session msg (%i)", ret);
-			sess_param->session_id = ret;
-			return;
-		}
-		break;
-	case VIRTIO_CRYPTO_SYM_OP_ALGORITHM_CHAINING:
-		if (unlikely(sess_param->u.sym_sess.hash_mode !=
-				VIRTIO_CRYPTO_SYM_HASH_MODE_AUTH)) {
-			sess_param->session_id = -VIRTIO_CRYPTO_NOTSUPP;
-			VC_LOG_ERR("Error transform session message (%i)",
-					-VIRTIO_CRYPTO_NOTSUPP);
-			return;
-		}
+    switch (sess_param->u.sym_sess.op_type) {
+    case VIRTIO_CRYPTO_SYM_OP_NONE:
+    case VIRTIO_CRYPTO_SYM_OP_CIPHER:
+        ret = transform_cipher_param(&xform1, &sess_param->u.sym_sess);
+        if (unlikely(ret)) {
+            VC_LOG_ERR("Error transform session msg (%i)", ret);
+            sess_param->session_id = ret;
+			/* ====== ✅ [cipher debug] 打 virtio 输入 + 映射后的 rte 参数 ====== */
+			VC_LOG_INFO("[xform][cipher][virtio] dir=%u cipher_algo=%u cipher_key_len=%u",
+						(unsigned)sess_param->u.sym_sess.dir,
+						(unsigned)sess_param->u.sym_sess.cipher_algo,
+						(unsigned)sess_param->u.sym_sess.cipher_key_len);
 
-		xform1.next = &xform2;
+			VC_LOG_INFO("[xform][cipher][rte] algo=%u op=%u key_len=%u iv_len=%u iv_off=%u",
+						(unsigned)xform1.cipher.algo,
+						(unsigned)xform1.cipher.op,
+						(unsigned)xform1.cipher.key.length,
+						(unsigned)xform1.cipher.iv.length,
+						(unsigned)xform1.cipher.iv.offset);
+            return;
+        }
+        break;
+    case VIRTIO_CRYPTO_SYM_OP_ALGORITHM_CHAINING:
+        if (unlikely(sess_param->u.sym_sess.hash_mode !=
+                     VIRTIO_CRYPTO_SYM_HASH_MODE_AUTH)) {
+            sess_param->session_id = -VIRTIO_CRYPTO_NOTSUPP;
+            VC_LOG_ERR("Error transform session message (%i)",
+                       -VIRTIO_CRYPTO_NOTSUPP);
+            return;
+        }
+        xform1.next = &xform2;
+        ret = transform_chain_param(&xform1, &sess_param->u.sym_sess);
+        if (unlikely(ret)) {
+            VC_LOG_ERR("Error transform session message (%i)", ret);
+            sess_param->session_id = ret;
+            return;
+        }
+        break;
+    default:
+        VC_LOG_ERR("Algorithm not yet supported");
+        sess_param->session_id = -VIRTIO_CRYPTO_NOTSUPP;
+        return;
+    }
 
-		ret = transform_chain_param(&xform1, &sess_param->u.sym_sess);
-		if (unlikely(ret)) {
-			VC_LOG_ERR("Error transform session message (%i)", ret);
-			sess_param->session_id = ret;
-			return;
-		}
+    session = rte_cryptodev_sym_session_create(vcrypto->cid, &xform1,
+                                               vcrypto->sess_pool);
+    if (!session) {
+        VC_LOG_ERR("Failed to create session");
+        sess_param->session_id = -VIRTIO_CRYPTO_ERR;
+        return;
+    }
 
-		break;
-	default:
-		VC_LOG_ERR("Algorithm not yet supported");
-		sess_param->session_id = -VIRTIO_CRYPTO_NOTSUPP;
-		return;
+    vhost_session = rte_zmalloc(NULL, sizeof(*vhost_session), 0);
+    if (vhost_session == NULL) {
+        VC_LOG_ERR("Failed to alloc session memory");
+        goto error_exit;
+    }
+
+    vhost_session->type = RTE_CRYPTO_OP_TYPE_SYMMETRIC;
+    vhost_session->sym  = session;
+
+    /* === 缓存“原始会话参数 + 密钥”用于迁移重建 === */
+    vhost_session->meta.valid       = true;
+    vhost_session->meta.session_id  = vcrypto->last_session_id;
+    vhost_session->meta.kind        = VC_SESS_SYM;
+
+    /* 1) 固定描述字段：来自 guest 的 sess_param */
+    struct vc_sym_meta_v1 *D = &vhost_session->meta.sym.desc;
+    memset(D, 0, sizeof(*D));
+    D->algo_cipher = (uint16_t)sess_param->u.sym_sess.cipher_algo;
+    D->algo_auth   = (uint16_t)sess_param->u.sym_sess.hash_algo;   /* 无 auth 可为 0 */
+    D->algo_aead   = 0;        /* 目前不走 AEAD，保留 */
+    D->chain_mode  = (uint16_t)sess_param->u.sym_sess.chaining_dir;
+    D->key_len     = (uint16_t)sess_param->u.sym_sess.cipher_key_len;
+    D->aad_len     = 0;        /* 非 AEAD */
+    D->tag_len     = (uint16_t)sess_param->u.sym_sess.digest_len;  /* 链式/HMAC 才用 */
+    D->iv_gen_mode = 0;
+	/* ====== 关键：精确恢复必须保存这三个 ====== */
+	D->op_type     = (uint8_t)sess_param->u.sym_sess.op_type;
+	D->dir         = (uint8_t)sess_param->u.sym_sess.dir;
+	D->hash_mode   = (uint8_t)sess_param->u.sym_sess.hash_mode;
+	
+	enum rte_crypto_cipher_algorithm rte_algo = 0;
+	if (cipher_algo_transform(sess_param->u.sym_sess.cipher_algo, &rte_algo) == 0) {
+		int iv = get_iv_len(rte_algo);
+		D->iv_len = (uint16_t)(iv > 0 ? iv : 0);
+	} else {
+		D->iv_len = 0;
+	}
+	if (D->iv_len == 0) {
+		const struct rte_crypto_sym_xform *cxf = NULL;
+		if (xform1.type == RTE_CRYPTO_SYM_XFORM_CIPHER)      cxf = &xform1;
+		else if (xform2.type == RTE_CRYPTO_SYM_XFORM_CIPHER) cxf = &xform2;
+		D->iv_len = (uint16_t)(cxf ? cxf->cipher.iv.length : 0);
 	}
 
-	session = rte_cryptodev_sym_session_create(vcrypto->cid, &xform1,
-			vcrypto->sess_pool);
-	if (!session) {
-		VC_LOG_ERR("Failed to create session");
-		sess_param->session_id = -VIRTIO_CRYPTO_ERR;
-		return;
-	}
 
-	vhost_session = rte_zmalloc(NULL, sizeof(*vhost_session), 0);
-	if (vhost_session == NULL) {
-		VC_LOG_ERR("Failed to alloc session memory");
-		goto error_exit;
-	}
+    /* 2) 变长 blob 约定顺序：cipher_key | auth_key | iv_seed(可选) */
+    uint32_t key_len      = sess_param->u.sym_sess.cipher_key_len;
+    uint32_t auth_key_len = sess_param->u.sym_sess.auth_key_len; /* 仅链式/HMAC有 */
+    uint32_t iv_seed_len  = 0;  /* 通常每 op 提供 IV，默认不保存模板 */
+    uint32_t blob_len     = key_len + auth_key_len + iv_seed_len;
 
-	vhost_session->type = RTE_CRYPTO_OP_TYPE_SYMMETRIC;
-	vhost_session->sym = session;
+    void *blob = (blob_len ? rte_zmalloc(NULL, blob_len, 0) : NULL);
+    if (blob_len && !blob) {
+        VC_LOG_ERR("No mem for sym meta blob");
+        goto error_exit;
+    }
+    uint8_t *w = (uint8_t*)blob;
+    if (key_len) {
+        rte_memcpy(w, sess_param->u.sym_sess.cipher_key_buf, key_len);
+        w += key_len;
+    }
+    if (auth_key_len) {
+        rte_memcpy(w, sess_param->u.sym_sess.auth_key_buf, auth_key_len);
+        w += auth_key_len;
+    }
+    if (iv_seed_len) {
+        /* 若未来需要固定 IV 模板，在此 memcpy 对应来源；当前置零占位 */
+        memset(w, 0, iv_seed_len);
+        w += iv_seed_len;
+    }
+    vhost_session->meta.sym.b.blob     = blob;
+    vhost_session->meta.sym.b.blob_len = blob_len;
 
-	/* insert session to map */
-	if ((rte_hash_add_key_data(vcrypto->session_map,
-		&vcrypto->last_session_id, vhost_session) < 0)) {
-		VC_LOG_ERR("Failed to insert session to hash table");
-		goto error_exit;
-	}
+    /* === 插入到会话映射 === */
+    if (rte_hash_add_key_data(vcrypto->session_map,
+                              &vcrypto->last_session_id, vhost_session) < 0) {
+        VC_LOG_ERR("Failed to insert session to hash table");
+        goto error_exit;
+    }
 
-	VC_LOG_INFO("Session %"PRIu64" created for vdev %i.",
-			vcrypto->last_session_id, vcrypto->dev->vid);
+    VC_LOG_INFO("Session %"PRIu64" created for vdev %i.",
+                vcrypto->last_session_id, vcrypto->dev->vid);
 
-	sess_param->session_id = vcrypto->last_session_id;
-	vcrypto->last_session_id++;
-	return;
+    sess_param->session_id = vcrypto->last_session_id;
+    vcrypto->last_session_id++;
+    return;
 
 error_exit:
-	if (rte_cryptodev_sym_session_free(vcrypto->cid, session) < 0)
-		VC_LOG_ERR("Failed to free session");
-
-	sess_param->session_id = -VIRTIO_CRYPTO_ERR;
-	rte_free(vhost_session);
+    if (vhost_session && vhost_session->meta.valid &&
+        vhost_session->meta.kind == VC_SESS_SYM &&
+        vhost_session->meta.sym.b.blob) {
+        explicit_bzero(vhost_session->meta.sym.b.blob,
+                       vhost_session->meta.sym.b.blob_len);
+        rte_free(vhost_session->meta.sym.b.blob);
+        vhost_session->meta.sym.b.blob = NULL;
+        vhost_session->meta.sym.b.blob_len = 0;
+    }
+    if (session) {
+        if (rte_cryptodev_sym_session_free(vcrypto->cid, session) < 0)
+            VC_LOG_ERR("Failed to free session");
+    }
+    sess_param->session_id = -VIRTIO_CRYPTO_ERR;
+    rte_free(vhost_session);
 }
+
 
 static int
 tlv_decode(uint8_t *tlv, uint8_t type, uint8_t **data, size_t *data_len)
 {
-	size_t tlen = -EINVAL, len;
+    int tlen = -EINVAL;           // <-- 用 int
+    size_t len;
 
-	if (tlv[0] != type)
-		return -EINVAL;
+    if (tlv[0] != type)
+        return -EINVAL;
 
-	if (tlv[1] == 0x82) {
-		len = (tlv[2] << 8) | tlv[3];
-		*data = &tlv[4];
-		tlen = len + 4;
-	} else if (tlv[1] == 0x81) {
-		len = tlv[2];
-		*data = &tlv[3];
-		tlen = len + 3;
-	} else {
-		len = tlv[1];
-		*data = &tlv[2];
-		tlen = len + 2;
-	}
+    if (tlv[1] == 0x82) {
+        len = (tlv[2] << 8) | tlv[3];
+        *data = &tlv[4];
+        tlen = (int)len + 4;
+    } else if (tlv[1] == 0x81) {
+        len = tlv[2];
+        *data = &tlv[3];
+        tlen = (int)len + 3;
+    } else {
+        len = tlv[1];
+        *data = &tlv[2];
+        tlen = (int)len + 2;
+    }
 
-	*data_len = len;
-	return tlen;
+    *data_len = len;
+    return tlen;
 }
 
 static int
@@ -641,65 +870,108 @@ rsa_param_transform(struct rte_crypto_asym_xform *xform,
 
 static void
 vhost_crypto_create_asym_sess(struct vhost_crypto *vcrypto,
-		VhostUserCryptoSessionParam *sess_param)
+                              VhostUserCryptoSessionParam *sess_param)
 {
-	struct rte_cryptodev_asym_session *session = NULL;
-	struct vhost_crypto_session *vhost_session;
-	struct rte_crypto_asym_xform xform = {0};
-	int ret;
+    struct rte_cryptodev_asym_session *session = NULL;
+    struct vhost_crypto_session *vhost_session = NULL;
+    struct rte_crypto_asym_xform xform = (struct rte_crypto_asym_xform){0};
+    int ret;
 
-	switch (sess_param->u.asym_sess.algo) {
-	case VIRTIO_CRYPTO_AKCIPHER_RSA:
-		ret = rsa_param_transform(&xform, &sess_param->u.asym_sess);
-		if (unlikely(ret < 0)) {
-			VC_LOG_ERR("Error transform session msg (%i)", ret);
-			sess_param->session_id = ret;
-			return;
-		}
-		break;
-	default:
-		VC_LOG_ERR("Invalid op algo");
-		sess_param->session_id = -VIRTIO_CRYPTO_ERR;
-		return;
-	}
+    /* 1) 来宾参数 -> DPDK xform（沿用你已有的转换） */
+    switch (sess_param->u.asym_sess.algo) {
+    case VIRTIO_CRYPTO_AKCIPHER_RSA:
+        ret = rsa_param_transform(&xform, &sess_param->u.asym_sess);
+        if (unlikely(ret < 0)) {
+            VC_LOG_ERR("Error transform session msg (%i)", ret);
+            sess_param->session_id = ret;
+            return;
+        }
+        break;
+    default:
+        VC_LOG_ERR("Invalid op algo");
+        sess_param->session_id = -VIRTIO_CRYPTO_ERR;
+        return;
+    }
 
-	ret = rte_cryptodev_asym_session_create(vcrypto->cid, &xform,
-		vcrypto->sess_pool, (void *)&session);
-	if (session == NULL) {
-		VC_LOG_ERR("Failed to create session");
-		sess_param->session_id = -VIRTIO_CRYPTO_ERR;
-		return;
-	}
+    /* 2) 创建 cryptodev 会话（保持你现有 API 形态） */
+    ret = rte_cryptodev_asym_session_create(vcrypto->cid, &xform,
+                                            vcrypto->sess_pool, (void *)&session);
+    if (session == NULL) {
+        VC_LOG_ERR("Failed to create session");
+        sess_param->session_id = -VIRTIO_CRYPTO_ERR;
+        return;
+    }
 
-	vhost_session = rte_zmalloc(NULL, sizeof(*vhost_session), 0);
-	if (vhost_session == NULL) {
-		VC_LOG_ERR("Failed to alloc session memory");
-		goto error_exit;
-	}
+    /* 3) 分配 vhost 会话对象 */
+    vhost_session = rte_zmalloc(NULL, sizeof(*vhost_session), 0);
+    if (vhost_session == NULL) {
+        VC_LOG_ERR("Failed to alloc session memory");
+        goto error_exit;
+    }
+    vhost_session->type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
+    vhost_session->asym = session;
 
-	vhost_session->type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
-	vhost_session->asym = session;
+    /* 4) 缓存“原始会话参数+密钥素材”，供迁移重建 */
+    vhost_session->meta.valid      = true;
+    vhost_session->meta.session_id = vcrypto->last_session_id;
+    vhost_session->meta.kind       = VC_SESS_ASYM;
 
-	/* insert session to map */
-	if ((rte_hash_add_key_data(vcrypto->session_map,
-			&vcrypto->last_session_id, vhost_session) < 0)) {
-		VC_LOG_ERR("Failed to insert session to hash table");
-		goto error_exit;
-	}
+	struct vc_asym_meta_v1 *A = &vhost_session->meta.asym.desc;
+	memset(A, 0, sizeof(*A));
 
-	VC_LOG_INFO("Session %"PRIu64" created for vdev %i.",
-			vcrypto->last_session_id, vcrypto->dev->vid);
+	A->algo_asym    = (uint16_t)sess_param->u.asym_sess.algo;
+	A->key_bits     = 0;
+	A->hash_algo    = (uint16_t)sess_param->u.asym_sess.u.rsa.hash_algo;
+	A->curve_id     = 0;
+	A->padding_algo = (uint16_t)sess_param->u.asym_sess.u.rsa.padding_algo;
+	A->key_type     = (uint16_t)sess_param->u.asym_sess.key_type;
 
-	sess_param->session_id = vcrypto->last_session_id;
-	vcrypto->last_session_id++;
-	return;
+	/* 保存 guest 传来的原始 RSA DER（公钥或私钥） */
+	uint32_t blob_len = sess_param->u.asym_sess.key_len;
+    void *blob = (blob_len ? rte_zmalloc(NULL, blob_len, 0) : NULL);
+    if (blob_len && !blob) {
+        VC_LOG_ERR("No mem for asym meta blob");
+        goto error_exit;
+    }
+    if (blob_len) {
+        rte_memcpy(blob, sess_param->u.asym_sess.key_buf, blob_len);
+    }
+    vhost_session->meta.asym.b.blob     = blob;
+    vhost_session->meta.asym.b.blob_len = blob_len;
+
+    /* 5) 插入会话映射 */
+    if (rte_hash_add_key_data(vcrypto->session_map,
+                              &vcrypto->last_session_id, vhost_session) < 0) {
+        VC_LOG_ERR("Failed to insert session to hash table");
+        goto error_exit;
+    }
+
+    VC_LOG_INFO("Asym session %"PRIu64" created for vdev %i.",
+                vcrypto->last_session_id, vcrypto->dev->vid);
+
+    sess_param->session_id = vcrypto->last_session_id;
+    vcrypto->last_session_id++;
+    return;
 
 error_exit:
-	if (rte_cryptodev_asym_session_free(vcrypto->cid, session) < 0)
-		VC_LOG_ERR("Failed to free session");
-	sess_param->session_id = -VIRTIO_CRYPTO_ERR;
-	rte_free(vhost_session);
+    if (vhost_session && vhost_session->meta.valid &&
+        vhost_session->meta.kind == VC_SESS_ASYM &&
+        vhost_session->meta.asym.b.blob) {
+        explicit_bzero(vhost_session->meta.asym.b.blob,
+                       vhost_session->meta.asym.b.blob_len);
+        rte_free(vhost_session->meta.asym.b.blob);
+        vhost_session->meta.asym.b.blob = NULL;
+        vhost_session->meta.asym.b.blob_len = 0;
+    }
+    if (session) {
+        if (rte_cryptodev_asym_session_free(vcrypto->cid, session) < 0)
+            VC_LOG_ERR("Failed to free asym session");
+    }
+    sess_param->session_id = -VIRTIO_CRYPTO_ERR;
+    rte_free(vhost_session);
 }
+
+
 
 static void
 vhost_crypto_create_sess(struct vhost_crypto *vcrypto,
@@ -714,45 +986,235 @@ vhost_crypto_create_sess(struct vhost_crypto *vcrypto,
 static int
 vhost_crypto_close_sess(struct vhost_crypto *vcrypto, uint64_t session_id)
 {
-	struct vhost_crypto_session *vhost_session = NULL;
-	uint64_t sess_id = session_id;
-	int ret;
+    struct vhost_crypto_session *vhost_session = NULL;
+    uint64_t sid = session_id;
+    int rc = 0;
 
-	ret = rte_hash_lookup_data(vcrypto->session_map, &sess_id,
-				(void **)&vhost_session);
-	if (unlikely(ret < 0)) {
-		VC_LOG_ERR("Failed to find session for id %"PRIu64".", session_id);
-		return -VIRTIO_CRYPTO_INVSESS;
-	}
+    /* 1) 从会话表取指针（当前分支的既有用法） */
+    if (rte_hash_lookup_data(vcrypto->session_map, &sid,
+                             (void **)&vhost_session) < 0 || !vhost_session) {
+        return -VIRTIO_CRYPTO_ERR;
+    }
 
-	if (vhost_session->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
-		if (rte_cryptodev_sym_session_free(vcrypto->cid,
-			vhost_session->sym) < 0) {
-			VC_LOG_DBG("Failed to free session");
-			return -VIRTIO_CRYPTO_ERR;
-		}
-	} else if (vhost_session->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
-		if (rte_cryptodev_asym_session_free(vcrypto->cid,
-			vhost_session->asym) < 0) {
-			VC_LOG_DBG("Failed to free session");
-			return -VIRTIO_CRYPTO_ERR;
-			}
-	} else {
-		VC_LOG_ERR("Invalid session for id %"PRIu64".", session_id);
-		return -VIRTIO_CRYPTO_INVSESS;
-	}
+    /* 2) 先从哈希表移除，避免并发路径再拿到它 */
+    if (rte_hash_del_key(vcrypto->session_map, &sid) < 0) {
+        VC_LOG_DBG("Failed to delete session %" PRIu64 " from hash.", sid);
+        rc = -VIRTIO_CRYPTO_ERR; /* 记录但继续做清理，避免泄漏 */
+    }
 
-	if (rte_hash_del_key(vcrypto->session_map, &sess_id) < 0) {
-		VC_LOG_DBG("Failed to delete session from hash table.");
-		return -VIRTIO_CRYPTO_ERR;
-	}
+    /* 3) 释放 DPDK 会话对象（对称/非对称分支） */
+    if (vhost_session->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+        if (vhost_session->sym) {
+            if (rte_cryptodev_sym_session_free(vcrypto->cid,
+                                               vhost_session->sym) < 0) {
+                VC_LOG_ERR("Failed to free sym session");
+                rc = -VIRTIO_CRYPTO_ERR;
+            }
+            vhost_session->sym = NULL;
+        }
+    } else {
+        if (vhost_session->asym) {
+            if (rte_cryptodev_asym_session_free(vcrypto->cid,
+                                                vhost_session->asym) < 0) {
+                VC_LOG_ERR("Failed to free asym session");
+                rc = -VIRTIO_CRYPTO_ERR;
+            }
+            vhost_session->asym = NULL;
+        }
+    }
 
-	VC_LOG_INFO("Session %"PRIu64" deleted for vdev %i.", sess_id,
-			vcrypto->dev->vid);
+    /* 4) 显式清零并释放缓存的密钥/DER blob（避免残留敏感信息） */
+    if (vhost_session->meta.valid) {
+        if (vhost_session->meta.kind == VC_SESS_SYM &&
+            vhost_session->meta.sym.b.blob) {
+            explicit_bzero(vhost_session->meta.sym.b.blob,
+                           vhost_session->meta.sym.b.blob_len);
+            rte_free(vhost_session->meta.sym.b.blob);
+            vhost_session->meta.sym.b.blob = NULL;
+            vhost_session->meta.sym.b.blob_len = 0;
+        } else if (vhost_session->meta.kind == VC_SESS_ASYM &&
+                   vhost_session->meta.asym.b.blob) {
+            explicit_bzero(vhost_session->meta.asym.b.blob,
+                           vhost_session->meta.asym.b.blob_len);
+            rte_free(vhost_session->meta.asym.b.blob);
+            vhost_session->meta.asym.b.blob = NULL;
+            vhost_session->meta.asym.b.blob_len = 0;
+        }
+        vhost_session->meta.valid = false;
+        memset(&vhost_session->meta, 0, sizeof(vhost_session->meta));
+    }
 
-	rte_free(vhost_session);
-	return 0;
+    VC_LOG_INFO("Session %" PRIu64 " closed for vdev %i.",
+                session_id, vcrypto->dev->vid);
+
+    /* 5) 释放会话结构本身 */
+    rte_free(vhost_session);
+
+    return rc ? rc : 0;
 }
+
+static enum rte_vhost_msg_result
+vhost_crypto_msg_pre_handler(int vid, void *msg)
+{
+
+    return RTE_VHOST_MSG_RESULT_NOT_HANDLED;
+}
+
+
+static int
+read_all_from_fd(int fd, uint8_t **out_buf, size_t *out_len)
+{
+    size_t cap = 4096;
+    size_t len = 0;
+    uint8_t *buf = malloc(cap);
+    if (!buf)
+        return -ENOMEM;
+
+    for (;;) {
+        ssize_t n = read(fd, buf + len, cap - len);
+        if (n > 0) {
+            len += (size_t)n;
+            if (len == cap) {
+                cap *= 2;
+                uint8_t *nb = realloc(buf, cap);
+                if (!nb) {
+                    free(buf);
+                    return -ENOMEM;
+                }
+                buf = nb;
+            }
+            continue;
+        }
+        if (n == 0)
+            break; /* EOF */
+        if (errno == EINTR)
+            continue;
+        free(buf);
+        return -errno;
+    }
+
+    *out_buf = buf;
+    *out_len = len;
+    return 0;
+}
+static __rte_always_inline int vhost_crypto_vq_usable(struct vhost_virtqueue *vq);
+static inline int vhost_crypto_device_ready(struct virtio_net *dev);
+static int vhost_crypto_load_state_fd(int vid, int fd);
+
+/* Restore gate: allow applying CRYPTO_LOAD as soon as mem table + FEATURES_OK are ready.
+ * Do NOT require DRIVER_OK here, otherwise guest requests may arrive before sessions are restored.
+ */
+static inline int
+vhost_crypto_restore_ready(struct virtio_net *dev)
+{
+    if (!dev || !dev->mem || dev->mem->nregions == 0)
+        return 0;
+
+    if (!(dev->status & VIRTIO_DEVICE_STATUS_FEATURES_OK))
+        return 0;
+
+    return 1;
+}
+
+static void
+vhost_crypto_try_apply_pending_load(int vid, struct virtio_net *dev,
+                                    struct vhost_crypto *vcrypto,
+                                    const char *why)
+{
+    uint8_t *buf = NULL;
+    size_t len = 0;
+    int rc;
+
+    if (!vcrypto || !dev)
+        return;
+
+    /* Safety gate first: keep control-plane fast and avoid early restore.
+     * If not ready, just return and retry on later cfg messages.
+     */
+    if (!vhost_crypto_restore_ready(dev)) {
+        RTE_LOG(DEBUG, VHOST_CONFIG,
+                "pending LOAD: restore not ready (vid=%d why=%s status=0x%x)",
+                vid, why, dev->status);
+        return;
+    }
+
+    /* 1) 抢占 apply 权，避免重入/并发双 apply */
+    rte_spinlock_lock(&vcrypto->pending_lock);
+
+    if (!vcrypto->pending_load_valid ||
+        !vcrypto->pending_load_buf ||
+        vcrypto->pending_load_len == 0) {
+        rte_spinlock_unlock(&vcrypto->pending_lock);
+        RTE_LOG(DEBUG, VHOST_CONFIG,
+                "pending LOAD: none (vid=%d why=%s)", vid, why);
+        return;
+    }
+
+    if (vcrypto->pending_applying) {
+        rte_spinlock_unlock(&vcrypto->pending_lock);
+        RTE_LOG(DEBUG, VHOST_CONFIG,
+                "pending LOAD: applying in progress (vid=%d why=%s)",
+                vid, why);
+        return;
+    }
+
+    vcrypto->pending_applying = 1;
+
+    /* 2) 把 pending 从全局摘下来，避免另一条路径也来 apply 同一份 buf */
+    buf = vcrypto->pending_load_buf;
+    len = vcrypto->pending_load_len;
+
+    vcrypto->pending_load_buf = NULL;
+    vcrypto->pending_load_len = 0;
+    vcrypto->pending_load_valid = 0;
+
+    rte_spinlock_unlock(&vcrypto->pending_lock);
+
+    VC_LOG_INFO("Applying deferred CRYPTO_LOAD now (vid=%d why=%s len=%zu)",
+                vid, why, len);
+
+    /* 3) 真正执行 load（锁外重活） */
+    rc = vhost_crypto_load_state(vid, buf, len);
+
+    /* 4) 收尾：成功 free；失败放回 pending 以便后续触发点重试 */
+    rte_spinlock_lock(&vcrypto->pending_lock);
+
+    if (rc == 0) {
+        vcrypto->pending_applying = 0;
+
+        vcrypto->load_failed = 0;
+        vcrypto->last_load_rc = 0;
+        vcrypto->load_fail_cnt = 0;
+
+        rte_spinlock_unlock(&vcrypto->pending_lock);
+
+        uint32_t applied_crc = vc_crc32(buf, (uint32_t)len);
+        vcrypto->last_applied_blob_crc = applied_crc;
+        vcrypto->last_applied_blob_len = len;
+
+        rte_free(buf);
+        VC_LOG_INFO("Deferred LOAD OK (vid=%d)", vid);
+        return;
+    }
+
+    /* 失败：把 buf 放回去，允许重试；清 applying */
+    vcrypto->pending_load_buf = buf;
+    vcrypto->pending_load_len = len;
+    vcrypto->pending_load_valid = 1;
+    vcrypto->pending_applying = 0;
+
+    vcrypto->load_failed = 1;
+    vcrypto->last_load_rc = rc;
+    vcrypto->load_fail_cnt++;
+
+    rte_spinlock_unlock(&vcrypto->pending_lock);
+
+    VC_LOG_ERR("Deferred LOAD failed (vid=%d rc=%d) keep pending for retry",
+               vid, rc);
+}
+
+
+
 
 static enum rte_vhost_msg_result
 vhost_crypto_msg_post_handler(int vid, void *msg)
@@ -760,6 +1222,8 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 	struct virtio_net *dev = get_device(vid);
 	struct vhost_crypto *vcrypto;
 	struct vhu_msg_context *ctx = msg;
+	VC_LOG_INFO("TAG_CTRL_POST vid=%d req=%u fd_num=%u",
+            vid, ctx->msg.request.frontend, ctx->fd_num);
 	enum rte_vhost_msg_result ret = RTE_VHOST_MSG_RESULT_OK;
 
 	if (dev == NULL) {
@@ -776,19 +1240,243 @@ vhost_crypto_msg_post_handler(int vid, void *msg)
 
 	switch (ctx->msg.request.frontend) {
 	case VHOST_USER_CRYPTO_CREATE_SESS:
-		vhost_crypto_create_sess(vcrypto,
-				&ctx->msg.payload.crypto_session);
+		vhost_crypto_create_sess(vcrypto, &ctx->msg.payload.crypto_session);
 		ctx->fd_num = 0;
 		ret = RTE_VHOST_MSG_RESULT_REPLY;
 		break;
+
 	case VHOST_USER_CRYPTO_CLOSE_SESS:
 		if (vhost_crypto_close_sess(vcrypto, ctx->msg.payload.u64))
 			ret = RTE_VHOST_MSG_RESULT_ERR;
+		break;
+	
+	case VHOST_USER_SET_STATUS: 
+		uint8_t st = (uint8_t)ctx->msg.payload.u64;
+		/* DRIVER_OK 置位：允许数据面开始工作；迁移恢复后也会走到这里 */
+		if (st & VIRTIO_DEVICE_STATUS_DRIVER_OK) {
+			(void)vhost_crypto_thaw(vid);
+		}
+		ret = RTE_VHOST_MSG_RESULT_NOT_HANDLED; /* 让原生 handler 继续处理 */
+		break;
+	
+	/* ---- migration extensions ---- */
+	case VHOST_USER_CRYPTO_TEST:
+    test_save_load_blob(vid);
+    break;
+
+	case VHOST_USER_CRYPTO_FREEZE:
+		ret = (vhost_crypto_freeze(vid) == 0) ? RTE_VHOST_MSG_RESULT_OK
+											: RTE_VHOST_MSG_RESULT_ERR;
+		break;
+
+	case VHOST_USER_CRYPTO_SAVE: {
+		int fd = (ctx->fd_num > 0) ? ctx->fds[0] : -1;
+		ctx->fds[0] = -1;
+		ctx->fd_num = 0;
+
+		if (fd < 0) {
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* 关键：SAVE 必须在 freeze 之后进行，否则导出状态不一致 */
+		struct virtio_net *dev = get_device(vid);
+		struct vhost_crypto *vcrypto = dev ? dev->extern_data : NULL;
+		if (!dev || !vcrypto) {
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* Freeze only when we are actually snapshotting backend state */
+		int fr = vhost_crypto_freeze(vid);
+		while (fr == -EBUSY) {
+			rte_delay_us_block(100);
+			fr = vhost_crypto_freeze(vid);
+		}
+		if (fr < 0) {
+			VC_LOG_ERR("SAVE: freeze failed (vid=%d ret=%d)", vid, fr);
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		/* 保险：哪怕 freeze 已经做过，也再确认一下 quiescent */
+		if (__atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE) != 0) {
+			VC_LOG_ERR("SAVE while inflight!=0 (vid=%d inflight=%u)",
+					vid, __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE));
+			close(fd);
+			ret = RTE_VHOST_MSG_RESULT_ERR;
+			break;
+		}
+
+		int rc = vhost_crypto_save_state(vid, fd);
+
+		/* 建议：写完后 flush 一下，减少目的端读到半截的概率 */
+		if (rc == 0) {
+			(void)fsync(fd);
+		}
+
+		close(fd);
+		ret = (rc == 0) ? RTE_VHOST_MSG_RESULT_OK : RTE_VHOST_MSG_RESULT_ERR;
+		break;
+	}
+
+
+	case VHOST_USER_CRYPTO_LOAD: {
+			int fd = (ctx->fd_num > 0) ? ctx->fds[0] : -1;
+			ctx->fds[0] = -1;
+			ctx->fd_num = 0;
+
+			if (fd < 0) {
+					VC_LOG_ERR("CRYPTO_LOAD missing fd (vid=%d)", vid);
+					ret = RTE_VHOST_MSG_RESULT_ERR;
+					break;
+			}
+			uint8_t *p = (uint8_t *)&ctx->msg;
+			VC_LOG_INFO("CRYPTO_LOAD hdr: vid=%d fd_num=%d size=%u",
+						vid, ctx->fd_num, ctx->msg.size);
+
+			/* hexdump 前 32 字节（含 hdr + u64 payload），避免结构体差异时啥都看不到 */
+			char hex[32 * 3 + 1] = {0};
+			size_t dump_n = 32;
+			for (size_t i = 0; i < dump_n; i++) {
+				snprintf(&hex[i * 3], 4, "%02x ", p[i]);
+			}
+			VC_LOG_INFO("CRYPTO_LOAD raw32: %s", hex);
+
+			/* QEMU should send msg.size=8 and payload.u64 = blob_len */
+			if (ctx->msg.size != sizeof(uint64_t)) {
+					VC_LOG_ERR("CRYPTO_LOAD bad msg.size=%u (expect 8) vid=%d",
+							ctx->msg.size, vid);
+					close(fd);
+					ret = RTE_VHOST_MSG_RESULT_ERR;
+					break;
+			}
+
+			size_t blob_len = (size_t)FROMLE64(ctx->msg.payload.u64);
+			if (blob_len == 0 || blob_len > (64u << 20)) {
+					VC_LOG_ERR("CRYPTO_LOAD bad blob_len=%zu vid=%d", blob_len, vid);
+					close(fd);
+					ret = RTE_VHOST_MSG_RESULT_ERR;
+					break;
+			}
+
+			void *buf = rte_malloc(NULL, blob_len, 0);
+			if (!buf) {
+					VC_LOG_ERR("CRYPTO_LOAD rte_malloc(%zu) failed vid=%d", blob_len, vid);
+					close(fd);
+					ret = RTE_VHOST_MSG_RESULT_ERR;
+					break;
+			}
+
+			/* Read exactly blob_len bytes; DO NOT wait for EOF (deadlocks with QEMU wait_reply) */
+			size_t off = 0;
+			while (off < blob_len) {
+					ssize_t n = read(fd, (uint8_t *)buf + off, blob_len - off);
+					if (n > 0) {
+							off += (size_t)n;
+							continue;
+					}
+					if (n == 0) {
+							VC_LOG_ERR("CRYPTO_LOAD unexpected EOF (got=%zu want=%zu) vid=%d",
+									off, blob_len, vid);
+							rte_free(buf);
+							close(fd);
+							ret = RTE_VHOST_MSG_RESULT_ERR;
+							break;
+					}
+					if (errno == EINTR)
+							continue;
+
+					VC_LOG_ERR("CRYPTO_LOAD read error errno=%d vid=%d", errno, vid);
+					rte_free(buf);
+					close(fd);
+					ret = RTE_VHOST_MSG_RESULT_ERR;
+					break;
+			}
+
+			close(fd);
+
+			if (ret == RTE_VHOST_MSG_RESULT_ERR) {
+					/* buf already freed on error paths above */
+					break;
+			}
+
+			/* ---- dedup: ignore duplicate blobs that were already applied ---- */
+			uint32_t blob_crc = vc_crc32(buf, (uint32_t)blob_len);
+
+			rte_spinlock_lock(&vcrypto->pending_lock);
+
+			/* 如果这份 blob 已经成功 apply 过，直接丢弃，避免重复 restore */
+			if (vcrypto->last_applied_blob_len == blob_len &&
+				vcrypto->last_applied_blob_crc == blob_crc) {
+				rte_spinlock_unlock(&vcrypto->pending_lock);
+				VC_LOG_INFO("CRYPTO_LOAD duplicate ignored (vid=%d len=%zu crc=0x%x)",
+							vid, blob_len, blob_crc);
+				rte_free(buf);
+				ret = RTE_VHOST_MSG_RESULT_OK;
+				break;
+			}
+
+			/* 正在 apply 时，如果又来一份 LOAD：直接覆盖旧 pending（更符合“最后一次为准”） */
+			if (vcrypto->pending_load_valid && vcrypto->pending_load_buf) {
+				rte_free(vcrypto->pending_load_buf);
+				vcrypto->pending_load_buf = NULL;
+				vcrypto->pending_load_len = 0;
+				vcrypto->pending_load_valid = 0;
+			}
+
+			vcrypto->pending_load_buf = (uint8_t *)buf;
+			vcrypto->pending_load_len = blob_len;
+			vcrypto->pending_load_valid = 1;
+
+			rte_spinlock_unlock(&vcrypto->pending_lock);
+
+			VC_LOG_INFO("CRYPTO_LOAD cached blob_len=%zu vid=%d crc=0x%x", blob_len, vid, blob_crc);
+
+			ret = RTE_VHOST_MSG_RESULT_OK;
+			break;
+
+	}
+
+
+
+	case VHOST_USER_CRYPTO_THAW:
+		ret = (vhost_crypto_thaw(vid) == 0) ? RTE_VHOST_MSG_RESULT_OK
+											: RTE_VHOST_MSG_RESULT_ERR;
+		break;
+
+	/* 可选：仅在宏存在时编译，避免报未定义 */
+	#ifdef VHOST_USER_SUSPEND
+	case VHOST_USER_SUSPEND:
+		ret = (vhost_crypto_freeze(vid) == 0) ? RTE_VHOST_MSG_RESULT_OK
+											: RTE_VHOST_MSG_RESULT_ERR;
+		break;
+	#endif
+
+	#ifdef VHOST_USER_RESUME
+	case VHOST_USER_RESUME:
+		ret = (vhost_crypto_thaw(vid) == 0) ? RTE_VHOST_MSG_RESULT_OK
+											: RTE_VHOST_MSG_RESULT_ERR;
+		break;
+	#endif
+
+	case VHOST_USER_SET_MEM_TABLE:
+	case VHOST_USER_SET_VRING_ADDR:
+	case VHOST_USER_SET_VRING_NUM:
+	case VHOST_USER_SET_VRING_BASE:
+	case VHOST_USER_SET_VRING_KICK:
+		/* 这些必须让 vhost core 去真正配置队列/内存，我们这里只做“配置后尝试 apply pending” */
+		ret = RTE_VHOST_MSG_RESULT_NOT_HANDLED;
+
+		vhost_crypto_try_apply_pending_load(vid, dev, vcrypto, "cfg-msg-post");
 		break;
 	default:
 		ret = RTE_VHOST_MSG_RESULT_NOT_HANDLED;
 		break;
 	}
+
 
 	return ret;
 }
@@ -1564,7 +2252,7 @@ static __rte_always_inline int
 vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 		struct vhost_virtqueue *vq, struct rte_crypto_op *op,
 		struct vring_desc *head, struct vhost_crypto_desc *descs,
-		uint16_t desc_idx, struct rte_mbuf *mbuf)
+		uint16_t used_idx, uint16_t head_idx)
 	__rte_requires_shared_capability(&vq->iotlb_lock)
 {
 	struct vhost_crypto_data_req *vc_req, *vc_req_out;
@@ -1573,7 +2261,7 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 	struct vhost_crypto_data_req data_req = {0};
 	struct vhost_crypto_session *vhost_session;
 	struct vhost_crypto_desc *desc = descs;
-	uint32_t nb_descs = 0, max_n_descs, i;
+	uint32_t nb_descs = 0, max_n_descs = 0, i;
 	struct virtio_crypto_op_data_req req;
 	struct virtio_crypto_inhdr *inhdr;
 	struct vring_desc *src_desc;
@@ -1582,13 +2270,17 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 	int err;
 
 	vc_req = &data_req;
-	vc_req->desc_idx = desc_idx;
-	vc_req->dev = vcrypto->dev;
-	vc_req->vq = vq;
+	vc_req->used_idx = used_idx;   /* ring slot */
+	vc_req->head_idx = head_idx;   /* descriptor head index */
+	vc_req->dev = vcrypto->dev;          /* IOVA_TO_VVA 等还会用到 */
+    vc_req->vq  = vq;
+	vc_req->vcrypto = vcrypto;           /* 新增：用于 completion 时做 inflight-- */
+
 
 	if (unlikely((head->flags & VRING_DESC_F_INDIRECT) == 0)) {
-		VC_LOG_ERR("Invalid descriptor");
-		return -1;
+        VC_LOG_ERR("Invalid descriptor");
+        err = VIRTIO_CRYPTO_BADMSG;
+        goto error_exit;
 	}
 
 	dlen = head->len;
@@ -1736,9 +2428,6 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 
 		asym_session = vcrypto->cache_asym_session;
 		op->type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
-		// fixme
-		if (mbuf != NULL)
-			rte_mempool_put(mbuf->pool, (void *)mbuf);
 
 		err = rte_crypto_op_attach_asym_session(op, asym_session);
 		if (unlikely(err < 0)) {
@@ -1784,86 +2473,163 @@ error_exit:
 
 static __rte_always_inline struct vhost_virtqueue *
 vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
-		struct vhost_virtqueue *old_vq)
+        struct vhost_virtqueue *old_vq)
 {
-	struct rte_mbuf *m_src = NULL, *m_dst = NULL;
-	struct vhost_crypto_data_req *vc_req;
-	struct vhost_virtqueue *vq;
-	uint16_t used_idx, desc_idx;
+    struct rte_mbuf *m_src = NULL, *m_dst = NULL;
+    struct vhost_crypto_data_req *vc_req;
+    struct vhost_virtqueue *vq;
+    uint16_t used_idx, desc_idx;
 
-	if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
-		m_src = op->sym->m_src;
-		m_dst = op->sym->m_dst;
-		vc_req = rte_mbuf_to_priv(m_src);
-	} else if (op->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
-		// vc_req = rte_cryptodev_asym_session_get_user_data(op->asym->session);
-		vc_req = rte_crypto_op_ctod_offset(op, uint8_t *, IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
-	} else {
-		VC_LOG_ERR("Invalid crypto op type");
-		return NULL;
-	}
+    if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+        m_src = op->sym->m_src;
+        m_dst = op->sym->m_dst;
+        vc_req = rte_mbuf_to_priv(m_src);
+    } else if (op->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+        vc_req = rte_crypto_op_ctod_offset(op, uint8_t *,
+                IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
+    } else {
+        VC_LOG_ERR("Invalid crypto op type");
+        return NULL;
+    }
 
-	if (unlikely(!vc_req)) {
-		VC_LOG_ERR("Failed to retrieve vc_req");
-		return NULL;
-	}
-	vq = vc_req->vq;
-	used_idx = vc_req->desc_idx;
+    if (unlikely(!vc_req)) {
+        VC_LOG_ERR("Failed to retrieve vc_req");
+        return NULL;
+    }
 
-	if (old_vq && (vq != old_vq))
-		return vq;
+    vq = vc_req->vq;
+    used_idx = vc_req->used_idx;
+    desc_idx = vc_req->head_idx;
 
-	if (unlikely(op->status != RTE_CRYPTO_OP_STATUS_SUCCESS))
-		vc_req->inhdr->status = VIRTIO_CRYPTO_ERR;
-	else {
-		if (vc_req->zero_copy == 0)
-			write_back_data(vc_req);
-	}
+    if (unlikely(vq == NULL))
+        return NULL;
 
-	desc_idx = vq->avail->ring[used_idx];
-	vq->used->ring[desc_idx].id = vq->avail->ring[desc_idx];
-	vq->used->ring[desc_idx].len = vc_req->len;
+    /*
+     * IMPORTANT RULE:
+     * If vring is not safe to touch (reconfig/migration window),
+     * do NOT free buffers and do NOT pretend success.
+     * Leave op intact so upper layer can retry later.
+     */
+    if (unlikely(rte_rwlock_read_trylock(&vq->access_lock) != 0)) {
+        return NULL;
+    }
 
-	if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
-		rte_mempool_put(m_src->pool, (void *)m_src);
-		if (m_dst)
-			rte_mempool_put(m_dst->pool, (void *)m_dst);
-	}
+    vhost_user_iotlb_rd_lock(vq);
 
-	return vq;
+    if (unlikely(!vq->access_ok || vq->avail == NULL || vq->used == NULL ||
+                 used_idx >= vq->size)) {
+        vhost_user_iotlb_rd_unlock(vq);
+        rte_rwlock_read_unlock(&vq->access_lock);
+        return NULL;
+    }
+
+    /* write-back for non-zero-copy path (touches guest mem, must be under lock) */
+    if (vc_req->wb)
+        write_back_data(vc_req);
+
+    /* Fill used ring entry (idx advance is done by the batch caller under SAME lock) */
+    vq->used->ring[used_idx].id  = desc_idx;
+    vq->used->ring[used_idx].len = vc_req->len;
+
+    vhost_user_iotlb_rd_unlock(vq);
+    rte_rwlock_read_unlock(&vq->access_lock);
+
+    /* Recycle writeback chain after successful write-back. */
+    if (vc_req->wb) {
+        free_wb_data(vc_req->wb, vc_req->wb_pool);
+        vc_req->wb = NULL;
+    }
+
+    /* Now it is safe to free mbufs: completion has been committed to used ring entry. */
+    if (m_dst && m_dst != m_src)
+        rte_pktmbuf_free(m_dst);
+    if (m_src)
+        rte_pktmbuf_free(m_src);
+
+    return vq;
 }
+
+
 
 static __rte_always_inline uint16_t
 vhost_crypto_complete_one_vm_requests(struct rte_crypto_op **ops,
-		uint16_t nb_ops, int *callfd)
+        uint16_t nb_ops, int *callfd)
 {
-	uint16_t processed = 1;
-	struct vhost_virtqueue *vq, *tmp_vq;
+    uint16_t processed = 0;
+    struct vhost_virtqueue *vq, *tmp_vq;
 
-	if (unlikely(nb_ops == 0))
-		return 0;
+    if (unlikely(nb_ops == 0))
+        return 0;
 
-	vq = vhost_crypto_finalize_one_request(ops[0], NULL);
-	if (unlikely(vq == NULL))
-		return 0;
-	tmp_vq = vq;
+    /*
+     * First op: try to finalize used entry.
+     * If vring not ready, finalize_one_request returns NULL and we return 0
+     * so upper layer keeps ops and retries later (NO DROP).
+     */
+    vq = vhost_crypto_finalize_one_request(ops[0], NULL);
+    if (unlikely(vq == NULL))
+        return 0;
 
-	while ((processed < nb_ops)) {
-		tmp_vq = vhost_crypto_finalize_one_request(ops[processed],
-				tmp_vq);
+    processed = 1;
+    tmp_vq = vq;
 
-		if (unlikely(vq != tmp_vq))
-			break;
+    while (processed < nb_ops) {
+        tmp_vq = vhost_crypto_finalize_one_request(ops[processed], tmp_vq);
+        if (unlikely(tmp_vq == NULL || tmp_vq != vq))
+            break;
+        processed++;
+    }
 
-		processed++;
-	}
+    /*
+     * Now we must advance used->idx under protection, otherwise vring_invalidate()
+     * can NULL out vq->used between finalize and idx increment (your crash).
+     */
+    if (unlikely(rte_rwlock_read_trylock(&vq->access_lock) != 0)) {
+        /* vring reconfig window: do not consume ops, retry later */
+        return 0;
+    }
 
-	*callfd = vq->callfd;
+    vhost_user_iotlb_rd_lock(vq);
+    if (unlikely(!vq->access_ok || vq->used == NULL)) {
+        vhost_user_iotlb_rd_unlock(vq);
+        rte_rwlock_read_unlock(&vq->access_lock);
+        return 0;
+    }
 
-	*(volatile uint16_t *)&vq->used->idx += processed;
+    *callfd = vq->callfd;
 
-	return processed;
+    *(volatile uint16_t *)&vq->used->idx += processed;
+    vq->last_used_idx += processed;
+
+    vhost_user_iotlb_rd_unlock(vq);
+    rte_rwlock_read_unlock(&vq->access_lock);
+
+    /*
+     * inflight accounting MUST correspond to "committed to used ring".
+     * We decrement AFTER idx update succeeded.
+     */
+    if (likely(processed != 0)) {
+        struct rte_mbuf *m_src = ops[0]->sym ? ops[0]->sym->m_src : NULL;
+        struct vhost_crypto_data_req *vc_req = m_src ? rte_mbuf_to_priv(m_src) : NULL;
+        struct vhost_crypto *vcrypto = vc_req ? vc_req->vcrypto : NULL;
+
+        if (likely(vcrypto)) {
+            uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
+            if (unlikely(cur < processed)) {
+                VC_LOG_ERR("inflight underflow cur=%u sub=%u (BUG)", cur, processed);
+                __atomic_store_n(&vcrypto->inflight_corrupt, 1, __ATOMIC_RELEASE);
+                __atomic_store_n(&vcrypto->inflight, 0, __ATOMIC_RELEASE);
+            } else {
+                __atomic_fetch_sub(&vcrypto->inflight, processed, __ATOMIC_ACQ_REL);
+            }
+        } else {
+            VC_LOG_ERR("inflight sub skipped: missing vcrypto in op priv (BUG)");
+        }
+    }
+
+    return processed;
 }
+
 
 RTE_EXPORT_SYMBOL(rte_vhost_crypto_driver_start)
 int
@@ -1879,7 +2645,7 @@ rte_vhost_crypto_driver_start(const char *path)
 	ret = rte_vhost_driver_get_protocol_features(path, &protocol_features);
 	if (ret)
 		return -1;
-	protocol_features |= (1ULL << VHOST_USER_PROTOCOL_F_CONFIG);
+	//protocol_features |= (1ULL << VHOST_USER_PROTOCOL_F_CONFIG);
 	ret = rte_vhost_driver_set_protocol_features(path, protocol_features);
 	if (ret)
 		return -1;
@@ -1919,6 +2685,21 @@ rte_vhost_crypto_create(int vid, uint8_t cryptodev_id,
 	vcrypto->dev = dev;
 	vcrypto->option = RTE_VHOST_CRYPTO_ZERO_COPY_DISABLE;
 
+	/* pending-load init (for deferred CRYPTO_LOAD) */
+	rte_spinlock_init(&vcrypto->pending_lock);
+	vcrypto->pending_load_buf = NULL;
+	vcrypto->pending_load_len = 0;
+	vcrypto->pending_load_valid = 0;
+	vcrypto->pending_applying = 0;
+
+	/* restore failure bookkeeping (must be deterministic) */
+	vcrypto->load_failed = 0;
+	vcrypto->last_load_rc = 0;
+	vcrypto->load_fail_cnt = 0;
+	vcrypto->last_applied_blob_crc = 0;
+	vcrypto->last_applied_blob_len = 0;
+
+
 	snprintf(name, 127, "HASH_VHOST_CRYPT_%u", (uint32_t)vid);
 	params.name = name;
 	params.entries = VHOST_CRYPTO_SESSION_MAP_ENTRIES;
@@ -1957,14 +2738,28 @@ rte_vhost_crypto_create(int vid, uint8_t cryptodev_id,
 	}
 
 	dev->extern_data = vcrypto;
-	dev->extern_ops.pre_msg_handle = NULL;
+	dev->extern_ops.pre_msg_handle = vhost_crypto_msg_pre_handler;;
 	dev->extern_ops.post_msg_handle = vhost_crypto_msg_post_handler;
 
 	return 0;
 
 error_exit:
-	rte_hash_free(vcrypto->session_map);
-	rte_mempool_free(vcrypto->mbuf_pool);
+	/* pending buffer cleanup */
+	rte_spinlock_lock(&vcrypto->pending_lock);
+	if (vcrypto->pending_load_valid && vcrypto->pending_load_buf) {
+		rte_free(vcrypto->pending_load_buf);
+		vcrypto->pending_load_buf = NULL;
+		vcrypto->pending_load_len = 0;
+		vcrypto->pending_load_valid = 0;
+	}
+	rte_spinlock_unlock(&vcrypto->pending_lock);
+
+	if (vcrypto->session_map)
+		rte_hash_free(vcrypto->session_map);
+	if (vcrypto->mbuf_pool)
+		rte_mempool_free(vcrypto->mbuf_pool);
+	if (vcrypto->wb_pool)
+		rte_mempool_free(vcrypto->wb_pool);
 
 	rte_free(vcrypto);
 
@@ -1988,6 +2783,16 @@ rte_vhost_crypto_free(int vid)
 		VC_LOG_ERR("Cannot find required data, is it initialized?");
 		return -ENOENT;
 	}
+
+	/* free pending load buffer if any */
+	rte_spinlock_lock(&vcrypto->pending_lock);
+	if (vcrypto->pending_load_valid && vcrypto->pending_load_buf) {
+		rte_free(vcrypto->pending_load_buf);
+		vcrypto->pending_load_buf = NULL;
+		vcrypto->pending_load_len = 0;
+		vcrypto->pending_load_valid = 0;
+	}
+	rte_spinlock_unlock(&vcrypto->pending_lock);
 
 	rte_hash_free(vcrypto->session_map);
 	rte_mempool_free(vcrypto->mbuf_pool);
@@ -2057,6 +2862,85 @@ rte_vhost_crypto_set_zero_copy(int vid, enum rte_vhost_crypto_zero_copy option)
 	return 0;
 }
 
+static inline void
+vhost_crypto_dump_ready(struct virtio_net *dev, uint32_t qid)
+{
+    struct vhost_virtqueue *vq = (dev && qid < dev->nr_vring) ? dev->virtqueue[qid] : NULL;
+
+    VC_LOG_INFO("READYCHK: mem=%p nreg=%u vq=%p size=%u desc=%p avail=%p used=%p kick=%d call=%d ready=%d access_ok=%d",
+        dev ? dev->mem : NULL,
+        (dev && dev->mem) ? dev->mem->nregions : 0,
+        vq,
+        vq ? vq->size : 0,
+        vq ? vq->desc : NULL,
+        vq ? vq->avail : NULL,
+        vq ? vq->used : NULL,
+        vq ? vq->kickfd : -1,
+        vq ? vq->callfd : -1,
+        vq ? vq->ready : 0,
+        vq ? vq->access_ok : 0);
+}
+
+static __rte_always_inline int
+vhost_crypto_vq_usable(struct vhost_virtqueue *vq)
+{
+    bool access_ok;
+
+    if (!vq)
+        return 0;
+
+    /* Only consider enabled queues.
+     * If the protocol doesn't use SET_VRING_ENABLE, enabled is typically true by default.
+     */
+    if (!vq->enabled)
+        return 0;
+
+    /* SET_VRING_NUM */
+    if (vq->size == 0)
+        return 0;
+
+    /* split ring tables must exist */
+    if (!vq->desc || !vq->avail || !vq->used)
+        return 0;
+
+    /* access_ok is guarded by access_lock */
+    rte_rwlock_read_lock(&vq->access_lock);
+    access_ok = vq->access_ok;
+    rte_rwlock_read_unlock(&vq->access_lock);
+
+    if (!vq->ready || !access_ok)
+        return 0;
+
+    return 1;
+}
+
+static inline int
+vhost_crypto_device_ready(struct virtio_net *dev)
+{
+    if (!dev || !dev->mem || dev->mem->nregions == 0)
+        return 0;
+
+    /* Hard gate: do NOT restore device state before DRIVER_OK.
+     * Cross-host migration has more message re-ordering/jitter; restoring too early is fragile.
+     */
+    if (!(dev->status & VIRTIO_DEVICE_STATUS_DRIVER_OK))
+        return 0;
+
+    if (dev->nr_vring == 0)
+        return 0;
+
+    /* Any usable (enabled) queue is enough.
+     * Requiring "all enabled queues" is fragile and can stall migration.
+     */
+    for (uint32_t qid = 0; qid < dev->nr_vring; qid++) {
+        if (vhost_crypto_vq_usable(dev->virtqueue[qid]))
+            return 1;
+    }
+
+    return 0;
+}
+
+
 RTE_EXPORT_SYMBOL(rte_vhost_crypto_fetch_requests)
 uint16_t
 rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
@@ -2076,22 +2960,54 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 		VC_LOG_ERR("Invalid vid %i", vid);
 		return 0;
 	}
+	
+
+	vq = dev->virtqueue[qid];
+	if (unlikely(vq == NULL))
+		return 0;
 
 	if (unlikely(qid >= VHOST_MAX_QUEUE_PAIRS)) {
 		VC_LOG_ERR("Invalid qid %u", qid);
 		return 0;
 	}
 
+	/* 先拿 vcrypto：这是 host 侧结构，不碰 vring/guest 内存，安全 */
 	vcrypto = (struct vhost_crypto *)dev->extern_data;
 	if (unlikely(vcrypto == NULL)) {
 		VC_LOG_ERR("Cannot find required data, is it initialized?");
 		return 0;
 	}
 
-	vq = dev->virtqueue[qid];
+	/* ✅ FREEZE 语义：冻结时不抓取新 descriptor（纯 backpressure，不改 vring 索引） */
+	if (unlikely(__atomic_load_n(&vcrypto->frozen, __ATOMIC_ACQUIRE))) {
+		return 0;
+	}
+	 /* Migration restore is pending/applying: do not process requests yet.
+     * This provides safe backpressure and avoids "Failed to find session".
+     */
+    if (unlikely(__atomic_load_n(&vcrypto->pending_load_valid, __ATOMIC_ACQUIRE) ||
+                 __atomic_load_n(&vcrypto->pending_applying, __ATOMIC_ACQUIRE))) {
+        return 0;
+    }
+
+	/* access_ok 是硬门：没开就绝对不要触碰 vring/guest 内存 */
+	if (unlikely(!vq->access_ok)) {
+		static int once;
+		if (!once) {
+			once = 1;
+			VC_LOG_ERR("TAG_FETCH_GATE vid=%d qid=%u status=0x%x ready=%d access_ok=%d",
+					vid, qid, dev->status, vq->ready, vq->access_ok);
+		}
+		return 0;
+	}
 
 	if (unlikely(vq == NULL)) {
-		VC_LOG_ERR("Invalid virtqueue %u", qid);
+		VC_LOG_ERR("TAG_FETCH_INVALID_VQ vid=%d qid=%u flags=0x%x dev=%p vq=%p",
+           vid, qid, dev->flags, dev, vq);
+		   VC_LOG_ERR("TAG_FETCH_INVALID_VQ_MORE vid=%d qid=%u extern=%p frozen=%d inflight=%u",
+           vid, qid, dev->extern_data,
+           dev->extern_data ? ((struct vhost_crypto*)dev->extern_data)->frozen : -1,
+           dev->extern_data ? __atomic_load_n(&((struct vhost_crypto*)dev->extern_data)->inflight, __ATOMIC_ACQUIRE) : 0);
 		return 0;
 	}
 
@@ -2105,7 +3021,7 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 	}
 
 	avail_idx = *((volatile uint16_t *)&vq->avail->idx);
-	start_idx = vq->last_used_idx;
+	start_idx = vq->last_avail_idx;
 	count = avail_idx - start_idx;
 	count = RTE_MIN(count, VHOST_CRYPTO_MAX_BURST_SIZE);
 	count = RTE_MIN(count, nb_ops);
@@ -2118,8 +3034,6 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 	 */
 	switch (vcrypto->option) {
 	case RTE_VHOST_CRYPTO_ZERO_COPY_ENABLE:
-			VC_LOG_ERR("%d", count);
-
 		if (unlikely(rte_mempool_get_bulk(vcrypto->mbuf_pool,
 				(void **)mbufs, count * 2) < 0)) {
 			VC_LOG_ERR("Insufficient memory");
@@ -2138,7 +3052,7 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 			op->sym->m_dst->data_off = 0;
 
 			if (unlikely(vhost_crypto_process_one_req(vcrypto, vq,
-					op, head, descs, used_idx, NULL) < 0))
+					op, head, descs, used_idx, desc_idx) < 0))
 				break;
 		}
 
@@ -2153,7 +3067,6 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 		if (unlikely(rte_mempool_get_bulk(vcrypto->mbuf_pool,
 				(void **)mbufs, count) < 0)) {
 			VC_LOG_ERR("Insufficient memory");
-			exit(0);
 			goto out_unlock;
 		}
 
@@ -2163,14 +3076,12 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 			struct vring_desc *head = &vq->desc[desc_idx];
 			struct rte_crypto_op *op = ops[i];
 
-			if (op->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
-				op->sym->m_src = mbufs[i];
-				op->sym->m_dst = NULL;
-				op->sym->m_src->data_off = 0;
-			}
+			op->sym->m_src = mbufs[i];
+			op->sym->m_dst = NULL;
+			op->sym->m_src->data_off = 0;
 
 			if (unlikely(vhost_crypto_process_one_req(vcrypto, vq,
-					op, head, descs, desc_idx, mbufs[i]) < 0))
+					op, head, descs, used_idx, desc_idx) < 0))
 				break;
 		}
 
@@ -2180,11 +3091,17 @@ rte_vhost_crypto_fetch_requests(int vid, uint32_t qid,
 					count - i);
 
 		break;
+	default:
+		VC_LOG_ERR("Unknown zero-copy option %d", vcrypto->option);
+		goto out_unlock;
 
 	}
 
-	vq->last_used_idx += i;
-
+	vq->last_avail_idx += i;
+	/* inflight accounting: ops fetched => now owned by backend until completion */
+	if (likely(i != 0)) {
+		__atomic_fetch_add(&vcrypto->inflight, i, __ATOMIC_ACQ_REL);
+	}
 out_unlock:
 	vhost_user_iotlb_rd_unlock(vq);
 	rte_rwlock_read_unlock(&vq->access_lock);
@@ -2205,8 +3122,11 @@ rte_vhost_crypto_finalize_requests(struct rte_crypto_op **ops,
 	while (left) {
 		count = vhost_crypto_complete_one_vm_requests(tmp_ops, left,
 				&callfd);
-		if (unlikely(count == 0))
+		if (unlikely(count == 0)) {
+			VC_LOG_ERR("TAG_FINALIZE_STUCK nb_ops=%u left=%u (likely vring not ready / stopped)",
+					nb_ops, left);
 			break;
+		}
 
 		tmp_ops = &tmp_ops[count];
 		left -= count;
@@ -2223,3 +3143,901 @@ rte_vhost_crypto_finalize_requests(struct rte_crypto_op **ops,
 
 	return nb_ops - left;
 }
+
+/* --- inflight accounting helpers (called by the worker) --- */
+void vhost_crypto_inflight_add(int vid, uint32_t n)
+{
+    if (n == 0) {
+        return;
+    }
+
+    struct virtio_net *dev = get_device(vid);
+    if (!dev || !dev->extern_data) {
+        return;
+    }
+
+    struct vhost_crypto *vcrypto = dev->extern_data;
+    __atomic_fetch_add(&vcrypto->inflight, n, __ATOMIC_ACQ_REL);
+}
+
+void vhost_crypto_inflight_sub(int vid, uint32_t n)
+{
+    if (n == 0) {
+        return;
+    }
+
+    struct virtio_net *dev = get_device(vid);
+    if (!dev || !dev->extern_data) {
+        return;
+    }
+
+    struct vhost_crypto *vcrypto = dev->extern_data;
+
+    uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
+    while (1) {
+        if (unlikely(cur < n)) {
+            VC_LOG_ERR("inflight underflow vid=%d cur=%u sub=%u (BUG)", vid, cur, n);
+            __atomic_store_n(&vcrypto->inflight_corrupt, 1, __ATOMIC_RELEASE);
+            /* Avoid wrap-around; keep system running but mark state as unsafe */
+            if (__atomic_compare_exchange_n(&vcrypto->inflight, &cur, 0,
+                                            false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                break;
+            }
+            continue;
+        }
+
+        uint32_t next = cur - n;
+        if (__atomic_compare_exchange_n(&vcrypto->inflight, &cur, next,
+                                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            break;
+        }
+		/* cur updated on failure */
+    }
+}
+
+
+int vhost_crypto_freeze(int vid) {
+    struct virtio_net *dev = get_device(vid);
+    if (!dev || !dev->extern_data)
+        return -ENOENT;
+    struct vhost_crypto *vcrypto = dev->extern_data;
+
+    if (unlikely(__atomic_load_n(&vcrypto->inflight_corrupt, __ATOMIC_ACQUIRE))) {
+        VC_LOG_ERR("FREEZE refused: inflight accounting corrupt (vid=%d)", vid);
+        return -EIO;
+    }	
+    /* Step 1: 设置冻结位，阻断新请求进入 */
+    __atomic_store_n(&vcrypto->frozen, 1, __ATOMIC_RELEASE);
+	VC_LOG_INFO("FREEZE_BEGIN vid=%d ts_ms=%llu",
+            vid, (unsigned long long)(rte_get_timer_cycles() * 1000ULL / rte_get_timer_hz()));
+	VC_LOG_INFO("TAG_FREEZE_STATE vid=%d frozen=%d inflight=%u",
+            vid, vcrypto->frozen,
+            __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE));
+    /* Step 2: 等待所有 inflight 请求完成（有界等待） */
+    const uint64_t hz = rte_get_timer_hz();
+    const uint64_t start = rte_get_timer_cycles();
+    const uint64_t deadline = start + 3 * hz;  // 最多等 3 秒
+    uint32_t last_inflight = UINT32_MAX;
+
+    while (1) {
+        uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
+        if (cur == 0) {
+            VC_LOG_INFO("FREEZE_OK vid=%d ts_ms=%llu",
+            vid, (unsigned long long)(rte_get_timer_cycles() * 1000ULL / rte_get_timer_hz()));
+		    break; /* quiescent state reached */
+        }
+
+        /* 打印进度日志（只在 inflight 变化时输出） */
+        if (cur != last_inflight) {
+            VC_LOG_INFO("FREEZE_DRAIN vid=%d inflight=%u ts_ms=%llu",
+            vid, cur, (unsigned long long)(rte_get_timer_cycles() * 1000ULL / rte_get_timer_hz()));
+            last_inflight = cur;
+        }
+
+        /* 超时退出 */
+        if (rte_get_timer_cycles() > deadline) {
+			VC_LOG_ERR("FREEZE timeout; inflight still=%u", cur);
+			__atomic_store_n(&vcrypto->frozen, 0, __ATOMIC_RELEASE); /* 回滚服务 */
+			return -EBUSY;
+		}
+
+        /* 小延迟防止忙等 */
+        rte_delay_us_block(10);
+    }
+
+	return 0;
+}
+
+static void dump_hex(const void *buf, size_t len) {
+    const uint8_t *p = buf;
+    for (size_t i = 0; i < len; ++i) {
+        if (i % 16 == 0) fprintf(stderr, "%04zx: ", i);
+        fprintf(stderr, "%02x ", p[i]);
+        if (i % 16 == 15 || i == len - 1) fprintf(stderr, "\n");
+    }
+}
+
+/* 把 vcrypto 的状态序列化到 buf；成功返回写入字节数，失败返回负错码 */
+static int
+vhost_crypto_save_state_mem(struct vhost_crypto *vcrypto, void *buf, size_t buf_len)
+{
+    uint8_t *p = buf, *end = (uint8_t*)buf + buf_len;
+    if (buf_len < sizeof(struct vc_snap_hdr)) return -ENOSPC;
+
+    struct vc_snap_hdr *hdr = (struct vc_snap_hdr *)p;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->magic   = TOLE32(VC_SNAP_MAGIC);
+    hdr->version = TOLE16(1);
+    hdr->hdr_len = TOLE16(sizeof(*hdr));
+    p += sizeof(*hdr);
+
+    // ---- DEV_META ----
+    struct vc_dev_meta_v1 meta = {
+		.cid= vcrypto->cid,          /* for validation/debug */
+        .last_session_id = vcrypto->last_session_id,
+    };
+    if (end - p < (ptrdiff_t)(sizeof(struct vc_tlv) + sizeof(meta))) return -ENOSPC;
+
+    struct vc_tlv *tlv = (struct vc_tlv *)p;
+    tlv->type = TOLE16(VC_TLV_DEV_META);
+    tlv->rsvd = 0;
+    tlv->len  = TOLE32((uint32_t)sizeof(meta));
+    p += sizeof(*tlv);
+    memcpy(p, &meta, sizeof(meta));
+    p += sizeof(meta);
+
+    fprintf(stderr, "[save_state] DEV_META: last_session_id=%lu\n", meta.last_session_id);
+
+    // ---- SESSION TLVs ----
+    uint32_t iter = 0;
+    const void *k;
+    void *d;
+    while (rte_hash_iterate(vcrypto->session_map, &k, &d, &iter) >= 0) {
+        struct vhost_crypto_session *s = (struct vhost_crypto_session *)d;
+        if (!s || !s->meta.valid) continue;
+
+        uint32_t desc_len, blob_len;
+        if (s->meta.kind == VC_SESS_SYM) {
+            desc_len = sizeof(s->meta.sym.desc);
+            blob_len = s->meta.sym.b.blob_len;
+        } else {
+            desc_len = sizeof(s->meta.asym.desc);
+            blob_len = s->meta.asym.b.blob_len;
+        }
+
+        struct vc_sess_head_v1 sh = {
+            .session_id = TOLE64(s->meta.session_id),
+            .kind       = s->meta.kind,
+            .flags      = 0,
+        };
+
+        uint32_t vlen = (uint32_t)(sizeof(sh) + desc_len + blob_len);
+        if (end - p < (ptrdiff_t)(sizeof(struct vc_tlv) + vlen)) return -ENOSPC;
+
+        tlv = (struct vc_tlv *)p;
+        tlv->type = TOLE16(VC_TLV_SESSION);
+        tlv->rsvd = 0;
+        tlv->len  = TOLE32(vlen);
+        p += sizeof(*tlv);
+
+        uint8_t *tlv_body_start = p;
+        memcpy(p, &sh, sizeof(sh)); p += sizeof(sh);
+        if (s->meta.kind == VC_SESS_SYM) {
+            memcpy(p, &s->meta.sym.desc, desc_len); p += desc_len;
+            if (blob_len) {
+				memcpy(p, s->meta.sym.b.blob, blob_len);
+			}
+			p += blob_len;
+        } else {
+            memcpy(p, &s->meta.asym.desc, desc_len); p += desc_len;
+            if (blob_len) {
+				memcpy(p, s->meta.asym.b.blob, blob_len);
+			}
+			p += blob_len;
+        }
+
+        fprintf(stderr, "[save_state] SESSION: sid=%lu kind=%u desc_len=%u blob_len=%u total=%u\n",
+                s->meta.session_id, s->meta.kind, desc_len, blob_len, vlen);
+        dump_hex(tlv_body_start, vlen);
+    }
+
+    uint32_t pay = (uint32_t)((uintptr_t)p - (uintptr_t)buf - sizeof(*hdr));
+    hdr->payload_len = TOLE32(pay);
+    hdr->crc32 = TOLE32(vc_crc32((uint8_t*)buf + sizeof(*hdr), pay));
+
+    fprintf(stderr, "[save_state] snapshot done. total=%td payload=%u\n",
+            (uintptr_t)p - (uintptr_t)buf, pay);
+    dump_hex(buf, (uintptr_t)p - (uintptr_t)buf);
+
+    return (int)((uintptr_t)p - (uintptr_t)buf);
+}
+
+static int read_full(int fd, void *buf, size_t len)
+{
+    uint8_t *p = (uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        if (n == 0) return -EIO;   /* EOF before we got enough */
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+
+static int write_full(int fd, const void *buf, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -errno;
+        }
+        if (n == 0) return -EIO;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+int vhost_crypto_save_state(int vid, int fd)
+{
+    struct vhost_crypto *vcrypto = vc_lookup(vid);
+    if (!vcrypto) return -ENOENT;
+
+    size_t cap = 256 * 1024;
+    const size_t cap_max = 32 * 1024 * 1024;
+    void *buf = NULL;
+    int nbytes = -1;
+
+    for (;;) {
+        if (buf) rte_free(buf);
+        buf = rte_zmalloc(NULL, cap, 0);
+        if (!buf) return -ENOMEM;
+
+        nbytes = vhost_crypto_save_state_mem(vcrypto, buf, cap);
+        if (nbytes == -ENOSPC) {
+            if (cap >= cap_max) { rte_free(buf); return -ENOSPC; }
+            cap <<= 1;
+            continue;
+        }
+        break;
+    }
+
+    if (nbytes < 0) { rte_free(buf); return nbytes; }
+
+    int rc = write_full(fd, buf, (size_t)nbytes);
+    rte_free(buf);
+    return rc;
+}
+
+static inline void
+vc_session_destroy(struct vhost_crypto *vcrypto, struct vhost_crypto_session *vs)
+{
+    if (!vs) return;
+
+    /* 1) free meta blob (wiping) */
+    if (vs->meta.valid) {
+        if (vs->meta.kind == VC_SESS_SYM) {
+            secure_free(vs->meta.sym.b.blob, vs->meta.sym.b.blob_len);
+            vs->meta.sym.b.blob = NULL;
+            vs->meta.sym.b.blob_len = 0;
+        } else if (vs->meta.kind == VC_SESS_ASYM) {
+            secure_free(vs->meta.asym.b.blob, vs->meta.asym.b.blob_len);
+            vs->meta.asym.b.blob = NULL;
+            vs->meta.asym.b.blob_len = 0;
+        }
+        vs->meta.valid = false;
+    }
+
+    /* 2) free dpdk session */
+    if (vs->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+        if (vs->sym) {
+            rte_cryptodev_sym_session_free(vcrypto->cid, vs->sym);
+            vs->sym = NULL;
+        }
+    } else if (vs->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+        if (vs->asym) {
+            rte_cryptodev_asym_session_free(vcrypto->cid, vs->asym);
+            vs->asym = NULL;
+        }
+    }
+
+    /* 3) free container */
+    rte_free(vs);
+}
+
+static struct vhost_crypto_session *
+vc_session_create_sym(struct vhost_crypto *vcrypto, uint64_t sid,
+                      const struct vc_sym_meta_v1 *D,
+                      const void *blob, uint32_t blob_len)
+{
+    struct rte_crypto_sym_xform xform1 = {0}, xform2 = {0};
+    struct rte_cryptodev_sym_session *sess = NULL;
+    struct vhost_crypto_session *vs = NULL;
+    int ret;
+
+    /* 1) 构造一个 VhostUserCryptoSymSessionParam，让现有 transform_* 走“同一套”映射逻辑 */
+    VhostUserCryptoSymSessionParam P;
+    memset(&P, 0, sizeof(P));
+
+    /* ——精确恢复三件套（你现在迁移失败最像是这里没恢复对）—— */
+    P.op_type     = (uint8_t)D->op_type;
+    P.dir         = (uint8_t)D->dir;
+    P.hash_mode   = (uint8_t)D->hash_mode;
+
+    /* 其他描述字段 */
+    P.chaining_dir    = (uint8_t)D->chain_mode;
+    P.cipher_algo     = (uint32_t)D->algo_cipher;
+    P.hash_algo       = (uint32_t)D->algo_auth;
+    P.aad_len         = (uint16_t)D->aad_len;
+    P.digest_len      = (uint16_t)D->tag_len;
+
+    /* 2) 从 blob 拆 key / auth_key（你保存端就是 key|auth_key 这么拼的） */
+    const uint8_t *p = (const uint8_t *)blob;
+
+    P.cipher_key_len = (uint16_t)D->key_len;
+    if (P.cipher_key_len) {
+        if (blob_len < P.cipher_key_len) {
+            VC_LOG_ERR("restore: blob too small sid=%" PRIu64
+                       " blob_len=%u cipher_key_len=%u",
+                       (uint64_t)sid, (unsigned)blob_len, (unsigned)P.cipher_key_len);
+            return NULL;
+        }
+        rte_memcpy(P.cipher_key_buf, p, P.cipher_key_len);
+        P.cipher_key = P.cipher_key_buf;
+        p += P.cipher_key_len;
+    }
+
+    P.auth_key_len = 0;
+    if (blob_len > P.cipher_key_len) {
+        P.auth_key_len = (uint16_t)(blob_len - P.cipher_key_len);
+        rte_memcpy(P.auth_key_buf, p, P.auth_key_len);
+        P.auth_key = P.auth_key_buf;
+    }
+
+    /* 需要 auth 但没给 auth_key：直接失败更清晰 */
+    if (P.hash_mode == VIRTIO_CRYPTO_SYM_HASH_MODE_AUTH &&
+        P.digest_len > 0 && P.hash_algo != 0 && P.auth_key_len == 0) {
+        VC_LOG_ERR("restore: auth required but auth_key missing sid=%" PRIu64
+                   " hash_algo=%u digest_len=%u",
+                   (uint64_t)sid, (unsigned)P.hash_algo, (unsigned)P.digest_len);
+        return NULL;
+    }
+
+    /* 3) 生成 xform：完全复用 DPDK vhost-crypto 自己的映射/方向设置逻辑 */
+    switch (P.op_type) {
+    case VIRTIO_CRYPTO_SYM_OP_NONE:
+    case VIRTIO_CRYPTO_SYM_OP_CIPHER:
+        ret = transform_cipher_param(&xform1, &P);
+        if (unlikely(ret)) {
+            VC_LOG_ERR("restore: transform_cipher_param failed sid=%" PRIu64 " ret=%d",
+                       (uint64_t)sid, ret);
+            return NULL;
+        }
+		VC_LOG_INFO("[restore][cipher][virtio] sid=%" PRIu64 " dir=%u cipher_algo=%u key_len=%u",
+					(uint64_t)sid, (unsigned)P.dir, (unsigned)P.cipher_algo, (unsigned)P.cipher_key_len);
+		VC_LOG_INFO("[restore][cipher][rte] sid=%" PRIu64 " algo=%u op=%u key_len=%u iv_len=%u iv_off=%u",
+					(uint64_t)sid,
+					(unsigned)xform1.cipher.algo,
+					(unsigned)xform1.cipher.op,
+					(unsigned)xform1.cipher.key.length,
+					(unsigned)xform1.cipher.iv.length,
+					(unsigned)xform1.cipher.iv.offset);
+
+        break;
+
+    case VIRTIO_CRYPTO_SYM_OP_ALGORITHM_CHAINING:
+        if (unlikely(P.hash_mode != VIRTIO_CRYPTO_SYM_HASH_MODE_AUTH)) {
+            VC_LOG_ERR("restore: chaining but hash_mode!=AUTH sid=%" PRIu64
+                       " hash_mode=%u",
+                       (uint64_t)sid, (unsigned)P.hash_mode);
+            return NULL;
+        }
+        xform1.next = &xform2;
+        ret = transform_chain_param(&xform1, &P);
+        if (unlikely(ret)) {
+            VC_LOG_ERR("restore: transform_chain_param failed sid=%" PRIu64 " ret=%d",
+                       (uint64_t)sid, ret);
+            return NULL;
+        }
+        break;
+
+    default:
+        VC_LOG_ERR("restore: unsupported op_type sid=%" PRIu64 " op_type=%u",
+                   (uint64_t)sid, (unsigned)P.op_type);
+        return NULL;
+    }
+
+    /* 4) 创建 cryptodev session */
+    sess = rte_cryptodev_sym_session_create(vcrypto->cid, &xform1, vcrypto->sess_pool);
+    if (!sess) {
+         /* 注意：P.cipher_algo 是 virtio 编号；真正给驱动的是 xform1.cipher.algo / xform1.cipher.iv.length */
+		VC_LOG_ERR("restore: rte_cryptodev_sym_session_create failed sid=%" PRIu64
+				" op_type=%u dir=%u hash_mode=%u"
+				" virtio_cipher_algo=%u virtio_hash_algo=%u"
+				" rte_cipher_algo=%u rte_iv_len=%u"
+				" key_len=%u digest_len=%u auth_key_len=%u rte_errno=%d",
+				(uint64_t)sid,
+				(unsigned)P.op_type, (unsigned)P.dir, (unsigned)P.hash_mode,
+				(unsigned)P.cipher_algo, (unsigned)P.hash_algo,
+				(unsigned)xform1.cipher.algo, (unsigned)xform1.cipher.iv.length,
+				(unsigned)P.cipher_key_len,
+				(unsigned)P.digest_len,
+				(unsigned)P.auth_key_len,
+				rte_errno);
+        return NULL;
+    }
+
+    /* 5) 分配 vhost 会话对象，并回填 meta（保持你迁移框架需要的结构） */
+    vs = rte_zmalloc(NULL, sizeof(*vs), 0);
+    if (!vs) {
+        VC_LOG_ERR("restore: alloc vhost_crypto_session failed sid=%" PRIu64, (uint64_t)sid);
+        rte_cryptodev_sym_session_free(vcrypto->cid, sess);
+        return NULL;
+    }
+
+    vs->type = RTE_CRYPTO_OP_TYPE_SYMMETRIC;
+    vs->sym  = sess;
+
+    vs->meta.valid      = true;
+    vs->meta.session_id = sid;
+    vs->meta.kind       = VC_SESS_SYM;
+    rte_memcpy(&vs->meta.sym.desc, D, sizeof(*D));
+
+    if (blob_len) {
+        vs->meta.sym.b.blob = rte_zmalloc(NULL, blob_len, 0);
+        if (!vs->meta.sym.b.blob) {
+            VC_LOG_ERR("restore: alloc meta blob failed sid=%" PRIu64 " blob_len=%u",
+                       (uint64_t)sid, (unsigned)blob_len);
+            rte_cryptodev_sym_session_free(vcrypto->cid, sess);
+            rte_free(vs);
+            return NULL;
+        }
+        rte_memcpy(vs->meta.sym.b.blob, blob, blob_len);
+        vs->meta.sym.b.blob_len = blob_len;
+    }
+
+    return vs;
+}
+
+
+
+void test_save_load_blob(int vid)
+{
+    const char *path = "/tmp/snap.bin";
+    int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        perror("open for save");
+        return;
+    }
+
+    if (vhost_crypto_save_state(vid, fd) < 0) {
+        fprintf(stderr, "[test] save_state failed\n");
+        close(fd);
+        return;
+    }
+    close(fd);
+    fprintf(stderr, "[test] save_state written to %s\n", path);
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open for load");
+        return;
+    }
+
+	uint8_t *tmp = NULL;
+	size_t tlen = 0;
+
+	if (read_all_from_fd(fd, &tmp, &tlen) < 0) {
+		fprintf(stderr, "[test] read_all_from_fd failed\n");
+		close(fd);
+		return;
+	}
+	close(fd);
+
+	if (vhost_crypto_load_state(vid, tmp, tlen) < 0) {
+		fprintf(stderr, "[test] load_state failed\n");
+		free(tmp);
+		return;
+	}
+	free(tmp);
+
+    close(fd);
+    fprintf(stderr, "[test] load_state success\n");
+}
+
+static struct vhost_crypto_session*
+vc_session_create_asym(struct vhost_crypto *vcrypto, uint64_t sid,
+                       const struct vc_asym_meta_v1 *A,
+                       const void *blob, uint32_t blob_len)
+{
+    if (!vcrypto || !A || !blob || !blob_len)
+        return NULL;
+
+    /* 目前只恢复 RSA，会话保存的是私钥 DER 原文 */
+    if (A->algo_asym != VIRTIO_CRYPTO_AKCIPHER_RSA)
+        return NULL;
+
+    /* 1) 先把只读 DER 拷到一块可写内存，避免 const-cast */
+    uint8_t *der_copy = dup_bytes_dpdk(blob, blob_len);
+    if (!der_copy)
+        return NULL;
+
+    struct rte_crypto_asym_xform ax;
+    memset(&ax, 0, sizeof(ax));
+
+    /* 2) DER -> xform: choose parser by saved key_type */
+	if (A->key_type == VIRTIO_CRYPTO_AKCIPHER_KEY_TYPE_PUBLIC) {
+		if (virtio_crypto_asym_rsa_public_der_to_xform(der_copy, blob_len, &ax) < 0) {
+			secure_free(der_copy, blob_len);
+			return NULL;
+		}
+		ax.rsa.key_type = RTE_RSA_KEY_TYPE_EXP;
+	} else if (A->key_type == VIRTIO_CRYPTO_AKCIPHER_KEY_TYPE_PRIVATE) {
+		if (virtio_crypto_asym_rsa_der_to_xform(der_copy, blob_len, &ax) < 0) {
+			secure_free(der_copy, blob_len);
+			return NULL;
+		}
+		ax.rsa.key_type = RTE_RSA_KEY_TYPE_QT;
+	} else {
+		secure_free(der_copy, blob_len);
+		return NULL;
+	}
+
+	/* parsed already, wipe temp DER copy */
+	secure_free(der_copy, blob_len);
+
+	/* 3) fixed xform type */
+	ax.xform_type = RTE_CRYPTO_ASYM_XFORM_RSA;
+
+    /* 4) 映射 virtio 的 padding 到 DPDK 的 padding type
+          注意：padding 在 A->u.rsa.padding_algo */
+    {
+        uint16_t pad = A->padding_algo;  /* ← 关键：使用 u.rsa 成员 */
+
+        switch (pad) {
+        case VIRTIO_CRYPTO_RSA_RAW_PADDING:
+            ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_NONE;
+            break;
+#ifdef VIRTIO_CRYPTO_RSA_PSS_PADDING
+        case VIRTIO_CRYPTO_RSA_PSS_PADDING:
+            ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PSS;
+            break;
+#endif
+        case VIRTIO_CRYPTO_RSA_PKCS1_PADDING:
+        default:
+            ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5;
+            break;
+        }
+    }
+
+    /* 5) 创建 cryptodev 非对称会话（签名按你工程封装来）
+          你给出的接口是：create(cid, &ax, pool, &out_sess) */
+    struct rte_cryptodev_asym_session *sess = NULL;
+    if (rte_cryptodev_asym_session_create(vcrypto->cid, &ax,
+                                          vcrypto->sess_pool, (void *)&sess) < 0 || !sess) {
+        return NULL;
+    }
+
+    /* 6) vhost 会话对象 + 回填 meta（保证再次 save 仍可复原） */
+    struct vhost_crypto_session *vs = rte_zmalloc(NULL, sizeof(*vs), 0);
+    if (!vs) {
+        rte_cryptodev_asym_session_free(vcrypto->cid, sess);
+        return NULL;
+    }
+
+    vs->type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
+    vs->asym = sess;
+
+    vs->meta.valid       = true;
+    vs->meta.session_id  = sid;
+    vs->meta.kind        = VC_SESS_ASYM;
+
+    memcpy(&vs->meta.asym.desc, A, sizeof(*A));
+
+    if (blob_len) {
+        vs->meta.asym.b.blob = rte_zmalloc(NULL, blob_len, 0);
+        if (!vs->meta.asym.b.blob) {
+            rte_cryptodev_asym_session_free(vcrypto->cid, sess);
+            rte_free(vs);
+            return NULL;
+        }
+        rte_memcpy(vs->meta.asym.b.blob, blob, blob_len);
+        vs->meta.asym.b.blob_len = blob_len;
+    }
+
+    return vs;
+}
+
+int vhost_crypto_load_state(int vid, const void *buf, size_t len)
+{
+    int fd = -1;
+#ifdef __linux__
+    fd = memfd_create("vhost-crypto-snap", 0);
+#endif
+    if (fd < 0) {
+        /* fallback: use tmpfile */
+        FILE *fp = tmpfile();
+        if (!fp)
+            return -errno;
+        fd = fileno(fp);
+        /* fp will be closed when process exits; ok for test/debug */
+    }
+
+    if (write_full(fd, buf, len) != 0) {
+        int e = -errno;
+        close(fd);
+        return e;
+    }
+
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        int e = -errno;
+        close(fd);
+        return e;
+    }
+
+    int rc = vhost_crypto_load_state_fd(vid, fd);
+    close(fd);
+    return rc;
+}
+
+
+/* Load: read header + payload from fd and rebuild backend state */
+static int vhost_crypto_load_state_fd(int vid, int fd)
+{
+    struct vhost_crypto *vcrypto = vc_lookup(vid);
+    if (unlikely(!vcrypto)) {
+        fprintf(stderr, "[load_state] vc_lookup(%d) failed\n", vid);
+        return -ENOENT;
+    }
+
+    struct vc_snap_hdr hdr;
+	int rc = read_full(fd, &hdr, sizeof(hdr));
+	if (rc) {
+		fprintf(stderr, "[load_state] failed to read header (%d)\n", rc);
+		return rc;
+	}
+
+    /* Now interpret the header */
+    if (FROMLE32(hdr.magic) != VC_SNAP_MAGIC) {
+        fprintf(stderr, "[load_state] bad magic: 0x%x\n",
+                FROMLE32(hdr.magic));
+        return -EINVAL;
+    }
+
+    if (FROMLE16(hdr.version) != 1) {
+        fprintf(stderr, "[load_state] unsupported version: %u\n",
+                FROMLE16(hdr.version));
+        return -EINVAL;
+    }
+
+    uint16_t hdr_len = FROMLE16(hdr.hdr_len);
+    uint32_t pay_len = FROMLE32(hdr.payload_len);
+
+    if (hdr_len < sizeof(hdr)) {
+        fprintf(stderr, "[load_state] invalid hdr_len: %u\n", hdr_len);
+        return -EINVAL;
+    }
+
+    /* rest = (header-extension) + payload(TLVs) */
+    size_t rest = (size_t)hdr_len - sizeof(hdr) + (size_t)pay_len;
+    
+	/* size cap: must match/save-side cap_max (or choose your own) */
+	const size_t rest_max = 32 * 1024 * 1024;  /* 32MB */
+	if (rest == 0 || rest > rest_max) {
+		fprintf(stderr, "[load_state] invalid rest size: %zu (hdr_len=%u pay_len=%u)\n",
+				rest, hdr_len, pay_len);
+		return -EINVAL;
+	}
+	
+	uint8_t *buf = rte_zmalloc(NULL, rest, 0);
+    if (!buf) {
+        fprintf(stderr, "[load_state] malloc failed, size=%zu\n", rest);
+        return -ENOMEM;
+    }
+
+    rc = read_full(fd, buf, rest);
+	if (rc) {
+		fprintf(stderr, "[load_state] failed to read payload (%d)\n", rc);
+		rte_free(buf);
+		return rc;
+	}
+
+    fprintf(stderr, "[load_state] full TLV region (hex), size=%zu:\n", rest);
+    dump_hex(buf, rest);
+
+    const uint8_t *tlv_base = buf + (hdr_len - sizeof(hdr));
+    uint32_t crc = vc_crc32(tlv_base, pay_len);
+    if (FROMLE32(hdr.crc32) != crc) {
+        fprintf(stderr, "[load_state] crc mismatch: got 0x%x expected 0x%x\n",
+                crc, FROMLE32(hdr.crc32));
+        rte_free(buf);
+        return -EINVAL;
+    }
+
+    const uint8_t *q    = tlv_base;
+    const uint8_t *qend = tlv_base + pay_len;
+
+    while (q + sizeof(struct vc_tlv) <= qend) {
+        const struct vc_tlv *tlv = (const struct vc_tlv *)q;
+        uint16_t t = FROMLE16(tlv->type);
+        uint32_t L = FROMLE32(tlv->len);
+
+        fprintf(stderr, "[load_state] TLV type=0x%x len=%u\n", t, L);
+
+        q += sizeof(*tlv);
+        if (q + L > qend) {
+            fprintf(stderr, "[load_state] TLV length overrun: L=%u\n", L);
+            rte_free(buf);
+            return -EINVAL;
+        }
+
+        if (t == VC_TLV_DEV_META) {
+            if (L < sizeof(struct vc_dev_meta_v1)) {
+                fprintf(stderr,
+                        "[load_state] DEV_META size too small: %u\n", L);
+                rte_free(buf);
+                return -EINVAL;
+            }
+
+            const struct vc_dev_meta_v1 *m = (const struct vc_dev_meta_v1 *)q;
+
+			uint32_t snap_cid  = FROMLE32(m->cid);
+			uint64_t snap_last = FROMLE64(m->last_session_id);
+
+			if (snap_cid != vcrypto->cid) {
+				fprintf(stderr,
+						"[load_state] WARN: snapshot cid=%u != local cid=%u (keep local)\n",
+						snap_cid, vcrypto->cid);
+			}
+
+			vcrypto->last_session_id = snap_last;
+
+			fprintf(stderr,
+					"[load_state] DEV_META: snapshot_cid=%u, local_cid=%u, last_sid=%lu\n",
+					snap_cid, vcrypto->cid, (unsigned long)snap_last);
+
+        } else if (t == VC_TLV_SESSION) {
+
+            const uint8_t *s = q;
+            if (L < sizeof(struct vc_sess_head_v1)) {
+                fprintf(stderr,
+                        "[load_state] SESSION head size too small: %u\n", L);
+                rte_free(buf);
+                return -EINVAL;
+            }
+
+            const struct vc_sess_head_v1 *sh =
+                (const struct vc_sess_head_v1 *)s;
+            uint64_t sid = FROMLE64(sh->session_id);
+            uint8_t  kind = sh->kind;
+            s += sizeof(*sh);
+
+            fprintf(stderr,
+                    "[load_state] SESSION TLV: sid=%lu kind=%u\n",
+                    sid, kind);
+
+            struct vhost_crypto_session *vs = NULL;
+
+            if (kind == VC_SESS_SYM) {
+
+                if (s + sizeof(struct vc_sym_meta_v1) > q + L) {
+                    fprintf(stderr, "[load_state] SYM meta too long\n");
+                    rte_free(buf);
+                    return -EINVAL;
+                }
+
+                const struct vc_sym_meta_v1 *D =
+                    (const struct vc_sym_meta_v1 *)s;
+                s += sizeof(*D);
+                const void *blob = s;
+                uint32_t blen = (uint32_t)((q + L) - s);
+
+                fprintf(stderr, "[load_state] SYM: blob_len=%u\n", blen);
+                dump_hex(blob, blen);
+
+                vs = vc_session_create_sym(vcrypto, sid, D, blob, blen);
+                if (!vs) {
+                    fprintf(stderr,
+                            "[load_state] vc_session_create_sym failed\n");
+                    rte_free(buf);
+                    return -EIO;
+                }
+
+            } else if (kind == VC_SESS_ASYM) {
+
+                if (s + sizeof(struct vc_asym_meta_v1) > q + L) {
+                    fprintf(stderr, "[load_state] ASYM meta too long\n");
+                    rte_free(buf);
+                    return -EINVAL;
+                }
+
+                const struct vc_asym_meta_v1 *A =
+                    (const struct vc_asym_meta_v1 *)s;
+                s += sizeof(*A);
+                const void *blob = s;
+                uint32_t blen = (uint32_t)((q + L) - s);
+
+                fprintf(stderr, "[load_state] ASYM: blob_len=%u\n", blen);
+                dump_hex(blob, blen);
+
+                vs = vc_session_create_asym(vcrypto, sid, A, blob, blen);
+                if (!vs) {
+                    fprintf(stderr,
+                            "[load_state] vc_session_create_asym failed\n");
+                    rte_free(buf);
+                    return -EIO;
+                }
+
+            } else {
+                fprintf(stderr,
+                        "[load_state] unknown session kind: %u\n", kind);
+                rte_free(buf);
+                return -EINVAL;
+            }
+
+            int drc = rte_hash_del_key(vcrypto->session_map, &sid);
+			if (drc < 0 && drc != -ENOENT) {
+				fprintf(stderr,
+						"[load_state] session_map del failed sid=%lu rc=%d\n",
+						sid, drc);
+
+				/* ✅ avoid leaking the just-created session */
+				vc_session_destroy(vcrypto, vs);
+
+				rte_free(buf);
+				return drc; /* keep real errno */
+			}
+
+			int arc = rte_hash_add_key_data(vcrypto->session_map, &sid, vs);
+			if (arc < 0) {
+				fprintf(stderr,
+						"[load_state] session_map add failed sid=%lu rc=%d\n",
+						sid, arc);
+
+				/* ✅ avoid leaking the just-created session */
+				vc_session_destroy(vcrypto, vs);
+
+				rte_free(buf);
+				return arc; /* keep real errno */
+			}
+
+        } else {
+            fprintf(stderr,
+                    "[load_state] unknown TLV type: 0x%x, skipping\n", t);
+        }
+
+        q += L;
+    }
+
+    rte_free(buf);
+    fprintf(stderr, "[load_state] done\n");
+    return 0;
+}
+
+
+/* Thaw: resume processing */
+int vhost_crypto_thaw(int vid)
+{
+    struct virtio_net *dev = get_device(vid);
+    if (!dev || !dev->extern_data) {
+        VC_LOG_ERR("THAW vid=%d failed: dev/extern_data missing", vid);
+        return -ENOENT;
+    }
+
+    struct vhost_crypto *vcrypto = dev->extern_data;
+
+    int old = __atomic_exchange_n(&vcrypto->frozen, 0, __ATOMIC_ACQ_REL);
+    uint32_t inflight = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
+
+    VC_LOG_INFO("THAW vid=%d frozen:%d->0 inflight=%u", vid, old, inflight);
+    return 0;
+}
+
+

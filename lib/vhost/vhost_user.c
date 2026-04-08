@@ -591,10 +591,10 @@ numa_realloc(struct virtio_net **pdev, struct vhost_virtqueue **pvq)
 
 	vq = rte_realloc_socket(*pvq, sizeof(**pvq), 0, node);
 	if (!vq) {
-		VHOST_CONFIG_LOG(dev->ifname, ERR,
-			"failed to realloc virtqueue %d on node %d",
-			(*pvq)->index, node);
-		return;
+			VHOST_CONFIG_LOG(dev->ifname, WARNING,
+					"realloc virtqueue %d on node %d failed, keep old queue",
+					(*pvq)->index, node);
+			goto out_dev_realloc;
 	}
 	*pvq = vq;
 
@@ -695,13 +695,17 @@ out_dev_realloc:
 	if (dev_node == node)
 		return;
 
-	struct vhost_comp *tmp = (struct vhost_comp *)((*pdev)->extern_data);
+	void *extern_data = (*pdev)->extern_data;
+	typeof((*pdev)->extern_ops) extern_ops = (*pdev)->extern_ops;
+
 	dev = rte_realloc_socket(*pdev, sizeof(**pdev), 0, node);
 	if (!dev) {
 		VHOST_CONFIG_LOG((*pdev)->ifname, ERR, "failed to realloc dev on node %d", node);
 		return;
 	}
 	*pdev = dev;
+	dev->extern_data = extern_data;
+	dev->extern_ops = extern_ops;
 
 	VHOST_CONFIG_LOG(dev->ifname, INFO, "reallocated device on node %d", node);
 	vhost_devices[dev->vid] = dev;
@@ -2315,6 +2319,19 @@ vhost_user_set_vring_enable(struct virtio_net **pdev,
 	}
 
 	vq->enabled = enable;
+	if (enable &&
+			!(dev->flags & VIRTIO_DEV_VDPA_CONFIGURED) &&
+			(dev->features & (1ULL << VHOST_USER_F_PROTOCOL_FEATURES))) {
+
+			if (vq->ring_addrs.desc_user_addr &&
+					vq->ring_addrs.avail_user_addr &&
+					vq->ring_addrs.used_user_addr) {
+
+					vring_invalidate(dev, vq);
+					translate_ring_addresses(&dev, &vq);
+					*pdev = dev;
+			}
+	}
 
 	return RTE_VHOST_MSG_RESULT_OK;
 }
