@@ -2522,8 +2522,7 @@ vhost_crypto_finalize_one_request(struct rte_crypto_op *op,
         m_dst = op->sym->m_dst;
         vc_req = rte_mbuf_to_priv(m_src);
     } else if (op->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
-        vc_req = rte_crypto_op_ctod_offset(op, uint8_t *,
-                IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
+        vc_req = rte_crypto_op_ctod_offset(op, struct vhost_crypto_data_req *,IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
     } else {
         VC_LOG_ERR("Invalid crypto op type");
         return NULL;
@@ -2653,9 +2652,14 @@ vhost_crypto_complete_one_vm_requests(struct rte_crypto_op **ops,
 			struct rte_mbuf *m_src = ops[0]->sym->m_src;
 			vc_req = m_src ? rte_mbuf_to_priv(m_src) : NULL;
 		} else if (ops[0]->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
-			vc_req = rte_crypto_op_ctod_offset(ops[0],
+			vc_req = rte_crypto_op_ctod_offset(
+					ops[0],
 					struct vhost_crypto_data_req *,
 					IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
+		} else {
+			VC_LOG_ERR("inflight sub skipped: invalid crypto op type=%u",
+					ops[0]->type);
+			return processed;
 		}
 
 		vcrypto = vc_req ? vc_req->vcrypto : NULL;
@@ -2663,7 +2667,8 @@ vhost_crypto_complete_one_vm_requests(struct rte_crypto_op **ops,
 		if (likely(vcrypto)) {
 			uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
 			if (unlikely(cur < processed)) {
-				VC_LOG_ERR("inflight underflow cur=%u sub=%u (BUG)", cur, processed);
+				VC_LOG_ERR("inflight underflow cur=%u sub=%u (BUG)",
+						cur, processed);
 				__atomic_store_n(&vcrypto->inflight_corrupt, 1, __ATOMIC_RELEASE);
 				__atomic_store_n(&vcrypto->inflight, 0, __ATOMIC_RELEASE);
 			} else {

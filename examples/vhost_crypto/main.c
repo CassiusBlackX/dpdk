@@ -46,8 +46,6 @@ static inline uint64_t vc_now_ms(void)
 #define MAX_NB_SOCKETS			(4)
 #define MAX_NB_WORKER_CORES		(16)
 
-extern void vhost_crypto_inflight_add(int vid, uint32_t n);
-extern void vhost_crypto_inflight_sub(int vid, uint32_t n);
 extern int vhost_crypto_freeze(int vid);
 
 struct lcore_option {
@@ -778,16 +776,24 @@ main(int argc, char *argv[])
 
 		if (!options.asymmetric_crypto) {
 			snprintf(name, 127, "SYM_SESS_POOL_%u", lo->lcore_id);
-			info->sess_pool = rte_cryptodev_sym_session_pool_create(name,
+			info->sess_pool = rte_cryptodev_sym_session_pool_create(
+					name,
 					SESSION_MAP_ENTRIES,
-					rte_cryptodev_sym_get_private_session_size(
-					info->cid), 0, 0,
+					rte_cryptodev_sym_get_private_session_size(info->cid),
+					0, 0,
 					rte_lcore_to_socket_id(lo->lcore_id));
 			cop_type = RTE_CRYPTO_OP_TYPE_SYMMETRIC;
 		} else {
+			uint32_t priv_size;
+
 			snprintf(name, 127, "ASYM_SESS_POOL_%u", lo->lcore_id);
-			info->sess_pool = rte_cryptodev_asym_session_pool_create(name,
-					SESSION_MAP_ENTRIES, 0, 64,
+			priv_size = rte_cryptodev_asym_get_private_session_size(info->cid);
+
+			info->sess_pool = rte_cryptodev_asym_session_pool_create(
+					name,
+					SESSION_MAP_ENTRIES,
+					0,
+					priv_size,
 					rte_lcore_to_socket_id(lo->lcore_id));
 			cop_type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
 		}
