@@ -551,26 +551,38 @@ vhost_crypto_worker(void *arg)
                 uint32_t to_fetch = RTE_MIN(burst_size, room);
 
                 if (to_fetch != 0) {
-                    uint16_t fetched = rte_vhost_crypto_fetch_requests(
-                        vid, (uint16_t)vq, ops[vq], (uint16_t)to_fetch);
+					uint16_t fetched = rte_vhost_crypto_fetch_requests(
+						vid, (uint16_t)vq, ops[vq], (uint16_t)to_fetch);
 
-                    if (likely(fetched != 0)) {
-                        uint16_t enq = rte_cryptodev_enqueue_burst(
-                            info->cid, info->qid, ops[vq], fetched);
+					if (likely(fetched != 0)) {
+						uint16_t enq = rte_cryptodev_enqueue_burst(
+							info->cid, info->qid, ops[vq], fetched);
 
-                        if (enq) {
-                            nb_inflight_ops[sock][vq] += enq;
-                            vhost_crypto_inflight_add(vid, enq);
-                            rte_crypto_op_bulk_alloc(info->cop_pool, cop_type, ops[vq], enq);
-                        }
+						if (enq) {
+							nb_inflight_ops[sock][vq] += enq;
 
-                        if (unlikely(enq < fetched)) {
-                            for (uint16_t x = enq; x < fetched; x++) {
-                                rte_crypto_op_free(ops[vq][x]);
-                            }
-                        }
-                    }
-                }
+							if (unlikely(rte_crypto_op_bulk_alloc(info->cop_pool, cop_type,
+																ops[vq], enq) < enq)) {
+								RTE_LOG(ERR, USER1, "Failed to realloc enqueued ops\n");
+								return -ENOMEM;
+							}
+						}
+
+						if (unlikely(enq < fetched)) {
+							uint16_t left = fetched - enq;
+
+							for (uint16_t x = enq; x < fetched; x++) {
+								rte_crypto_op_free(ops[vq][x]);
+							}
+
+							if (unlikely(rte_crypto_op_bulk_alloc(info->cop_pool, cop_type,
+																&ops[vq][enq], left) < left)) {
+								RTE_LOG(ERR, USER1, "Failed to refill non-enqueued ops\n");
+								return -ENOMEM;
+							}
+						}
+					}
+				}
 
                 /* --- B0) retry pending finalize first (barrier) --- */
 				if (pend[sock][vq].cnt) {
@@ -586,7 +598,6 @@ vhost_crypto_worker(void *arg)
 
 						/* inflight-- only for committed ops */
 						nb_inflight_ops[sock][vq] -= fin;
-						vhost_crypto_inflight_sub(vid, fin);
 
 						if (!options.guest_polling) {
 							for (uint16_t k = 0; k < nb_callfds; k++) {
@@ -629,7 +640,6 @@ vhost_crypto_worker(void *arg)
                 /* 成功写回的部分才算真正完成 */
                 if (fin) {
                     nb_inflight_ops[sock][vq] -= fin;
-                    vhost_crypto_inflight_sub(vid, fin);
 
                     if (!options.guest_polling) {
                         for (uint16_t k = 0; k < nb_callfds; k++) {
