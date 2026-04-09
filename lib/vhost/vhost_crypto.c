@@ -2436,15 +2436,37 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 			goto error_exit;
 		}
 
-		// vc_req_out = rte_cryptodev_asym_session_get_user_data(asym_session);
-		vc_req_out = rte_crypto_op_ctod_offset(op, uint8_t *, IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
+		/* asym path stores request metadata in op private area */
+		vc_req_out = rte_crypto_op_ctod_offset(op,
+				struct vhost_crypto_data_req *,
+				IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
 		rte_memcpy(vc_req_out, vc_req, sizeof(struct vhost_crypto_data_req));
 		vc_req_out->wb = NULL;
+
+		/*
+		* IMPORTANT:
+		* fetch_requests() already borrowed temporary mbuf(s) from mbuf_pool.
+		* For asymmetric requests, finalize_one_request() retrieves vc_req from
+		* ctod area instead of rte_mbuf_to_priv(m_src), so these temporary mbufs
+		* will NOT be recycled automatically on the asym path.
+		* Recycle them here to avoid draining mbuf_pool.
+		*/
+		if (op->sym->m_dst && op->sym->m_dst != op->sym->m_src) {
+			rte_pktmbuf_free(op->sym->m_dst);
+			op->sym->m_dst = NULL;
+		}
+		if (op->sym->m_src) {
+			rte_pktmbuf_free(op->sym->m_src);
+			op->sym->m_src = NULL;
+		}
 
 		switch (req.header.algo) {
 		case VIRTIO_CRYPTO_AKCIPHER_RSA:
 			err = prepare_asym_rsa_op(vcrypto, op, vq, vc_req_out,
 					&req, desc, max_n_descs);
+			break;
+		default:
+			err = VIRTIO_CRYPTO_ERR;
 			break;
 		}
 		if (unlikely(err != 0)) {
@@ -2463,12 +2485,27 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 	return 0;
 
 error_exit:
+    /*
+     * On asym path, temporary mbuf(s) borrowed in fetch_requests()
+     * are not reclaimed by finalize_one_request(), so release them here
+     * on any failure path as well.
+     */
+    if (op->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+        if (op->sym->m_dst && op->sym->m_dst != op->sym->m_src) {
+            rte_pktmbuf_free(op->sym->m_dst);
+            op->sym->m_dst = NULL;
+        }
+        if (op->sym->m_src) {
+            rte_pktmbuf_free(op->sym->m_src);
+            op->sym->m_src = NULL;
+        }
+    }
 
-	inhdr = reach_inhdr(vc_req->dev, vq, descs, max_n_descs);
-	if (likely(inhdr != NULL))
-		inhdr->status = (uint8_t)err;
+    inhdr = reach_inhdr(vc_req->dev, vq, descs, max_n_descs);
+    if (likely(inhdr != NULL))
+        inhdr->status = (uint8_t)err;
 
-	return -1;
+    return -1;
 }
 
 static __rte_always_inline struct vhost_virtqueue *
@@ -2609,23 +2646,33 @@ vhost_crypto_complete_one_vm_requests(struct rte_crypto_op **ops,
      * We decrement AFTER idx update succeeded.
      */
     if (likely(processed != 0)) {
-        struct rte_mbuf *m_src = ops[0]->sym ? ops[0]->sym->m_src : NULL;
-        struct vhost_crypto_data_req *vc_req = m_src ? rte_mbuf_to_priv(m_src) : NULL;
-        struct vhost_crypto *vcrypto = vc_req ? vc_req->vcrypto : NULL;
+		struct vhost_crypto_data_req *vc_req = NULL;
+		struct vhost_crypto *vcrypto = NULL;
 
-        if (likely(vcrypto)) {
-            uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
-            if (unlikely(cur < processed)) {
-                VC_LOG_ERR("inflight underflow cur=%u sub=%u (BUG)", cur, processed);
-                __atomic_store_n(&vcrypto->inflight_corrupt, 1, __ATOMIC_RELEASE);
-                __atomic_store_n(&vcrypto->inflight, 0, __ATOMIC_RELEASE);
-            } else {
-                __atomic_fetch_sub(&vcrypto->inflight, processed, __ATOMIC_ACQ_REL);
-            }
-        } else {
-            VC_LOG_ERR("inflight sub skipped: missing vcrypto in op priv (BUG)");
-        }
-    }
+		if (ops[0]->type == RTE_CRYPTO_OP_TYPE_SYMMETRIC) {
+			struct rte_mbuf *m_src = ops[0]->sym->m_src;
+			vc_req = m_src ? rte_mbuf_to_priv(m_src) : NULL;
+		} else if (ops[0]->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
+			vc_req = rte_crypto_op_ctod_offset(ops[0],
+					struct vhost_crypto_data_req *,
+					IV_OFFSET + VHOST_CRYPTO_MAX_IV_LEN);
+		}
+
+		vcrypto = vc_req ? vc_req->vcrypto : NULL;
+
+		if (likely(vcrypto)) {
+			uint32_t cur = __atomic_load_n(&vcrypto->inflight, __ATOMIC_ACQUIRE);
+			if (unlikely(cur < processed)) {
+				VC_LOG_ERR("inflight underflow cur=%u sub=%u (BUG)", cur, processed);
+				__atomic_store_n(&vcrypto->inflight_corrupt, 1, __ATOMIC_RELEASE);
+				__atomic_store_n(&vcrypto->inflight, 0, __ATOMIC_RELEASE);
+			} else {
+				__atomic_fetch_sub(&vcrypto->inflight, processed, __ATOMIC_ACQ_REL);
+			}
+		} else {
+			VC_LOG_ERR("inflight sub skipped: missing vcrypto in op priv (BUG)");
+		}
+	}
 
     return processed;
 }
