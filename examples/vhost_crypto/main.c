@@ -87,15 +87,17 @@ struct vhost_crypto_writeback_data {
 };
 
 struct vhost_crypto_data_req {
-	struct vring_desc *head;
-	struct virtio_net *dev;
-	struct virtio_crypto_inhdr *inhdr;
-	struct vhost_virtqueue *vq;
-	struct vhost_crypto_writeback_data *wb;
-	struct rte_mempool *wb_pool;
-	uint16_t desc_idx;
-	uint16_t len;
-	uint16_t zero_copy;
+    struct vring_desc *head;
+    struct virtio_net *dev;
+    struct virtio_crypto_inhdr *inhdr;
+    struct vhost_virtqueue *vq;
+    struct vhost_crypto_writeback_data *wb;
+    struct rte_mempool *wb_pool;
+    uint16_t used_idx;
+    uint16_t head_idx;
+    uint16_t len;
+    uint16_t zero_copy;
+    struct vhost_crypto *vcrypto;
 };
 /* copied from lib/vhost/vhost_crypto.c */
 
