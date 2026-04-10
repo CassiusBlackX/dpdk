@@ -25,6 +25,11 @@ rte_compressdev_capabilities uadk_compress_pmd_capabilities[] = {
 				      RTE_COMP_FF_SHAREABLE_PRIV_XFORM |
 				      RTE_COMP_FF_HUFFMAN_FIXED |
 				      RTE_COMP_FF_HUFFMAN_DYNAMIC,
+		.window_size = {
+			.min = 13,
+			.max = 13,
+			.increment = 0,
+		},
 	},
 
 	RTE_COMP_END_OF_CAPABILITIES_LIST()
@@ -247,8 +252,8 @@ uadk_compress_pmd_xform_create(struct rte_compressdev *dev __rte_unused,
 			break;
 		case RTE_COMP_ALGO_DEFLATE:
 			setup.alg_type = WD_DEFLATE;
-			setup.win_sz = WD_COMP_WS_8K;
-			setup.comp_lv = WD_COMP_L8;
+			setup.win_sz = uadk_map_window(xform->compress.window_size);
+			setup.comp_lv = uadk_map_comp_level(xform->compress.level);
 			setup.op_type = WD_DIR_COMPRESS;
 			param.type = setup.op_type;
 			param.numa_id = -1;	/* choose nearby numa node */
@@ -264,6 +269,7 @@ uadk_compress_pmd_xform_create(struct rte_compressdev *dev __rte_unused,
 			break;
 		case RTE_COMP_ALGO_DEFLATE:
 			setup.alg_type = WD_DEFLATE;
+			setup.win_sz = uadk_map_window(xform->decompress.window_size);
 			setup.comp_lv = WD_COMP_L8;
 			setup.op_type = WD_DIR_DECOMPRESS;
 			param.type = setup.op_type;

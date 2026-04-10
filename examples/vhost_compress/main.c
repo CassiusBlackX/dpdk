@@ -383,7 +383,6 @@ vhost_compress_worker(void *arg)
 	int ret = 0;
 
 	RTE_LOG(INFO, USER1, "Processing on Core %u started\n", lcore_id);
-	RTE_LOG(INFO, USER1, "11111\n");
 
 	for (i = 0; i < NB_VIRTIO_QUEUES; i++) {
 		if (rte_comp_op_bulk_alloc(info->cop_pool,
@@ -394,8 +393,6 @@ vhost_compress_worker(void *arg)
 			goto exit;
 		}
 	}
-	RTE_LOG(INFO, USER1, "11111\n");
-
 	while (1) {
 		for (i = 0; i < info->nb_vids; i++) {
 			if (unlikely(info->initialized[i] == 0))
@@ -408,10 +405,6 @@ vhost_compress_worker(void *arg)
 				fetched = rte_vhost_comp_fetch_requests(
 						info->vids[i], j, ops[j],
 						to_fetch);
-				if (fetched != 0)
-				{
-				RTE_LOG(ERR, USER1, "try to enqueue\n");
-				}
 				info->nb_inflight_ops +=
 						rte_compressdev_enqueue_burst(
 						info->cid, info->qid, ops[j],
@@ -463,8 +456,8 @@ free_resource(void)
 		// rte_mempool_free(info->sess_pool);
 
 		for (j = 0; j < lo->nb_sockets; j++) {
-			rte_vhost_driver_unregister(lo->socket_files[i]);
-			free(lo->socket_files[i]);
+			rte_vhost_driver_unregister(lo->socket_files[j]);
+			free(lo->socket_files[j]);
 		}
 
 		rte_free(info);
