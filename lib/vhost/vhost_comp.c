@@ -244,12 +244,72 @@ error_exit:
 	rte_free(vhost_session);
 }
 
-// static void
-// vhost_comp_create_stream(struct vhost_comp *vcompress,
-// 		VhostUserCompSessionParam *sess_param)
-// {
-	
-// }
+static void
+vhost_comp_create_stream(struct vhost_comp *vcompress,
+		VhostUserCompSessionParam *param)
+{
+	struct rte_comp_xform xform = {0};
+	struct vhost_comp_session *vhost_session;
+	void *stream = NULL;
+	int ret;
+
+	if (param->u.stateful.op_type == VIRTIO_COMP_OP_COMPRESS)
+		xform.type = RTE_COMP_COMPRESS;
+	else if (param->u.stateful.op_type == VIRTIO_COMP_OP_DECOMPRESS)
+		xform.type = RTE_COMP_DECOMPRESS;
+	else {
+		VC_LOG_ERR("Bad operation type");
+		param->session_id = -VIRTIO_COMP_BADMSG;
+		return;
+	}
+
+	switch (param->u.stateful.algo) {
+	case VIRTIO_COMP_ALGO_DEFLATE:
+		if (xform.type == RTE_COMP_COMPRESS)
+			xform.compress.algo = RTE_COMP_ALGO_DEFLATE;
+		else
+			xform.decompress.algo = RTE_COMP_ALGO_DEFLATE;
+		break;
+	default:
+		VC_LOG_ERR("unsupported stateful compress algo");
+		param->session_id = -VIRTIO_COMP_BADMSG;
+		return;
+	}
+
+	ret = rte_compressdev_stream_create(vcompress->cid, &xform, &stream);
+	if (ret != 0) {
+		VC_LOG_ERR("Failed to create stream");
+		param->session_id = -VIRTIO_COMP_ERR;
+		return;
+	}
+
+	vhost_session = rte_zmalloc(NULL, sizeof(*vhost_session), 0);
+	if (vhost_session == NULL) {
+		VC_LOG_ERR("Failed to alloc session memory");
+		goto error_exit;
+	}
+
+	vhost_session->type = RTE_COMP_OP_STATEFUL;
+	vhost_session->xform_type = xform.type;
+	vhost_session->stream = stream;
+
+	if ((rte_hash_add_key_data(vcompress->session_map,
+		&vcompress->last_session_id, vhost_session) < 0)) {
+		VC_LOG_ERR("Failed to insert session to hash table");
+		goto error_exit;
+	}
+
+	param->session_id = vcompress->last_session_id;
+	vcompress->last_session_id++;
+	return;
+
+error_exit:
+	if (stream && rte_compressdev_stream_free(vcompress->cid, stream) < 0)
+		VC_LOG_ERR("Failed to free stream");
+
+	param->session_id = -VIRTIO_COMP_ERR;
+	rte_free(vhost_session);
+}
 
 static void
 vhost_comp_create_sess(struct vhost_comp *vcompress,
@@ -257,8 +317,8 @@ vhost_comp_create_sess(struct vhost_comp *vcompress,
 {
 	if (sess_param->op_code == VIRTIO_COMP_STATELESS_CREATE_SESSION)
 		vhost_comp_create_private_xform(vcompress, sess_param);
-	// else
-	// 	vhost_comp_create_compress_sess(vcompress, sess_param);
+	else if (sess_param->op_code == VIRTIO_COMP_STATEFUL_CREATE_SESSION)
+		vhost_comp_create_stream(vcompress, sess_param);
 }
 
 static int
@@ -281,14 +341,13 @@ vhost_comp_close_sess(struct vhost_comp *vcompress, uint64_t session_id)
 			VC_LOG_DBG("Failed to free session");
 			return -VIRTIO_COMP_ERR;
 		}
-	} 
-	// else if (vhost_session->type == RTE_COMP_OP_STATEFUL) {
-		// if (rte_compressdev_decompress_session_free(vcompress->cid,
-		// 	vhost_session->decompress) < 0) {
-		// 	VC_LOG_DBG("Failed to free session");
-		// }
-			// return -VIRTIO_COMP_ERR;
-	// } 
+	} else if (vhost_session->type == RTE_COMP_OP_STATEFUL) {
+		if (rte_compressdev_stream_free(vcompress->cid,
+			vhost_session->stream) < 0) {
+			VC_LOG_DBG("Failed to free stream");
+			return -VIRTIO_COMP_ERR;
+		}
+	}
 	else {
 		VC_LOG_ERR("Invalid session for id %"PRIu64".", session_id);
 		return -VIRTIO_COMP_INVSESS;
@@ -655,9 +714,10 @@ error_exit:
 static __rte_always_inline uint8_t
 vhost_comp_check_stateless_request(struct virtio_comp_stateless_data_req *req)
 {
-	if (likely((req->para.src_data_len <= 32768) &&
+	if (likely((req->para.src_data_len > 0) &&
+		(req->para.src_data_len <= UINT16_MAX) &&
 		(req->para.dst_data_len >= req->para.src_data_len) &&
-		(req->para.dst_data_len <= 32768)))
+		(req->para.dst_data_len <= UINT16_MAX)))
 		return VIRTIO_COMP_OK;
 	return VIRTIO_COMP_BADMSG;
 }
@@ -789,17 +849,82 @@ error_exit:
 	vc_req->len = INHDR_LEN;
 	return ret;
 }
-// static __rte_always_inline uint8_t
-// prepare_stateful_comp_op(struct vhost_comp *vcompress, struct rte_comp_op *op,
-// 		struct vhost_virtqueue *vq,
-// 		struct vhost_comp_data_req *vc_req,
-// 		struct virtio_comp_op_data_req *req,
-// 		struct vhost_comp_desc *head,
-// 		uint32_t max_n_descs)
-// 	__rte_requires_shared_capability(&vq->iotlb_lock)
-// {
-// 	return 0;
-// }
+
+static __rte_always_inline uint8_t
+prepare_stateful_comp_op(struct vhost_comp *vcomp, struct rte_comp_op *op,
+		struct vhost_virtqueue *vq,
+		struct vhost_comp_data_req *vc_req,
+		struct virtio_comp_op_data_req *req,
+		struct vhost_comp_desc *head,
+		uint32_t max_n_descs)
+	__rte_requires_shared_capability(&vq->iotlb_lock)
+{
+	struct vhost_comp_desc *desc = head;
+	struct rte_mbuf *m_src = op->m_src, *m_dst = op->m_dst;
+	uint32_t src_len = req->u.stateful_req.para.src_data_len;
+	uint32_t dst_len = req->u.stateful_req.para.dst_data_len;
+
+	if (unlikely(src_len == 0 || dst_len == 0 ||
+		src_len > UINT16_MAX || dst_len > UINT16_MAX ||
+		dst_len < src_len))
+		goto badmsg;
+
+	m_src->data_len = src_len;
+	rte_mbuf_iova_set(m_src,
+			  gpa_to_hpa(vcomp->dev, desc->addr, src_len));
+	m_src->buf_addr = get_data_ptr(vq, vc_req, desc, VHOST_ACCESS_RO);
+	if (unlikely(rte_mbuf_iova_get(m_src) == 0 || m_src->buf_addr == NULL)) {
+		VC_LOG_ERR("zero_copy may fail due to cross page data");
+		return VIRTIO_COMP_ERR;
+	}
+
+	if (unlikely(move_desc(head, &desc, src_len, max_n_descs) < 0)) {
+		VC_LOG_ERR("Incorrect descriptor");
+		return VIRTIO_COMP_ERR;
+	}
+
+	desc = find_write_desc(head, desc, max_n_descs);
+	if (unlikely(!desc)) {
+		VC_LOG_ERR("Cannot find write location");
+		goto badmsg;
+	}
+
+	rte_mbuf_iova_set(m_dst,
+			  gpa_to_hpa(vcomp->dev, desc->addr, dst_len));
+	m_dst->buf_addr = get_data_ptr(vq, vc_req, desc, VHOST_ACCESS_RW);
+	if (unlikely(rte_mbuf_iova_get(m_dst) == 0 || m_dst->buf_addr == NULL)) {
+		VC_LOG_ERR("zero_copy may fail due to cross page data");
+		return VIRTIO_COMP_ERR;
+	}
+
+	if (unlikely(move_desc(head, &desc, dst_len, max_n_descs) < 0)) {
+		VC_LOG_ERR("Incorrect descriptor");
+		return VIRTIO_COMP_ERR;
+	}
+
+	m_dst->data_len = dst_len;
+	op->op_type = RTE_COMP_OP_STATEFUL;
+	op->src.offset = 0;
+	op->src.length = src_len;
+
+	if (req->header.flag <= RTE_COMP_FLUSH_FINAL)
+		op->flush_flag = (enum rte_comp_flush_flag)req->header.flag;
+	else
+		op->flush_flag = RTE_COMP_FLUSH_FINAL;
+
+	vc_req->inhdr = get_data_ptr(vq, vc_req, desc, VHOST_ACCESS_WO);
+	if (unlikely(vc_req->inhdr == NULL))
+		goto badmsg;
+
+	vc_req->inhdr->status = VIRTIO_COMP_OK;
+	vc_req->len = dst_len + INHDR_LEN;
+
+	return 0;
+
+badmsg:
+	vc_req->len = INHDR_LEN;
+	return VIRTIO_COMP_BADMSG;
+}
 
 /**
  * Process on descriptor
@@ -939,6 +1064,41 @@ vhost_comp_process_one_req(struct vhost_comp *vcompress,
 			goto error_exit;
 		}
 		break;
+	case VIRTIO_COMP_STATEFUL_COMPRESS:
+	case VIRTIO_COMP_STATEFUL_DECOMPRESS:
+		vc_req_out = rte_mbuf_to_priv(op->m_src);
+		memcpy(vc_req_out, vc_req, sizeof(struct vhost_comp_data_req));
+		session_id = req.header.session_id;
+
+		if (vcompress->cache_stateful_session_id != session_id) {
+			err = rte_hash_lookup_data(vcompress->session_map,
+					&session_id, (void **)&vhost_session);
+			if (unlikely(err < 0)) {
+				err = VIRTIO_COMP_ERR;
+				VC_LOG_ERR("Failed to find session %"PRIu64, session_id);
+				goto error_exit;
+			}
+			if (unlikely(vhost_session->type != RTE_COMP_OP_STATEFUL)) {
+				err = VIRTIO_COMP_INVSESS;
+				VC_LOG_ERR("Session %"PRIu64" is not stateful", session_id);
+				goto error_exit;
+			}
+
+			vcompress->cache_stream = vhost_session->stream;
+			vcompress->cache_stateful_session_id = session_id;
+		}
+
+		stream = vcompress->cache_stream;
+		op->op_type = RTE_COMP_OP_STATEFUL;
+		op->stream = stream;
+
+		err = prepare_stateful_comp_op(vcompress, op, vq, vc_req_out,
+				&req, desc, max_n_descs);
+		if (unlikely(err != 0)) {
+			VC_LOG_ERR("Failed to process stateful request");
+			goto error_exit;
+		}
+		break;
 	default:
 		err = VIRTIO_COMP_ERR;
 		VC_LOG_ERR("Unsupported symmetric compress request type %u", req.header.opcode);
@@ -965,15 +1125,12 @@ vhost_comp_finalize_one_request(struct rte_comp_op *op,
 	struct vhost_virtqueue *vq;
 	uint16_t used_idx, desc_idx;
 
-	if (op->op_type == RTE_COMP_OP_STATELESS) {
+	if (op->op_type == RTE_COMP_OP_STATELESS ||
+		op->op_type == RTE_COMP_OP_STATEFUL) {
 		m_src = op->m_src;
 		m_dst = op->m_dst;
 		vc_req = rte_mbuf_to_priv(m_src);
-	}
-	// else if (op->type == RTE_COMP_OP_STATEFUL) {
-	// 	vc_req = rte_compressdev_decompress_session_get_user_data(op->asym->session);
-	// }
-	else {
+	} else {
 		VC_LOG_ERR("Invalid compress op type");
 		return NULL;
 	}
@@ -1002,7 +1159,8 @@ vhost_comp_finalize_one_request(struct rte_comp_op *op,
 	vq->used->ring[desc_idx].id = vq->avail->ring[desc_idx];
 	vq->used->ring[desc_idx].len = vc_req->len;
 
-	if (op->op_type == RTE_COMP_OP_STATELESS) {
+	if (op->op_type == RTE_COMP_OP_STATELESS ||
+		op->op_type == RTE_COMP_OP_STATEFUL) {
 		rte_mempool_put(m_src->pool, (void *)m_src);
 		if (m_dst)
 			rte_mempool_put(m_dst->pool, (void *)m_dst);
