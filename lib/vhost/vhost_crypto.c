@@ -2429,13 +2429,6 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 		asym_session = vcrypto->cache_asym_session;
 		op->type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
 
-		err = rte_crypto_op_attach_asym_session(op, asym_session);
-		if (unlikely(err < 0)) {
-			err = VIRTIO_CRYPTO_ERR;
-			VC_LOG_ERR("Failed to attach asym session to op");
-			goto error_exit;
-		}
-
 		/* asym path stores request metadata in op private area */
 		vc_req_out = rte_crypto_op_ctod_offset(op,
 				struct vhost_crypto_data_req *,
@@ -2444,20 +2437,27 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 		vc_req_out->wb = NULL;
 
 		/*
-		* IMPORTANT:
-		* fetch_requests() already borrowed temporary mbuf(s) from mbuf_pool.
-		* For asymmetric requests, finalize_one_request() retrieves vc_req from
-		* ctod area instead of rte_mbuf_to_priv(m_src), so these temporary mbufs
-		* will NOT be recycled automatically on the asym path.
-		* Recycle them here to avoid draining mbuf_pool.
+		* ZERO_COPY_DISABLE 下，这个 mbuf 只是 fetch 阶段的临时载体。
+		* asym 完成路径不依赖它，也不会在 finalize_one_request() 里自动回收，
+		* 所以这里要尽早放回 mbuf_pool。
+		*
+		* 注意：这些对象是 rte_mempool_get_bulk() 取出来的，按 schedule 版语义，
+		* 这里用 rte_mempool_put()，不要用 rte_pktmbuf_free()。
 		*/
 		if (op->sym->m_dst && op->sym->m_dst != op->sym->m_src) {
-			rte_pktmbuf_free(op->sym->m_dst);
+			rte_mempool_put(op->sym->m_dst->pool, (void *)op->sym->m_dst);
 			op->sym->m_dst = NULL;
 		}
 		if (op->sym->m_src) {
-			rte_pktmbuf_free(op->sym->m_src);
+			rte_mempool_put(op->sym->m_src->pool, (void *)op->sym->m_src);
 			op->sym->m_src = NULL;
+		}
+
+		err = rte_crypto_op_attach_asym_session(op, asym_session);
+		if (unlikely(err < 0)) {
+			err = VIRTIO_CRYPTO_ERR;
+			VC_LOG_ERR("Failed to attach asym session to op");
+			goto error_exit;
 		}
 
 		switch (req.header.algo) {
@@ -2486,17 +2486,16 @@ vhost_crypto_process_one_req(struct vhost_crypto *vcrypto,
 
 error_exit:
     /*
-     * On asym path, temporary mbuf(s) borrowed in fetch_requests()
-     * are not reclaimed by finalize_one_request(), so release them here
-     * on any failure path as well.
+     * asym 路径下，如果还没来得及在上面提前归还临时 mbuf，
+     * 这里兜底放回 mbuf_pool。
      */
     if (op->type == RTE_CRYPTO_OP_TYPE_ASYMMETRIC) {
         if (op->sym->m_dst && op->sym->m_dst != op->sym->m_src) {
-            rte_pktmbuf_free(op->sym->m_dst);
+            rte_mempool_put(op->sym->m_dst->pool, (void *)op->sym->m_dst);
             op->sym->m_dst = NULL;
         }
         if (op->sym->m_src) {
-            rte_pktmbuf_free(op->sym->m_src);
+            rte_mempool_put(op->sym->m_src->pool, (void *)op->sym->m_src);
             op->sym->m_src = NULL;
         }
     }
