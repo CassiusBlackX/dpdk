@@ -3703,106 +3703,105 @@ void test_save_load_blob(int vid)
     fprintf(stderr, "[test] load_state success\n");
 }
 
-static struct vhost_crypto_session*
+static struct vhost_crypto_session *
 vc_session_create_asym(struct vhost_crypto *vcrypto, uint64_t sid,
                        const struct vc_asym_meta_v1 *A,
                        const void *blob, uint32_t blob_len)
 {
+    struct rte_crypto_asym_xform ax;
+    struct rte_cryptodev_asym_session *sess = NULL;
+    struct vhost_crypto_session *vs = NULL;
+    uint8_t *der_copy = NULL;
+    int ret;
+
     if (!vcrypto || !A || !blob || !blob_len)
         return NULL;
 
-    /* 目前只恢复 RSA，会话保存的是私钥 DER 原文 */
     if (A->algo_asym != VIRTIO_CRYPTO_AKCIPHER_RSA)
         return NULL;
 
-    /* 1) 先把只读 DER 拷到一块可写内存，避免 const-cast */
-    uint8_t *der_copy = dup_bytes_dpdk(blob, blob_len);
+    der_copy = dup_bytes_dpdk(blob, blob_len);
     if (!der_copy)
         return NULL;
 
-    struct rte_crypto_asym_xform ax;
     memset(&ax, 0, sizeof(ax));
 
-    /* 2) DER -> xform: choose parser by saved key_type */
-	if (A->key_type == VIRTIO_CRYPTO_AKCIPHER_KEY_TYPE_PUBLIC) {
-		if (virtio_crypto_asym_rsa_public_der_to_xform(der_copy, blob_len, &ax) < 0) {
-			secure_free(der_copy, blob_len);
-			return NULL;
-		}
-		ax.rsa.key_type = RTE_RSA_KEY_TYPE_EXP;
-	} else if (A->key_type == VIRTIO_CRYPTO_AKCIPHER_KEY_TYPE_PRIVATE) {
-		if (virtio_crypto_asym_rsa_der_to_xform(der_copy, blob_len, &ax) < 0) {
-			secure_free(der_copy, blob_len);
-			return NULL;
-		}
-		ax.rsa.key_type = RTE_RSA_KEY_TYPE_QT;
-	} else {
-		secure_free(der_copy, blob_len);
-		return NULL;
-	}
-
-	/* parsed already, wipe temp DER copy */
-	secure_free(der_copy, blob_len);
-
-	/* 3) fixed xform type */
-	ax.xform_type = RTE_CRYPTO_ASYM_XFORM_RSA;
-
-    /* 4) 映射 virtio 的 padding 到 DPDK 的 padding type
-          注意：padding 在 A->u.rsa.padding_algo */
-    {
-        uint16_t pad = A->padding_algo;  /* ← 关键：使用 u.rsa 成员 */
-
-        switch (pad) {
-        case VIRTIO_CRYPTO_RSA_RAW_PADDING:
-            ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_NONE;
-            break;
-#ifdef VIRTIO_CRYPTO_RSA_PSS_PADDING
-        case VIRTIO_CRYPTO_RSA_PSS_PADDING:
-            ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PSS;
-            break;
-#endif
-        case VIRTIO_CRYPTO_RSA_PKCS1_PADDING:
-        default:
-            ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5;
-            break;
+    if (A->key_type == VIRTIO_CRYPTO_AKCIPHER_KEY_TYPE_PUBLIC) {
+        ret = virtio_crypto_asym_rsa_public_der_to_xform(der_copy, blob_len, &ax);
+        if (ret < 0) {
+            secure_free(der_copy, blob_len);
+            return NULL;
         }
-    }
-
-    /* 5) 创建 cryptodev 非对称会话（签名按你工程封装来）
-          你给出的接口是：create(cid, &ax, pool, &out_sess) */
-    struct rte_cryptodev_asym_session *sess = NULL;
-    if (rte_cryptodev_asym_session_create(vcrypto->cid, &ax,
-                                          vcrypto->sess_pool, (void *)&sess) < 0 || !sess) {
+        ax.rsa.key_type = RTE_RSA_KEY_TYPE_EXP;
+    } else if (A->key_type == VIRTIO_CRYPTO_AKCIPHER_KEY_TYPE_PRIVATE) {
+        ret = virtio_crypto_asym_rsa_der_to_xform(der_copy, blob_len, &ax);
+        if (ret < 0) {
+            secure_free(der_copy, blob_len);
+            return NULL;
+        }
+        ax.rsa.key_type = RTE_RSA_KEY_TYPE_QT;
+    } else {
+        secure_free(der_copy, blob_len);
         return NULL;
     }
 
-    /* 6) vhost 会话对象 + 回填 meta（保证再次 save 仍可复原） */
-    struct vhost_crypto_session *vs = rte_zmalloc(NULL, sizeof(*vs), 0);
+    ax.xform_type = RTE_CRYPTO_ASYM_XFORM_RSA;
+
+    switch (A->padding_algo) {
+    case VIRTIO_CRYPTO_RSA_RAW_PADDING:
+        ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_NONE;
+        break;
+#ifdef VIRTIO_CRYPTO_RSA_PSS_PADDING
+    case VIRTIO_CRYPTO_RSA_PSS_PADDING:
+        ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PSS;
+        break;
+#endif
+    case VIRTIO_CRYPTO_RSA_PKCS1_PADDING:
+    default:
+        ax.rsa.padding.type = RTE_CRYPTO_RSA_PADDING_PKCS1_5;
+        break;
+    }
+
+    /*
+     * IMPORTANT:
+     * der_copy must stay alive until asym_session_create() finishes,
+     * because ax.rsa.*.data pointers still refer to der_copy memory.
+     */
+    ret = rte_cryptodev_asym_session_create(vcrypto->cid, &ax,
+                                            vcrypto->sess_pool,
+                                            (void **)&sess);
+    if (ret < 0 || sess == NULL) {
+        secure_free(der_copy, blob_len);
+        return NULL;
+    }
+
+    vs = rte_zmalloc(NULL, sizeof(*vs), 0);
     if (!vs) {
         rte_cryptodev_asym_session_free(vcrypto->cid, sess);
+        secure_free(der_copy, blob_len);
         return NULL;
     }
 
     vs->type = RTE_CRYPTO_OP_TYPE_ASYMMETRIC;
     vs->asym = sess;
 
-    vs->meta.valid       = true;
-    vs->meta.session_id  = sid;
-    vs->meta.kind        = VC_SESS_ASYM;
+    vs->meta.valid = true;
+    vs->meta.session_id = sid;
+    vs->meta.kind = VC_SESS_ASYM;
+    rte_memcpy(&vs->meta.asym.desc, A, sizeof(*A));
 
-    memcpy(&vs->meta.asym.desc, A, sizeof(*A));
-
-    if (blob_len) {
-        vs->meta.asym.b.blob = rte_zmalloc(NULL, blob_len, 0);
-        if (!vs->meta.asym.b.blob) {
-            rte_cryptodev_asym_session_free(vcrypto->cid, sess);
-            rte_free(vs);
-            return NULL;
-        }
-        rte_memcpy(vs->meta.asym.b.blob, blob, blob_len);
-        vs->meta.asym.b.blob_len = blob_len;
+    vs->meta.asym.b.blob = rte_zmalloc(NULL, blob_len, 0);
+    if (!vs->meta.asym.b.blob) {
+        rte_cryptodev_asym_session_free(vcrypto->cid, sess);
+        secure_free(der_copy, blob_len);
+        rte_free(vs);
+        return NULL;
     }
 
+    rte_memcpy(vs->meta.asym.b.blob, blob, blob_len);
+    vs->meta.asym.b.blob_len = blob_len;
+
+    secure_free(der_copy, blob_len);
     return vs;
 }
 
